@@ -10,6 +10,7 @@ use crate::monitor::AssignedMonitors;
 use crate::protocol::Version;
 use hvdef::Vtl;
 use inspect::Inspect;
+use mesh::CancelContext;
 pub use saved_state::RestoreError;
 pub use saved_state::SavedState;
 pub use saved_state::SavedStateData;
@@ -2501,7 +2502,16 @@ impl<'a, N: 'a + Notifier> ServerWithNotifier<'a, N> {
     }
 
     /// Handles MessageType::REQUEST_OFFERS, which requests a list of channel offers.
-    fn handle_request_offers(&mut self) -> Result<(), ChannelError> {
+    async fn handle_request_offers(&mut self) -> Result<(), ChannelError> {
+        let mut context = CancelContext::new().with_timeout(Duration::from_secs(5));
+        let _ = context
+            .until_cancelled({
+                async {
+                    futures::pending!();
+                }
+            })
+            .await;
+
         let ConnectionState::Connected(info) = &mut self.inner.state else {
             unreachable!(
                 "in unexpected state {:?}, should be prevented by Message::parse()",
@@ -3336,7 +3346,10 @@ impl<'a, N: 'a + Notifier> ServerWithNotifier<'a, N> {
     }
 
     /// Processes an incoming message from the guest.
-    pub fn handle_synic_message(&mut self, message: SynicMessage) -> Result<(), ChannelError> {
+    pub async fn handle_synic_message(
+        &mut self,
+        message: SynicMessage,
+    ) -> Result<(), ChannelError> {
         assert!(!self.is_resetting());
 
         let version = self.inner.state.get_version();
@@ -3378,7 +3391,7 @@ impl<'a, N: 'a + Notifier> ServerWithNotifier<'a, N> {
                 self.handle_initiate_contact(&input.into(), &message, false)?
             }
             Message::Unload(..) => self.handle_unload(),
-            Message::RequestOffers(..) => self.handle_request_offers()?,
+            Message::RequestOffers(..) => self.handle_request_offers().await?,
             Message::GpadlHeader(input, range) => self.handle_gpadl_header(&input, range)?,
             Message::GpadlBody(input, range) => self.handle_gpadl_body(&input, range)?,
             Message::GpadlTeardown(input, ..) => self.handle_gpadl_teardown(&input)?,
@@ -3751,6 +3764,7 @@ mod tests {
     use crate::MESSAGE_CONNECTION_ID;
 
     use super::*;
+    use futures::executor::block_on;
     use guid::Guid;
     use protocol::VmbusMessage;
     use std::collections::VecDeque;
@@ -3816,21 +3830,23 @@ mod tests {
             .with_vtl(0)
             .with_feature_flags(FeatureFlags::new().into());
 
-        server
-            .with_notifier(&mut notifier)
-            .handle_synic_message(in_msg_ex(
-                protocol::MessageType::INITIATE_CONTACT,
-                protocol::InitiateContact {
-                    version_requested: Version::Win10Rs3_1 as u32,
-                    target_message_vp: 0,
-                    interrupt_page_or_target_info: target_info.into(),
-                    parent_to_child_monitor_page_gpa: 0,
-                    child_to_parent_monitor_page_gpa: 0,
-                },
-                true,
-                false,
-            ))
-            .unwrap();
+        block_on(
+            server
+                .with_notifier(&mut notifier)
+                .handle_synic_message(in_msg_ex(
+                    protocol::MessageType::INITIATE_CONTACT,
+                    protocol::InitiateContact {
+                        version_requested: Version::Win10Rs3_1 as u32,
+                        target_message_vp: 0,
+                        interrupt_page_or_target_info: target_info.into(),
+                        parent_to_child_monitor_page_gpa: 0,
+                        child_to_parent_monitor_page_gpa: 0,
+                    },
+                    true,
+                    false,
+                )),
+        )
+        .unwrap();
 
         // No action is taken when a different SINT is requested, since it's not supported. An
         // unsupported message is sent to the requested SINT.
@@ -3867,21 +3883,23 @@ mod tests {
             .with_vtl(2)
             .with_feature_flags(FeatureFlags::new().into());
 
-        server
-            .with_notifier(&mut notifier)
-            .handle_synic_message(in_msg_ex(
-                protocol::MessageType::INITIATE_CONTACT,
-                protocol::InitiateContact {
-                    version_requested: Version::Win10Rs4 as u32,
-                    target_message_vp: 0,
-                    interrupt_page_or_target_info: target_info.into(),
-                    parent_to_child_monitor_page_gpa: 0,
-                    child_to_parent_monitor_page_gpa: 0,
-                },
-                true,
-                false,
-            ))
-            .unwrap();
+        block_on(
+            server
+                .with_notifier(&mut notifier)
+                .handle_synic_message(in_msg_ex(
+                    protocol::MessageType::INITIATE_CONTACT,
+                    protocol::InitiateContact {
+                        version_requested: Version::Win10Rs4 as u32,
+                        target_message_vp: 0,
+                        interrupt_page_or_target_info: target_info.into(),
+                        parent_to_child_monitor_page_gpa: 0,
+                        child_to_parent_monitor_page_gpa: 0,
+                    },
+                    true,
+                    false,
+                )),
+        )
+        .unwrap();
 
         let action = notifier.forward_request.take().unwrap();
         assert!(matches!(action, InitiateContactRequest { .. }));
@@ -4011,22 +4029,20 @@ mod tests {
         expect_supported: bool,
         expected_features: u32,
     ) {
-        server
-            .with_notifier(notifier)
-            .handle_synic_message(in_msg(
-                protocol::MessageType::INITIATE_CONTACT,
-                protocol::InitiateContact2 {
-                    initiate_contact: protocol::InitiateContact {
-                        version_requested: version,
-                        target_message_vp: 1,
-                        interrupt_page_or_target_info: target_info,
-                        parent_to_child_monitor_page_gpa: 0,
-                        child_to_parent_monitor_page_gpa: 0,
-                    },
-                    client_id: guid::guid!("e6e6e6e6-e6e6-e6e6-e6e6-e6e6e6e6e6e6"),
+        block_on(server.with_notifier(notifier).handle_synic_message(in_msg(
+            protocol::MessageType::INITIATE_CONTACT,
+            protocol::InitiateContact2 {
+                initiate_contact: protocol::InitiateContact {
+                    version_requested: version,
+                    target_message_vp: 1,
+                    interrupt_page_or_target_info: target_info,
+                    parent_to_child_monitor_page_gpa: 0,
+                    child_to_parent_monitor_page_gpa: 0,
                 },
-            ))
-            .unwrap();
+                client_id: guid::guid!("e6e6e6e6-e6e6-e6e6-e6e6-e6e6e6e6e6e6"),
+            },
+        )))
+        .unwrap();
 
         let selected_version_or_connection_id = if expect_supported {
             let request = notifier.next_action();
@@ -4291,19 +4307,21 @@ mod tests {
             target_info.set_feature_flags(feature_flags.into());
         }
 
-        server
-            .with_notifier(&mut notifier)
-            .handle_synic_message(in_msg(
-                protocol::MessageType::INITIATE_CONTACT,
-                protocol::InitiateContact {
-                    version_requested: version as u32,
-                    target_message_vp: 0,
-                    interrupt_page_or_target_info: target_info.into(),
-                    parent_to_child_monitor_page_gpa: 0,
-                    child_to_parent_monitor_page_gpa: 0,
-                },
-            ))
-            .unwrap();
+        block_on(
+            server
+                .with_notifier(&mut notifier)
+                .handle_synic_message(in_msg(
+                    protocol::MessageType::INITIATE_CONTACT,
+                    protocol::InitiateContact {
+                        version_requested: version as u32,
+                        target_message_vp: 0,
+                        interrupt_page_or_target_info: target_info.into(),
+                        parent_to_child_monitor_page_gpa: 0,
+                        child_to_parent_monitor_page_gpa: 0,
+                    },
+                )),
+        )
+        .unwrap();
 
         let request = notifier.next_action();
         assert_eq!(
@@ -4339,10 +4357,12 @@ mod tests {
             notifier.check_message(OutgoingMessage::new(&version_response));
         }
 
-        server
-            .with_notifier(&mut notifier)
-            .handle_synic_message(in_msg(protocol::MessageType::REQUEST_OFFERS, ()))
-            .unwrap();
+        block_on(
+            server
+                .with_notifier(&mut notifier)
+                .handle_synic_message(in_msg(protocol::MessageType::REQUEST_OFFERS, ())),
+        )
+        .unwrap();
 
         let channel_id = ChannelId(1);
         notifier.check_messages(&[
@@ -4383,26 +4403,33 @@ mod tests {
                 connection_id = 0x2002;
             }
 
-            server
-                .with_notifier(&mut notifier)
-                .handle_synic_message(in_msg(
-                    protocol::MessageType::OPEN_CHANNEL,
-                    protocol::OpenChannel2 {
-                        open_channel,
-                        event_flag: 2,
-                        connection_id: 0x2002,
-                        flags: (u16::from(
-                            protocol::OpenChannelFlags::new().with_redirect_interrupt(true),
-                        ) | 0xabc)
-                            .into(), // a real flag and some junk
-                    },
-                ))
-                .unwrap();
+            block_on(
+                server
+                    .with_notifier(&mut notifier)
+                    .handle_synic_message(in_msg(
+                        protocol::MessageType::OPEN_CHANNEL,
+                        protocol::OpenChannel2 {
+                            open_channel,
+                            event_flag: 2,
+                            connection_id: 0x2002,
+                            flags: (u16::from(
+                                protocol::OpenChannelFlags::new().with_redirect_interrupt(true),
+                            ) | 0xabc)
+                                .into(), // a real flag and some junk
+                        },
+                    )),
+            )
+            .unwrap();
         } else {
-            server
-                .with_notifier(&mut notifier)
-                .handle_synic_message(in_msg(protocol::MessageType::OPEN_CHANNEL, open_channel))
-                .unwrap();
+            block_on(
+                server
+                    .with_notifier(&mut notifier)
+                    .handle_synic_message(in_msg(
+                        protocol::MessageType::OPEN_CHANNEL,
+                        open_channel,
+                    )),
+            )
+            .unwrap();
         }
 
         let (id, action) = recv.recv().unwrap();
@@ -4430,16 +4457,18 @@ mod tests {
             status: 0,
         }));
 
-        server
-            .with_notifier(&mut notifier)
-            .handle_synic_message(in_msg(
-                protocol::MessageType::MODIFY_CHANNEL,
-                protocol::ModifyChannel {
-                    channel_id,
-                    target_vp: 4,
-                },
-            ))
-            .unwrap();
+        block_on(
+            server
+                .with_notifier(&mut notifier)
+                .handle_synic_message(in_msg(
+                    protocol::MessageType::MODIFY_CHANNEL,
+                    protocol::ModifyChannel {
+                        channel_id,
+                        target_vp: 4,
+                    },
+                )),
+        )
+        .unwrap();
 
         let (id, action) = recv.recv().unwrap();
         assert_eq!(id, offer_id);
@@ -4460,13 +4489,15 @@ mod tests {
 
         server.with_notifier(&mut notifier).revoke_channel(offer_id);
 
-        server
-            .with_notifier(&mut notifier)
-            .handle_synic_message(in_msg(
-                protocol::MessageType::REL_ID_RELEASED,
-                protocol::RelIdReleased { channel_id },
-            ))
-            .unwrap();
+        block_on(
+            server
+                .with_notifier(&mut notifier)
+                .handle_synic_message(in_msg(
+                    protocol::MessageType::REL_ID_RELEASED,
+                    protocol::RelIdReleased { channel_id },
+                )),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4489,19 +4520,21 @@ mod tests {
         let (mut notifier, _recv) = TestNotifier::new();
         let mut server = Server::new(Vtl::Vtl0, MESSAGE_CONNECTION_ID, 0);
 
-        server
-            .with_notifier(&mut notifier)
-            .handle_synic_message(in_msg(
-                protocol::MessageType::INITIATE_CONTACT,
-                protocol::InitiateContact {
-                    version_requested: version as u32,
-                    target_message_vp: 0,
-                    interrupt_page_or_target_info: 0,
-                    parent_to_child_monitor_page_gpa: 0,
-                    child_to_parent_monitor_page_gpa: 0,
-                },
-            ))
-            .unwrap();
+        block_on(
+            server
+                .with_notifier(&mut notifier)
+                .handle_synic_message(in_msg(
+                    protocol::MessageType::INITIATE_CONTACT,
+                    protocol::InitiateContact {
+                        version_requested: version as u32,
+                        target_message_vp: 0,
+                        interrupt_page_or_target_info: 0,
+                        parent_to_child_monitor_page_gpa: 0,
+                        child_to_parent_monitor_page_gpa: 0,
+                    },
+                )),
+        )
+        .unwrap();
 
         let request = notifier.next_action();
         assert_eq!(
@@ -4548,10 +4581,12 @@ mod tests {
             )
         };
 
-        server
-            .with_notifier(&mut notifier)
-            .handle_synic_message(request_msg)
-            .unwrap();
+        block_on(
+            server
+                .with_notifier(&mut notifier)
+                .handle_synic_message(request_msg),
+        )
+        .unwrap();
 
         let request = notifier.hvsock_requests.pop().unwrap();
         assert_eq!(request.service_id, service_id);
@@ -4772,25 +4807,27 @@ mod tests {
                 feature_flags,
             });
 
-            let result = self.c().handle_synic_message(in_msg_ex(
-                protocol::MessageType::INITIATE_CONTACT,
-                protocol::InitiateContact2 {
-                    initiate_contact: protocol::InitiateContact {
-                        version_requested: version as u32,
-                        interrupt_page_or_target_info: TargetInfo::new()
-                            .with_sint(SINT)
-                            .with_vtl(0)
-                            .with_feature_flags(feature_flags.into())
-                            .into(),
-                        child_to_parent_monitor_page_gpa: 0x123f000,
-                        parent_to_child_monitor_page_gpa: 0x321f000,
-                        ..FromZeros::new_zeroed()
+            let result = block_on(
+                self.c().handle_synic_message(in_msg_ex(
+                    protocol::MessageType::INITIATE_CONTACT,
+                    protocol::InitiateContact2 {
+                        initiate_contact: protocol::InitiateContact {
+                            version_requested: version as u32,
+                            interrupt_page_or_target_info: TargetInfo::new()
+                                .with_sint(SINT)
+                                .with_vtl(0)
+                                .with_feature_flags(feature_flags.into())
+                                .into(),
+                            child_to_parent_monitor_page_gpa: 0x123f000,
+                            parent_to_child_monitor_page_gpa: 0x321f000,
+                            ..FromZeros::new_zeroed()
+                        },
+                        client_id: Guid::ZERO,
                     },
-                    client_id: Guid::ZERO,
-                },
-                false,
-                trusted,
-            ));
+                    false,
+                    trusted,
+                )),
+            );
             assert!(result.is_ok());
 
             let request = self.notifier.next_action();
@@ -4835,7 +4872,7 @@ mod tests {
         }
 
         fn try_send_message(&mut self, message: SynicMessage) -> Result<(), ChannelError> {
-            self.c().handle_synic_message(message)
+            block_on(self.c().handle_synic_message(message))
         }
 
         fn next_action(&mut self) -> ModifyConnectionRequest {
@@ -4867,7 +4904,7 @@ mod tests {
                 SUPPORTED_FEATURE_FLAGS,
             ));
         let offer_id3 = env.offer(3);
-        env.c().handle_request_offers().unwrap();
+        block_on(env.c().handle_request_offers()).unwrap();
         let offer_id4 = env.offer(4);
         env.open(1);
         env.open(2);
@@ -4923,7 +4960,7 @@ mod tests {
         env.connect(Version::Win10, FeatureFlags::new());
         assert_eq!(env.notifier.monitor_page, Some(expected_monitor));
 
-        env.c().handle_request_offers().unwrap();
+        block_on(env.c().handle_request_offers()).unwrap();
         assert_eq!(env.server.assigned_monitors.bitmap(), 7);
 
         env.open(1);
@@ -5158,7 +5195,7 @@ mod tests {
         let _offer_id3 = env.offer(3);
 
         env.connect(Version::Copper, FeatureFlags::new());
-        env.c().handle_request_offers().unwrap();
+        block_on(env.c().handle_request_offers()).unwrap();
 
         env.gpadl(1, 1);
         env.c().gpadl_create_complete(offer_id1, GpadlId(1), 0);
@@ -5212,7 +5249,7 @@ mod tests {
         assert!(env.notifier.messages.is_empty());
 
         // When the guest requests offers, they should be all be sent.
-        env.c().handle_request_offers().unwrap();
+        block_on(env.c().handle_request_offers()).unwrap();
         env.notifier.check_messages(&[
             OutgoingMessage::new(&protocol::OfferChannel {
                 interface_id: Guid {
@@ -5272,7 +5309,7 @@ mod tests {
         let _offer_id3 = env.offer(3);
 
         env.connect(Version::Copper, FeatureFlags::new());
-        env.c().handle_request_offers().unwrap();
+        block_on(env.c().handle_request_offers()).unwrap();
         let state = env.server.save();
         let mut env = TestEnv::new();
 
@@ -5320,7 +5357,7 @@ mod tests {
         let offer_id3 = env.offer(3);
 
         env.connect(Version::Copper, FeatureFlags::new());
-        env.c().handle_request_offers().unwrap();
+        block_on(env.c().handle_request_offers()).unwrap();
 
         env.notifier.messages.clear();
         env.notifier.pend_messages = true;
@@ -5467,7 +5504,7 @@ mod tests {
         let offer_id3 = env.offer(3);
 
         env.connect(Version::Win10, FeatureFlags::new());
-        env.c().handle_request_offers().unwrap();
+        block_on(env.c().handle_request_offers()).unwrap();
 
         // Check gpadl doesn't prevent unload or get torndown on disconnect
         env.gpadl(1, 10);
@@ -5502,7 +5539,7 @@ mod tests {
 
         env.notifier.messages.clear();
         env.connect(Version::Copper, FeatureFlags::new());
-        env.c().handle_request_offers().unwrap();
+        block_on(env.c().handle_request_offers()).unwrap();
 
         // Check reserved gpadl gets torndown on reset
         // Duplicate GPADL IDs across different channels should also work
@@ -5545,7 +5582,7 @@ mod tests {
         let offer_id1 = env.offer(1);
 
         env.connect(Version::Win10, FeatureFlags::new());
-        env.c().handle_request_offers().unwrap();
+        block_on(env.c().handle_request_offers()).unwrap();
 
         env.gpadl(1, 10);
         env.c().gpadl_create_complete(offer_id1, GpadlId(10), 0);
@@ -5567,7 +5604,7 @@ mod tests {
 
         env.notifier.messages.clear();
         env.connect(Version::Win10, FeatureFlags::new());
-        env.c().handle_request_offers().unwrap();
+        block_on(env.c().handle_request_offers()).unwrap();
 
         env.gpadl(2, 20);
         env.c().gpadl_create_complete(offer_id2, GpadlId(20), 0);
@@ -5595,7 +5632,7 @@ mod tests {
         let _offer_id3 = env.offer_with_preset_mnf(3, 5);
 
         env.connect(Version::Copper, FeatureFlags::new());
-        env.c().handle_request_offers().unwrap();
+        block_on(env.c().handle_request_offers()).unwrap();
 
         // Preset monitor ID should not be in the bitmap.
         assert_eq!(env.server.assigned_monitors.bitmap(), 1);
@@ -5665,7 +5702,7 @@ mod tests {
         let _offer_id7 = env.offer_with_order(5, 1, None);
 
         env.connect(Version::Win10, FeatureFlags::new());
-        env.c().handle_request_offers().unwrap();
+        block_on(env.c().handle_request_offers()).unwrap();
 
         env.notifier.check_messages(&[
             OutgoingMessage::new(&protocol::OfferChannel {

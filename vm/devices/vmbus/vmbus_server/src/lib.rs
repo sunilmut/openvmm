@@ -1048,11 +1048,12 @@ impl ServerTask {
             .send_tl_connect_result(result);
     }
 
-    fn handle_synic_message(&mut self, message: SynicMessage) {
+    async fn handle_synic_message(&mut self, message: SynicMessage) {
         match self
             .server
             .with_notifier(&mut self.inner)
             .handle_synic_message(message)
+            .await
         {
             Ok(()) => {}
             Err(err) => {
@@ -1174,7 +1175,7 @@ impl ServerTask {
                 }
                 data = message_recv => {
                     let data = data.unwrap();
-                    self.handle_synic_message(data);
+                    self.handle_synic_message(data).await;
                 }
                 r = external_requests => {
                     let r = r.unwrap();
