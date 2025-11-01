@@ -1763,7 +1763,10 @@ impl<'a, N: 'a + Notifier> ServerWithNotifier<'a, N> {
     }
 
     /// Creates a new channel, returning its offer ID.
-    pub fn offer_channel(&mut self, offer: OfferParamsInternal) -> Result<OfferId, OfferError> {
+    pub async fn offer_channel(
+        &mut self,
+        offer: OfferParamsInternal,
+    ) -> Result<OfferId, OfferError> {
         // Ensure no channel with this interface and instance ID exists.
         if let Some((offer_id, channel)) = self.inner.channels.get_by_key_mut(&offer.key()) {
             // Replace the current offer if this is an unmatched restored

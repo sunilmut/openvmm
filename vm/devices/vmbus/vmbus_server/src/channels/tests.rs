@@ -6,6 +6,7 @@ use crate::MESSAGE_CONNECTION_ID;
 use super::*;
 use crate::channels::ConnectionState;
 use guid::Guid;
+use pal_async::async_test;
 use protocol::VmbusMessage;
 use std::collections::VecDeque;
 use std::sync::mpsc;
@@ -13,15 +14,15 @@ use test_with_tracing::test;
 use vmbus_core::protocol::TargetInfo;
 use zerocopy::FromBytes;
 
-#[test]
-fn test_version_negotiation_not_supported() {
+#[async_test]
+async fn test_version_negotiation_not_supported() {
     let mut env = TestEnv::new();
 
-    test_initiate_contact(&mut env, TestVersion::Unsupported(0xffffffff), 0);
+    test_initiate_contact(&mut env, TestVersion::Unsupported(0xffffffff), 0).await;
 }
 
-#[test]
-fn test_version_negotiation_success() {
+#[async_test]
+async fn test_version_negotiation_success() {
     let mut env = TestEnv::new();
 
     test_initiate_contact(
@@ -31,11 +32,12 @@ fn test_version_negotiation_success() {
             expected_features: 0,
         },
         0,
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_version_negotiation_multiclient_sint() {
+#[async_test]
+async fn test_version_negotiation_multiclient_sint() {
     let mut env = TestEnv::new();
 
     let target_info = TargetInfo::new()
@@ -80,11 +82,12 @@ fn test_version_negotiation_multiclient_sint() {
             expected_features: 0,
         },
         target_info.into(),
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_version_negotiation_multiclient_vtl() {
+#[async_test]
+async fn test_version_negotiation_multiclient_vtl() {
     let mut env = TestEnv::new();
 
     let target_info = TargetInfo::new()
@@ -122,13 +125,14 @@ fn test_version_negotiation_multiclient_vtl() {
             expected_features: 0,
         },
         target_info.into(),
-    );
+    )
+    .await;
 
     assert!(env.notifier.forward_request.is_none());
 }
 
-#[test]
-fn test_version_negotiation_feature_flags() {
+#[async_test]
+async fn test_version_negotiation_feature_flags() {
     let mut env = TestEnv::new();
 
     // Test with no feature flags.
@@ -143,7 +147,8 @@ fn test_version_negotiation_feature_flags() {
             expected_features: 0,
         },
         target_info.into(),
-    );
+    )
+    .await;
 
     env.c().handle_unload();
     env.complete_reset();
@@ -163,7 +168,8 @@ fn test_version_negotiation_feature_flags() {
                 .into(),
         },
         target_info.into(),
-    );
+    )
+    .await;
 
     env.c().handle_unload();
     env.complete_reset();
@@ -181,7 +187,8 @@ fn test_version_negotiation_feature_flags() {
                 .into(),
         },
         target_info.into(),
-    );
+    )
+    .await;
 
     env.c().handle_unload();
     env.complete_reset();
@@ -195,11 +202,12 @@ fn test_version_negotiation_feature_flags() {
             expected_features: FeatureFlags::new().with_client_id(true).into(),
         },
         target_info.into(),
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_version_negotiation_interrupt_page() {
+#[async_test]
+async fn test_version_negotiation_interrupt_page() {
     let mut env = TestEnv::new();
     test_initiate_contact(
         &mut env,
@@ -208,7 +216,8 @@ fn test_version_negotiation_interrupt_page() {
             expected_features: 0,
         },
         1234,
-    );
+    )
+    .await;
 
     let mut env = TestEnv::new();
     test_initiate_contact(
@@ -218,7 +227,8 @@ fn test_version_negotiation_interrupt_page() {
             expected_features: 0,
         },
         1234,
-    );
+    )
+    .await;
 
     let mut env = TestEnv::new();
     test_initiate_contact(
@@ -228,7 +238,8 @@ fn test_version_negotiation_interrupt_page() {
             expected_features: 0,
         },
         1234,
-    );
+    )
+    .await;
 }
 
 enum TestVersion {
@@ -239,7 +250,7 @@ enum TestVersion {
     },
 }
 
-fn test_initiate_contact(env: &mut TestEnv, version: TestVersion, target_info: u64) {
+async fn test_initiate_contact(env: &mut TestEnv, version: TestVersion, target_info: u64) {
     let raw_version = match version {
         TestVersion::Unsupported(version) => version,
         TestVersion::Supported { version, .. } => version as u32,
@@ -353,38 +364,40 @@ fn test_initiate_contact(env: &mut TestEnv, version: TestVersion, target_info: u
     }
 }
 
-#[test]
-fn test_channel_lifetime() {
-    test_channel_lifetime_helper(Version::Win10Rs5, FeatureFlags::new());
+#[async_test]
+async fn test_channel_lifetime() {
+    test_channel_lifetime_helper(Version::Win10Rs5, FeatureFlags::new()).await;
 }
 
-#[test]
-fn test_channel_lifetime_iron() {
-    test_channel_lifetime_helper(Version::Iron, FeatureFlags::new());
+#[async_test]
+async fn test_channel_lifetime_iron() {
+    test_channel_lifetime_helper(Version::Iron, FeatureFlags::new()).await;
 }
 
-#[test]
-fn test_channel_lifetime_copper() {
-    test_channel_lifetime_helper(Version::Copper, FeatureFlags::new());
+#[async_test]
+async fn test_channel_lifetime_copper() {
+    test_channel_lifetime_helper(Version::Copper, FeatureFlags::new()).await;
 }
 
-#[test]
-fn test_channel_lifetime_copper_guest_signal() {
+#[async_test]
+async fn test_channel_lifetime_copper_guest_signal() {
     test_channel_lifetime_helper(
         Version::Copper,
         FeatureFlags::new().with_guest_specified_signal_parameters(true),
-    );
+    )
+    .await;
 }
 
-#[test]
-fn test_channel_lifetime_copper_open_flags() {
+#[async_test]
+async fn test_channel_lifetime_copper_open_flags() {
     test_channel_lifetime_helper(
         Version::Copper,
         FeatureFlags::new().with_channel_interrupt_redirection(true),
-    );
+    )
+    .await;
 }
 
-fn test_channel_lifetime_helper(version: Version, feature_flags: FeatureFlags) {
+async fn test_channel_lifetime_helper(version: Version, feature_flags: FeatureFlags) {
     let mut env = TestEnv::new();
     let interface_id = Guid::new_random();
     let instance_id = Guid::new_random();
@@ -396,6 +409,7 @@ fn test_channel_lifetime_helper(version: Version, feature_flags: FeatureFlags) {
             interface_id,
             ..Default::default()
         })
+        .await
         .unwrap();
 
     let mut target_info = TargetInfo::new()
@@ -581,18 +595,18 @@ fn test_channel_lifetime_helper(version: Version, feature_flags: FeatureFlags) {
         .unwrap();
 }
 
-#[test]
-fn test_hvsock() {
+#[async_test]
+async fn test_hvsock() {
     test_hvsock_helper(Version::Win10, false);
 }
 
-#[test]
-fn test_hvsock_rs3() {
+#[async_test]
+async fn test_hvsock_rs3() {
     test_hvsock_helper(Version::Win10Rs3_0, false);
 }
 
-#[test]
-fn test_hvsock_rs5() {
+#[async_test]
+async fn test_hvsock_rs5() {
     test_hvsock_helper(Version::Win10Rs5, false);
     test_hvsock_helper(Version::Win10Rs5, true);
 }
@@ -685,10 +699,10 @@ fn test_hvsock_helper(version: Version, force_small_message: bool) {
 }
 
 /// Ensure that channels can be offered at each stage of connection.
-#[test]
-fn test_hot_add() {
+#[async_test]
+async fn test_hot_add() {
     let mut env = TestEnv::new();
-    let offer_id1 = env.offer(1);
+    let offer_id1 = env.offer(1).await;
     let result = env.c().handle_initiate_contact(
         &protocol::InitiateContact2 {
             initiate_contact: protocol::InitiateContact {
@@ -701,16 +715,16 @@ fn test_hot_add() {
         true,
     );
     assert!(result.is_ok());
-    let offer_id2 = env.offer(2);
+    let offer_id2 = env.offer(2).await;
     env.c()
         .complete_initiate_contact(ModifyConnectionResponse::Supported(
             protocol::ConnectionState::SUCCESSFUL,
             SUPPORTED_FEATURE_FLAGS,
             None,
         ));
-    let offer_id3 = env.offer(3);
+    let offer_id3 = env.offer(3).await;
     env.c().handle_request_offers().unwrap();
-    let offer_id4 = env.offer(4);
+    let offer_id4 = env.offer(4).await;
     env.open(1);
     env.open(2);
     env.open(3);
@@ -728,12 +742,12 @@ fn test_hot_add() {
     assert!(env.notifier.is_reset());
 }
 
-#[test]
-fn test_save_restore_with_no_connection() {
+#[async_test]
+async fn test_save_restore_with_no_connection() {
     let mut env = TestEnv::new();
 
-    let offer_id1 = env.offer(1);
-    let _offer_id2 = env.offer(2);
+    let offer_id1 = env.offer(1).await;
+    let _offer_id2 = env.offer(2).await;
 
     let state = env.server.save();
     env.c().reset();
@@ -742,20 +756,20 @@ fn test_save_restore_with_no_connection() {
     env.c().restore_channel(offer_id1, false).unwrap();
 }
 
-#[test]
-fn test_save_restore_with_connection() {
+#[async_test]
+async fn test_save_restore_with_connection() {
     let mut env = TestEnv::new();
 
-    let offer_id1 = env.offer_with_mnf(1);
-    let offer_id2 = env.offer(2);
-    let offer_id3 = env.offer_with_mnf(3);
-    let offer_id4 = env.offer(4);
-    let offer_id5 = env.offer_with_mnf(5);
-    let offer_id6 = env.offer(6);
-    let offer_id7 = env.offer(7);
-    let offer_id8 = env.offer(8);
-    let offer_id9 = env.offer(9);
-    let offer_id10 = env.offer(10);
+    let offer_id1 = env.offer_with_mnf(1).await;
+    let offer_id2 = env.offer(2).await;
+    let offer_id3 = env.offer_with_mnf(3).await;
+    let offer_id4 = env.offer(4).await;
+    let offer_id5 = env.offer_with_mnf(5).await;
+    let offer_id6 = env.offer(6).await;
+    let offer_id7 = env.offer(7).await;
+    let offer_id8 = env.offer(8).await;
+    let offer_id9 = env.offer(9).await;
+    let offer_id10 = env.offer(10).await;
 
     let expected_monitor = MonitorPageGpas {
         child_to_parent: 0x123f000,
@@ -798,7 +812,7 @@ fn test_save_restore_with_connection() {
     // Revoke an offer but don't have the "guest" release it, so we can then mark it as
     // reoffered.
     env.c().revoke_channel(offer_id10);
-    let offer_id10 = env.offer(10);
+    let offer_id10 = env.offer(10).await;
 
     let state = env.server.save();
 
@@ -830,7 +844,7 @@ fn test_save_restore_with_connection() {
     env.c().revoke_channel(offer_id1);
     env.c().revoke_channel(offer_id4);
     env.c().restore_channel(offer_id3, false).unwrap();
-    let offer_id5 = env.offer_with_mnf(5);
+    let offer_id5 = env.offer_with_mnf(5).await;
     env.c().restore_channel(offer_id5, true).unwrap();
     env.c().restore_channel(offer_id7, false).unwrap();
     env.c().restore_channel(offer_id8, true).unwrap();
@@ -874,12 +888,12 @@ fn test_save_restore_with_connection() {
     assert_eq!(env.notifier.target_message_vp, Some(0));
 }
 
-#[test]
-fn test_save_restore_connecting() {
+#[async_test]
+async fn test_save_restore_connecting() {
     let mut env = TestEnv::new();
 
-    let offer_id1 = env.offer_with_mnf(1);
-    let _offer_id2 = env.offer(2);
+    let offer_id1 = env.offer_with_mnf(1).await;
+    let _offer_id2 = env.offer(2).await;
 
     env.start_connect(Version::Win10, FeatureFlags::new(), false, true);
     assert_eq!(
@@ -933,8 +947,8 @@ fn test_save_restore_connecting() {
     env.complete_connect();
 }
 
-#[test]
-fn test_save_restore_modifying() {
+#[async_test]
+async fn test_save_restore_modifying() {
     let mut env = TestEnv::new();
     env.connect(
         Version::Copper,
@@ -995,13 +1009,13 @@ fn test_save_restore_modifying() {
         }));
 }
 
-#[test]
-fn test_save_restore_disconnected_reserved() {
+#[async_test]
+async fn test_save_restore_disconnected_reserved() {
     let mut env = TestEnv::new();
 
-    let offer_id1 = env.offer(1);
-    let _offer_id2 = env.offer(2);
-    let _offer_id3 = env.offer(3);
+    let offer_id1 = env.offer(1).await;
+    let _offer_id2 = env.offer(2).await;
+    let _offer_id3 = env.offer(3).await;
 
     env.connect(Version::Copper, FeatureFlags::new());
     env.c().handle_request_offers().unwrap();
@@ -1014,9 +1028,9 @@ fn test_save_restore_disconnected_reserved() {
 
     let state = env.server.save();
     let mut env = TestEnv::new();
-    let offer_id1 = env.offer(1);
-    let offer_id2 = env.offer(2);
-    let offer_id3 = env.offer(3);
+    let offer_id1 = env.offer(1).await;
+    let offer_id2 = env.offer(2).await;
+    let offer_id3 = env.offer(3).await;
 
     env.c().restore(state).unwrap();
 
@@ -1029,13 +1043,13 @@ fn test_save_restore_disconnected_reserved() {
     assert!(env.server.gpadls.contains_key(&(GpadlId(1), offer_id1)));
 }
 
-#[test]
-fn test_save_restore_offers_not_sent() {
+#[async_test]
+async fn test_save_restore_offers_not_sent() {
     let mut env = TestEnv::new();
 
-    let _offer_id1 = env.offer(1);
-    let _offer_id2 = env.offer(2);
-    let _offer_id3 = env.offer(3);
+    let _offer_id1 = env.offer(1).await;
+    let _offer_id2 = env.offer(2).await;
+    let _offer_id3 = env.offer(3).await;
 
     env.connect(Version::Copper, FeatureFlags::new());
 
@@ -1043,9 +1057,9 @@ fn test_save_restore_offers_not_sent() {
     let state = env.server.save();
     let mut env = TestEnv::new();
 
-    let offer_id1 = env.offer(1);
-    let offer_id2 = env.offer(2);
-    let offer_id3 = env.offer(3);
+    let offer_id1 = env.offer(1).await;
+    let offer_id2 = env.offer(2).await;
+    let offer_id3 = env.offer(3).await;
 
     // Because the offers were not saved, they are treated as new during the restore.
     env.c().restore(state).unwrap();
@@ -1091,24 +1105,24 @@ fn test_save_restore_offers_not_sent() {
     ]);
 }
 
-#[test]
-fn test_save_restore_hot_add_during_restore() {
+#[async_test]
+async fn test_save_restore_hot_add_during_restore() {
     let mut env = TestEnv::new();
 
-    let _offer_id1 = env.offer(1);
-    let _offer_id2 = env.offer(2);
-    let _offer_id3 = env.offer(3);
+    let _offer_id1 = env.offer(1).await;
+    let _offer_id2 = env.offer(2).await;
+    let _offer_id3 = env.offer(3).await;
 
     env.connect(Version::Copper, FeatureFlags::new());
     env.c().handle_request_offers().unwrap();
     let state = env.server.save();
     let mut env = TestEnv::new();
 
-    let offer_id1 = env.offer(1);
-    let offer_id2 = env.offer(2);
-    let offer_id3 = env.offer(3);
+    let offer_id1 = env.offer(1).await;
+    let offer_id2 = env.offer(2).await;
+    let offer_id3 = env.offer(3).await;
     // A new offer is created that is not present in the saved state.
-    let _offer_id4 = env.offer(4);
+    let _offer_id4 = env.offer(4).await;
 
     // Because the offers were not saved, they are treated as new during the restore.
     env.c().restore(state).unwrap();
@@ -1133,13 +1147,13 @@ fn test_save_restore_hot_add_during_restore() {
     assert!(env.notifier.messages.is_empty());
 }
 
-#[test]
-fn test_pending_messages() {
+#[async_test]
+async fn test_pending_messages() {
     let mut env = TestEnv::new();
 
-    let offer_id1 = env.offer(1);
-    let offer_id2 = env.offer(2);
-    let offer_id3 = env.offer(3);
+    let offer_id1 = env.offer(1).await;
+    let offer_id2 = env.offer(2).await;
+    let offer_id3 = env.offer(3).await;
 
     env.connect(Version::Copper, FeatureFlags::new());
     env.c().handle_request_offers().unwrap();
@@ -1172,9 +1186,9 @@ fn test_pending_messages() {
     // Create a new env instead of resetting because the gpadl blocks the reset until released.
     let mut env = TestEnv::new();
 
-    let offer_id1 = env.offer(1);
-    let offer_id2 = env.offer(2);
-    let offer_id3 = env.offer(3);
+    let offer_id1 = env.offer(1).await;
+    let offer_id2 = env.offer(2).await;
+    let offer_id3 = env.offer(3).await;
 
     env.c().restore(state).unwrap();
     env.c().restore_channel(offer_id1, false).unwrap();
@@ -1209,8 +1223,8 @@ fn test_pending_messages() {
     assert!(!env.server.has_pending_messages());
 }
 
-#[test]
-fn test_modify_connection() {
+#[async_test]
+async fn test_modify_connection() {
     let mut env = TestEnv::new();
     env.connect(
         Version::Copper,
@@ -1256,8 +1270,8 @@ fn test_modify_connection() {
         }));
 }
 
-#[test]
-fn test_modify_connection_unsupported() {
+#[async_test]
+async fn test_modify_connection_unsupported() {
     let mut env = TestEnv::new();
     env.connect(Version::Copper, FeatureFlags::new());
 
@@ -1279,13 +1293,13 @@ fn test_modify_connection_unsupported() {
     ));
 }
 
-#[test]
-fn test_reserved_channels() {
+#[async_test]
+async fn test_reserved_channels() {
     let mut env = TestEnv::new();
 
-    let offer_id1 = env.offer(1);
-    let offer_id2 = env.offer(2);
-    let offer_id3 = env.offer(3);
+    let offer_id1 = env.offer(1).await;
+    let offer_id2 = env.offer(2).await;
+    let offer_id3 = env.offer(3).await;
 
     env.connect(Version::Win10, FeatureFlags::new());
     env.c().handle_request_offers().unwrap();
@@ -1360,11 +1374,11 @@ fn test_reserved_channels() {
     assert!(env.notifier.is_reset());
 }
 
-#[test]
-fn test_disconnected_reset() {
+#[async_test]
+async fn test_disconnected_reset() {
     let mut env = TestEnv::new();
 
-    let offer_id1 = env.offer(1);
+    let offer_id1 = env.offer(1).await;
 
     env.connect(Version::Win10, FeatureFlags::new());
     env.c().handle_request_offers().unwrap();
@@ -1386,7 +1400,7 @@ fn test_disconnected_reset() {
     env.complete_reset();
     assert!(env.notifier.is_reset());
 
-    let offer_id2 = env.offer(2);
+    let offer_id2 = env.offer(2).await;
 
     env.notifier.messages.clear();
     env.connect(Version::Win10, FeatureFlags::new());
@@ -1408,15 +1422,15 @@ fn test_disconnected_reset() {
     assert!(env.notifier.is_reset());
 }
 
-#[test]
-fn test_mnf_channel() {
+#[async_test]
+async fn test_mnf_channel() {
     let mut env = TestEnv::new();
 
     // This test combines server-handled and preset MNF IDs, which can't happen normally, but
     // it simplifies the test.
-    let _offer_id1 = env.offer(1);
-    let _offer_id2 = env.offer_with_mnf(2);
-    let _offer_id3 = env.offer_with_preset_mnf(3, 5);
+    let _offer_id1 = env.offer(1).await;
+    let _offer_id2 = env.offer_with_mnf(2).await;
+    let _offer_id3 = env.offer_with_preset_mnf(3, 5).await;
 
     let mut expected_channels = [
         protocol::OfferChannel {
@@ -1490,18 +1504,18 @@ fn test_mnf_channel() {
         .check_messages(make_messages(&expected_channels));
 }
 
-#[test]
-fn test_server_monitor_page() {
+#[async_test]
+async fn test_server_monitor_page() {
     // Guest pages provided, but overridden by server-allocated pages.
-    test_server_monitor_page_helper(true);
+    test_server_monitor_page_helper(true).await;
 
     // No guest pages supplied, server will allocate them.
-    test_server_monitor_page_helper(false);
+    test_server_monitor_page_helper(false).await;
 }
 
-fn test_server_monitor_page_helper(provide_guest_pages: bool) {
+async fn test_server_monitor_page_helper(provide_guest_pages: bool) {
     let mut env = TestEnv::new();
-    let _offer_id1 = env.offer_with_mnf(1);
+    let _offer_id1 = env.offer_with_mnf(1).await;
 
     let version = Version::Copper;
     let feature_flags = FeatureFlags::new().with_server_specified_monitor_pages(true);
@@ -1606,17 +1620,17 @@ fn test_server_monitor_page_helper(provide_guest_pages: bool) {
     ]);
 }
 
-#[test]
-fn test_channel_id_order() {
+#[async_test]
+async fn test_channel_id_order() {
     let mut env = TestEnv::new();
 
-    let _offer_id1 = env.offer(3);
-    let _offer_id2 = env.offer(10);
-    let _offer_id3 = env.offer(5);
-    let _offer_id4 = env.offer(17);
-    let _offer_id5 = env.offer_with_order(5, 6, Some(2));
-    let _offer_id6 = env.offer_with_order(5, 8, Some(1));
-    let _offer_id7 = env.offer_with_order(5, 1, None);
+    let _offer_id1 = env.offer(3).await;
+    let _offer_id2 = env.offer(10).await;
+    let _offer_id3 = env.offer(5).await;
+    let _offer_id4 = env.offer(17).await;
+    let _offer_id5 = env.offer_with_order(5, 6, Some(2)).await;
+    let _offer_id6 = env.offer_with_order(5, 8, Some(1)).await;
+    let _offer_id7 = env.offer_with_order(5, 1, None).await;
 
     env.connect(Version::Win10, FeatureFlags::new());
     env.c().handle_request_offers().unwrap();
@@ -1689,17 +1703,17 @@ fn test_channel_id_order() {
     ])
 }
 
-#[test]
-fn test_channel_id_order_absolute() {
+#[async_test]
+async fn test_channel_id_order_absolute() {
     let mut env = TestEnv::with_params(true);
 
-    let _offer_id1 = env.offer_with_order(3, 3, Some(1));
-    let _offer_id3 = env.offer_with_order(5, 5, Some(3));
-    let _offer_id4 = env.offer_with_order(17, 17, Some(4));
-    let _offer_id7 = env.offer_with_order(5, 1, None);
-    let _offer_id5 = env.offer_with_order(5, 6, Some(5));
-    let _offer_id2 = env.offer_with_order(10, 10, Some(2));
-    let _offer_id6 = env.offer_with_order(5, 8, Some(6));
+    let _offer_id1 = env.offer_with_order(3, 3, Some(1)).await;
+    let _offer_id3 = env.offer_with_order(5, 5, Some(3)).await;
+    let _offer_id4 = env.offer_with_order(17, 17, Some(4)).await;
+    let _offer_id7 = env.offer_with_order(5, 1, None).await;
+    let _offer_id5 = env.offer_with_order(5, 6, Some(5)).await;
+    let _offer_id2 = env.offer_with_order(10, 10, Some(2)).await;
+    let _offer_id6 = env.offer_with_order(5, 8, Some(6)).await;
 
     env.connect(Version::Win10, FeatureFlags::new());
     env.c().handle_request_offers().unwrap();
@@ -1773,8 +1787,8 @@ fn test_channel_id_order_absolute() {
     ])
 }
 
-#[test]
-fn test_confidential_connection() {
+#[async_test]
+async fn test_confidential_connection() {
     let mut env = TestEnv::new();
     env.connect_trusted(
         Version::Copper,
@@ -1789,14 +1803,16 @@ fn test_confidential_connection() {
         }
     );
 
-    env.offer(1); // non-confidential
-    env.offer_with_flags(2, OfferFlags::new().with_confidential_ring_buffer(true));
+    env.offer(1).await; // non-confidential
+    env.offer_with_flags(2, OfferFlags::new().with_confidential_ring_buffer(true))
+        .await;
     env.offer_with_flags(
         3,
         OfferFlags::new()
             .with_confidential_ring_buffer(true)
             .with_confidential_external_memory(true),
-    );
+    )
+    .await;
 
     // Untrusted messages are rejected when the connection is trusted.
     let error = env
@@ -1841,8 +1857,8 @@ fn test_confidential_connection() {
         .check_message(OutgoingMessage::new(&protocol::AllOffersDelivered {}));
 }
 
-#[test]
-fn test_confidential_channels_unsupported() {
+#[async_test]
+async fn test_confidential_channels_unsupported() {
     let mut env = TestEnv::new();
 
     // A trusted connection without confidential channels is weird, but it makes sure the server
@@ -1857,14 +1873,16 @@ fn test_confidential_channels_unsupported() {
         }
     );
 
-    env.offer_with_flags(1, OfferFlags::new().with_enumerate_device_interface(true)); // non-confidential
+    env.offer_with_flags(1, OfferFlags::new().with_enumerate_device_interface(true))
+        .await; // non-confidential
     env.offer_with_flags(
         2,
         OfferFlags::new()
             .with_named_pipe_mode(true)
             .with_confidential_ring_buffer(true)
             .with_confidential_external_memory(true),
-    );
+    )
+    .await;
 
     env.send_message(in_msg_ex(
         protocol::MessageType::REQUEST_OFFERS,
@@ -1889,8 +1907,8 @@ fn test_confidential_channels_unsupported() {
         .check_message(OutgoingMessage::new(&protocol::AllOffersDelivered {}));
 }
 
-#[test]
-fn test_confidential_channels_untrusted() {
+#[async_test]
+async fn test_confidential_channels_untrusted() {
     let mut env = TestEnv::new();
 
     env.connect(
@@ -1909,12 +1927,12 @@ fn test_confidential_channels_untrusted() {
     );
 }
 
-#[test]
-fn test_disconnect() {
+#[async_test]
+async fn test_disconnect() {
     let mut env = TestEnv::new();
-    let _offer_id1 = env.offer(1);
-    let _offer_id2 = env.offer(2);
-    let _offer_id3 = env.offer(3);
+    let _offer_id1 = env.offer(1).await;
+    let _offer_id2 = env.offer(2).await;
+    let _offer_id3 = env.offer(3).await;
 
     env.connect(Version::Win10, FeatureFlags::new());
     env.c().handle_request_offers().unwrap();
@@ -1939,12 +1957,12 @@ fn test_disconnect() {
         .check_message(OutgoingMessage::new(&protocol::UnloadComplete {}));
 }
 
-#[test]
-fn test_disconnect_open_channels() {
+#[async_test]
+async fn test_disconnect_open_channels() {
     let mut env = TestEnv::new();
-    let offer_id1 = env.offer(1);
-    let offer_id2 = env.offer(2);
-    let _offer_id3 = env.offer(3);
+    let offer_id1 = env.offer(1).await;
+    let offer_id2 = env.offer(2).await;
+    let _offer_id3 = env.offer(3).await;
 
     env.connect(Version::Win10, FeatureFlags::new());
     env.c().handle_request_offers().unwrap();
@@ -1982,12 +2000,12 @@ fn test_disconnect_open_channels() {
         .check_message(OutgoingMessage::new(&protocol::UnloadComplete {}));
 }
 
-#[test]
-fn test_reinitiate_contact() {
+#[async_test]
+async fn test_reinitiate_contact() {
     let mut env = TestEnv::new();
-    let _offer_id1 = env.offer(1);
-    let _offer_id2 = env.offer(2);
-    let _offer_id3 = env.offer(3);
+    let _offer_id1 = env.offer(1).await;
+    let _offer_id2 = env.offer(2).await;
+    let _offer_id3 = env.offer(3).await;
 
     env.connect(Version::Win10, FeatureFlags::new());
     env.c().handle_request_offers().unwrap();
@@ -2046,11 +2064,11 @@ fn test_reinitiate_contact() {
     env.complete_connect();
 }
 
-#[test]
-fn test_gpadl_create_failure() {
+#[async_test]
+async fn test_gpadl_create_failure() {
     let mut env = TestEnv::new();
 
-    let offer_id1 = env.offer(1);
+    let offer_id1 = env.offer(1).await;
 
     env.connect(Version::Copper, FeatureFlags::new());
     env.c().handle_request_offers().unwrap();
@@ -2328,11 +2346,12 @@ impl TestEnv {
         self.c().complete_modify_connection(response);
     }
 
-    fn offer(&mut self, id: u32) -> OfferId {
+    async fn offer(&mut self, id: u32) -> OfferId {
         self.offer_inner(id, id, MnfUsage::Disabled, None, OfferFlags::new())
+            .await
     }
 
-    fn offer_with_mnf(&mut self, id: u32) -> OfferId {
+    async fn offer_with_mnf(&mut self, id: u32) -> OfferId {
         self.offer_inner(
             id,
             id,
@@ -2342,9 +2361,10 @@ impl TestEnv {
             None,
             OfferFlags::new(),
         )
+        .await
     }
 
-    fn offer_with_preset_mnf(&mut self, id: u32, monitor_id: u8) -> OfferId {
+    async fn offer_with_preset_mnf(&mut self, id: u32, monitor_id: u8) -> OfferId {
         self.offer_inner(
             id,
             id,
@@ -2352,9 +2372,10 @@ impl TestEnv {
             None,
             OfferFlags::new(),
         )
+        .await
     }
 
-    fn offer_with_order(
+    async fn offer_with_order(
         &mut self,
         interface_id: u32,
         instance_id: u32,
@@ -2367,13 +2388,15 @@ impl TestEnv {
             order,
             OfferFlags::new(),
         )
+        .await
     }
 
-    fn offer_with_flags(&mut self, id: u32, flags: OfferFlags) -> OfferId {
+    async fn offer_with_flags(&mut self, id: u32, flags: OfferFlags) -> OfferId {
         self.offer_inner(id, id, MnfUsage::Disabled, None, flags)
+            .await
     }
 
-    fn offer_inner(
+    async fn offer_inner(
         &mut self,
         interface_id: u32,
         instance_id: u32,
@@ -2390,6 +2413,7 @@ impl TestEnv {
                 flags,
                 ..Default::default()
             })
+            .await
             .unwrap()
     }
 

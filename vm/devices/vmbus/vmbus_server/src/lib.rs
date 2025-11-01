@@ -805,7 +805,7 @@ enum ChannelState {
 }
 
 impl ServerTask {
-    fn handle_offer(&mut self, mut info: OfferInfo) -> anyhow::Result<()> {
+    async fn handle_offer(&mut self, mut info: OfferInfo) -> anyhow::Result<()> {
         let key = info.params.key();
         let flags = info.params.flags;
 
@@ -829,6 +829,7 @@ impl ServerTask {
             .server
             .with_notifier(&mut self.inner)
             .offer_channel(info.params)
+            .await
             .context("channel offer failed")?;
 
         tracing::debug!(?offer_id, %key, "offered channel");
@@ -1166,7 +1167,7 @@ impl ServerTask {
             .send_tl_connect_result(result);
     }
 
-    fn handle_synic_message(&mut self, message: SynicMessage) {
+    async fn handle_synic_message(&mut self, message: SynicMessage) {
         match self
             .server
             .with_notifier(&mut self.inner)
@@ -1263,7 +1264,10 @@ impl ServerTask {
                 r = self.offer_recv.select_next_some() => {
                     match r {
                         OfferRequest::Offer(rpc) => {
-                            rpc.handle_failable_sync(|request| { self.handle_offer(request) })
+                            let (input, response_rpc) = rpc.split();
+                            let result = self.handle_offer(input).await;
+                            response_rpc.handle_failable_sync(|_| { result });
+
                         },
                         OfferRequest::ForceReset(rpc) => {
                             self.handle_reset(rpc);
@@ -1295,7 +1299,7 @@ impl ServerTask {
                 }
                 data = message_recv => {
                     let data = data.unwrap();
-                    self.handle_synic_message(data);
+                    self.handle_synic_message(data).await;
                 }
                 r = external_requests => {
                     let r = r.unwrap();
