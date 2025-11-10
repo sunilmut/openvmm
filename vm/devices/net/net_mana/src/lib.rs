@@ -1309,6 +1309,30 @@ impl<T: DeviceBacking> ManaQueue<T> {
                 }
             } else {
                 let mut segment_count = segment_count;
+
+                // With LSO, GDMA requires that the first segment should only contain
+                // the header and should not exceed 256 bytes. Otherwise, it treats
+                // the WQE as "corrupt", disables the queue and return GDMA error.
+                // To meet the hardware requirements, do not coalesce SGE0 when LSO is enabled.
+                // i.e. Just push the SGE0 and start coalescing from the next valid segment.
+                let header_segment_count = if meta.flags.offload_tcp_segmentation()
+                    && segments.len() > header_segment_count
+                {
+                    last_segment_bounced = false;
+                    builder.push_sge(sge);
+                    sge = Sge {
+                        address: self
+                            .guest_memory
+                            .iova(segments[header_segment_count].gpa)
+                            .unwrap(),
+                        mem_key: self.mem_key,
+                        size: segments[header_segment_count].len,
+                    };
+                    header_segment_count + 1
+                } else {
+                    header_segment_count
+                };
+
                 for tail_idx in header_segment_count..segments.len() {
                     let tail = &segments[tail_idx];
                     // Try to coalesce segments together if there are more than the hardware allows.
@@ -1320,14 +1344,7 @@ impl<T: DeviceBacking> ManaQueue<T> {
                     //       longest sequence that can be coalesced, instead of the first sequence.
                     let coalesce_possible = sge.size + tail.len < PAGE_SIZE32;
                     if segment_count > hardware_segment_limit {
-                        // With LSO, GDMA requires that the first segment should only contain
-                        // the header and should not exceed 256 bytes. Otherwise, it treats
-                        // the WQE as "corrupt", disables the queue and return GDMA error.
-                        // To meet the hardware requirements, do not coalesce SGE0 when LSO is enabled.
-                        let coalesce_sge_possible = !meta.flags.offload_tcp_segmentation()
-                            || tail_idx > header_segment_count;
                         if !last_segment_bounced
-                            && coalesce_sge_possible
                             && coalesce_possible
                             && bounce_buffer.allocate(sge.size + tail.len).is_ok()
                         {
@@ -1342,7 +1359,7 @@ impl<T: DeviceBacking> ManaQueue<T> {
                             sge.address = gpa;
                             last_segment_bounced = true;
                         }
-                        if last_segment_bounced && coalesce_sge_possible {
+                        if last_segment_bounced {
                             if let Some(mut copy) = bounce_buffer.try_extend(tail.len) {
                                 // Combine current segment with previous one using bounce buffer.
                                 self.guest_memory
