@@ -1178,10 +1178,9 @@ impl<T: DeviceBacking> ManaQueue<T> {
             };
             builder.push_sge(sge);
         } else {
-            let mut header_len = head.len;
-            // For LSO, GDMA requires that SGE0 should only contain the header.
-            let (header_segment_count, partial_bytes) = if meta.flags.offload_tcp_segmentation() {
-                header_len = (meta.l2_len as u16 + meta.l3_len + meta.l4_len as u16) as u32;
+            let (segments, segment_offset) = if meta.flags.offload_tcp_segmentation() {
+                // For LSO, GDMA requires that SGE0 should only contain the header.
+                let header_len = (meta.l2_len as u16 + meta.l3_len + meta.l4_len as u16) as u32;
                 if header_len > PAGE_SIZE32 {
                     tracelimit::error_ratelimited!(
                         header_len,
@@ -1193,148 +1192,105 @@ impl<T: DeviceBacking> ManaQueue<T> {
                 builder.set_client_oob_in_sgl(header_len as u8);
                 builder.set_gd_client_unit_data(meta.max_tcp_segment_size);
 
-                let mut partial_bytes = 0;
-                if header_len > head.len || self.force_tx_header_bounce {
-                    let mut header_bytes_remaining = header_len;
-                    let mut hdr_idx = 0;
-                    while hdr_idx < segments.len() {
-                        if header_bytes_remaining <= segments[hdr_idx].len {
-                            if segments[hdr_idx].len > header_bytes_remaining {
-                                partial_bytes = header_bytes_remaining;
+                let (head_iova, used_segments, used_segments_len) =
+                    if header_len > head.len || self.force_tx_header_bounce {
+                        let mut copy = match bounce_buffer.allocate(header_len) {
+                            Ok(buf) => buf,
+                            Err(err) => {
+                                tracelimit::error_ratelimited!(
+                                    err = &err as &dyn std::error::Error,
+                                    header_len,
+                                    "Failed to bounce buffer split header"
+                                );
+                                // Drop the packet
+                                return Ok(None);
                             }
-                            header_bytes_remaining = 0;
-                            break;
-                        }
-                        header_bytes_remaining -= segments[hdr_idx].len;
-                        hdr_idx += 1;
-                    }
-                    if header_bytes_remaining > 0 {
-                        tracelimit::error_ratelimited!(
-                            header_len,
-                            missing_header_bytes = header_bytes_remaining,
-                            "Invalid split header"
-                        );
-                        // Drop the packet
-                        return Ok(None);
-                    }
-                    ((hdr_idx + 1), partial_bytes)
-                } else {
-                    if head.len > header_len {
-                        partial_bytes = header_len;
-                    }
-                    (1, partial_bytes)
-                }
-            } else {
-                (1, 0)
-            };
+                        };
 
-            let mut last_segment_bounced = false;
-            // The header needs to be contiguous.
-            let head_iova = if header_len > head.len || self.force_tx_header_bounce {
-                let mut copy = match bounce_buffer.allocate(header_len) {
-                    Ok(buf) => buf,
-                    Err(err) => {
-                        tracelimit::error_ratelimited!(
-                            err = &err as &dyn std::error::Error,
-                            header_len,
-                            "Failed to bounce buffer split header"
-                        );
-                        // Drop the packet
-                        return Ok(None);
-                    }
-                };
-                let mut next = copy.as_slice();
-                for hdr_seg in &segments[..header_segment_count] {
-                    let len = std::cmp::min(next.len(), hdr_seg.len as usize);
-                    self.guest_memory
-                        .read_to_atomic(hdr_seg.gpa, &next[..len])?;
-                    next = &next[len..];
+                        let mut data = copy.as_slice();
+                        let mut used_segments = 0;
+                        let mut used_segments_len = 0;
+                        for segment in segments {
+                            let (this, rest) = data.split_at(data.len().min(segment.len as usize));
+                            self.guest_memory.read_to_atomic(segment.gpa, this)?;
+                            data = rest;
+                            if this.len() < segment.len as usize {
+                                break;
+                            }
+                            used_segments += 1;
+                            used_segments_len += segment.len;
+                        }
+                        if !data.is_empty() {
+                            tracelimit::error_ratelimited!(
+                                header_len,
+                                missing_header_bytes = data.len(),
+                                "Invalid split header"
+                            );
+                            // Drop the packet
+                            return Ok(None);
+                        };
+                        let ContiguousBufferInUse { gpa, .. } = copy.reserve();
+                        (gpa, used_segments, used_segments_len)
+                    } else if header_len < head.len {
+                        (self.guest_memory.iova(head.gpa).unwrap(), 0, 0)
+                    } else {
+                        (self.guest_memory.iova(head.gpa).unwrap(), 1, header_len)
+                    };
+
+                // Drop the LSO packet if it only has a header segment.
+                // In production builds, this check always runs.
+                // For tests, use test hooks to bypass this check for allowing code coverage.
+                #[cfg(not(test))]
+                let check_lso_segment_count = true;
+                #[cfg(test)]
+                let check_lso_segment_count = !self.test_configuration.allow_lso_pkt_with_one_sge;
+                if check_lso_segment_count && used_segments == segments.len() {
+                    return Ok(None);
                 }
-                last_segment_bounced = true;
-                let ContiguousBufferInUse { gpa, .. } = copy.reserve();
-                gpa
+
+                // With LSO, GDMA requires that the first segment should only contain
+                // the header and should not exceed 256 bytes. Otherwise, it treats
+                // the WQE as "corrupt", disables the queue and return GDMA error.
+                builder.push_sge(Sge {
+                    address: head_iova,
+                    mem_key: self.mem_key,
+                    size: header_len,
+                });
+                (&segments[used_segments..], header_len - used_segments_len)
             } else {
-                self.guest_memory.iova(head.gpa).unwrap()
+                // Just send the segments as they are.
+                (segments, 0)
             };
 
             // Hardware limit for short oob is 31. Max WQE size is 512 bytes.
             // Hardware limit for long oob is 30.
             let hardware_segment_limit = if short_format { 31 } else { 30 };
-            let mut sge = Sge {
-                address: head_iova,
-                mem_key: self.mem_key,
-                size: header_len,
-            };
-            if partial_bytes > 0 {
-                last_segment_bounced = false;
-                let shared_seg = &segments[header_segment_count - 1];
-                builder.push_sge(sge);
-                sge = Sge {
-                    address: self
-                        .guest_memory
-                        .iova(shared_seg.gpa)
-                        .unwrap()
-                        .wrapping_add(partial_bytes as u64),
-                    mem_key: self.mem_key,
-                    size: shared_seg.len - partial_bytes,
-                };
-            }
-
-            let segment_count =
-                builder.sge_count() + 1 + meta.segment_count - header_segment_count as u8;
-
-            // Drop the LSO packet if it only has a header segment.
-            // In production builds, this check always runs.
-            // For tests, use test hooks to bypass this check for allowing code coverage.
-            #[cfg(not(test))]
-            let check_lso_segment_count = true;
-            #[cfg(test)]
-            let check_lso_segment_count = !self.test_configuration.allow_lso_pkt_with_one_sge;
-
-            if check_lso_segment_count
-                && meta.flags.offload_tcp_segmentation()
-                && segment_count == 1
-            {
-                return Ok(None);
-            }
-
+            let segment_count = builder.sge_count() + segments.len() as u8;
             if segment_count <= hardware_segment_limit {
-                builder.push_sge(sge);
-                for tail in &segments[header_segment_count..] {
+                let mut segment_offset = segment_offset;
+                for tail in segments {
                     builder.push_sge(Sge {
-                        address: self.guest_memory.iova(tail.gpa).unwrap(),
-                        mem_key: self.mem_key,
-                        size: tail.len,
-                    });
-                }
-            } else {
-                let mut segment_count = segment_count;
-
-                // With LSO, GDMA requires that the first segment should only contain
-                // the header and should not exceed 256 bytes. Otherwise, it treats
-                // the WQE as "corrupt", disables the queue and return GDMA error.
-                // To meet the hardware requirements, do not coalesce SGE0 when LSO is enabled.
-                // i.e. Just push the SGE0 and start coalescing from the next valid segment.
-                let header_segment_count = if meta.flags.offload_tcp_segmentation()
-                    && segments.len() > header_segment_count
-                {
-                    last_segment_bounced = false;
-                    builder.push_sge(sge);
-                    sge = Sge {
                         address: self
                             .guest_memory
-                            .iova(segments[header_segment_count].gpa)
+                            .iova(tail.gpa.wrapping_add(segment_offset.into()))
                             .unwrap(),
                         mem_key: self.mem_key,
-                        size: segments[header_segment_count].len,
-                    };
-                    header_segment_count + 1
-                } else {
-                    header_segment_count
+                        size: tail.len.wrapping_sub(segment_offset),
+                    });
+                    segment_offset = 0;
+                }
+            } else {
+                let gpa0 = segments[0].gpa.wrapping_add(segment_offset.into());
+                let mut sge = Sge {
+                    address: self.guest_memory.iova(gpa0).unwrap(),
+                    mem_key: self.mem_key,
+                    size: segments[0].len.wrapping_sub(segment_offset),
                 };
 
-                for tail_idx in header_segment_count..segments.len() {
-                    let tail = &segments[tail_idx];
+                let mut last_segment_bounced = false;
+                let mut segment_count = segment_count;
+                let mut last_segment_gpa = gpa0;
+                for tail in &segments[1..] {
                     // Try to coalesce segments together if there are more than the hardware allows.
                     // TODO: Could use more expensive techniques such as
                     //       copying portions of segments to fill an entire
@@ -1351,7 +1307,6 @@ impl<T: DeviceBacking> ManaQueue<T> {
                             // There is enough room to coalesce the current
                             // segment with the previous. The previous segment
                             // is not yet bounced, so bounce it now.
-                            let last_segment_gpa = segments[tail_idx - 1].gpa;
                             let mut copy = bounce_buffer.allocate(sge.size).unwrap();
                             self.guest_memory
                                 .read_to_atomic(last_segment_gpa, copy.as_slice())?;
@@ -1392,6 +1347,7 @@ impl<T: DeviceBacking> ManaQueue<T> {
                         mem_key: self.mem_key,
                         size: tail.len,
                     };
+                    last_segment_gpa = tail.gpa;
                 }
                 builder.push_sge(sge);
                 self.stats.tx_packets_coalesced.increment();
