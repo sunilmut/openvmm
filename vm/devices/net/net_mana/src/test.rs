@@ -291,6 +291,23 @@ async fn test_lso_split_header(driver: DefaultDriver) {
         None, // Default expected stats
     )
     .await;
+
+    // Split headers such that the last header has both header and payload bytes.
+    // i.e. The header should not evenly split into segments.
+    let segment_len = 5;
+    assert!(!IPV4_HEADER_LENGTH.is_multiple_of(segment_len));
+    let num_segments = IPV4_HEADER_LENGTH + 10;
+    let packet_len = num_segments * segment_len;
+    send_test_packet(
+        driver.clone(),
+        GuestDmaMode::DirectDma,
+        packet_len,
+        num_segments,
+        true, // LSO?
+        None, // Test config
+        None, // Default expected stats
+    )
+    .await;
 }
 
 #[async_test]
@@ -330,7 +347,6 @@ async fn test_lso_segment_coalescing_only_header(driver: DefaultDriver) {
     expected_stats.as_mut().unwrap().tx_errors.add(1);
     let test_config = Some(ManaTestConfiguration {
         allow_lso_pkt_with_one_sge: true,
-        ..Default::default()
     });
     send_test_packet(
         driver.clone(),
