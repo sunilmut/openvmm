@@ -31,6 +31,8 @@ use pal_async::task::Task;
 use parking_lot::RwLock;
 use save_restore::NvmeDriverWorkerSavedState;
 use std::collections::HashMap;
+use std::mem::ManuallyDrop;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use task_control::AsyncRun;
@@ -87,7 +89,12 @@ struct NamespaceHandle {
 
 #[derive(Inspect)]
 struct DriverWorkerTask<T: DeviceBacking> {
-    device: T,
+    /// The VFIO device backing this driver. For KeepAlive cases, the VFIO handle
+    /// is never dropped, otherwise there is a chance that VFIO will reset the
+    /// device. We don't want that.
+    ///
+    /// Dropped in `NvmeDriver::reset`.
+    device: ManuallyDrop<T>,
     #[inspect(skip)]
     driver: VmTaskDriver,
     registers: Arc<DeviceRegisters<T>>,
@@ -279,7 +286,7 @@ impl<T: DeviceBacking> NvmeDriver<T> {
         Ok(Self {
             device_id: device.id().to_owned(),
             task: Some(TaskControl::new(DriverWorkerTask {
-                device,
+                device: ManuallyDrop::new(device),
                 driver: driver.clone(),
                 registers,
                 admin: None,
@@ -322,7 +329,7 @@ impl<T: DeviceBacking> NvmeDriver<T> {
         // Start the admin queue pair.
         let admin = QueuePair::new(
             self.driver.clone(),
-            &worker.device,
+            worker.device.deref(),
             ADMIN_QID,
             admin_sqes,
             admin_cqes,
@@ -524,6 +531,7 @@ impl<T: DeviceBacking> NvmeDriver<T> {
 
     fn reset(&mut self) -> impl Send + Future<Output = ()> + use<T> {
         let driver = self.driver.clone();
+        let id = self.device_id.clone();
         let mut task = std::mem::take(&mut self.task).unwrap();
         async move {
             task.stop().await;
@@ -541,6 +549,9 @@ impl<T: DeviceBacking> NvmeDriver<T> {
             if let Err(e) = worker.registers.bar0.reset(&driver).await {
                 tracing::info!(csts = e, "device reset failed");
             }
+
+            let _vfio = ManuallyDrop::into_inner(worker.device);
+            tracing::debug!(pci_id = ?id, "dropping vfio handle to device");
         }
     }
 
@@ -675,7 +686,7 @@ impl<T: DeviceBacking> NvmeDriver<T> {
         let mut this = Self {
             device_id: device.id().to_owned(),
             task: Some(TaskControl::new(DriverWorkerTask {
-                device,
+                device: ManuallyDrop::new(device),
                 driver: driver.clone(),
                 registers: registers.clone(),
                 admin: None, // Updated below.
@@ -929,6 +940,7 @@ async fn handle_asynchronous_events(
 
 impl<T: DeviceBacking> Drop for NvmeDriver<T> {
     fn drop(&mut self) {
+        tracing::trace!(pci_id = ?self.device_id, ka = self.nvme_keepalive, task = self.task.is_some(), "dropping nvme driver");
         if self.task.is_some() {
             // Do not reset NVMe device when nvme_keepalive is requested.
             tracing::debug!(nvme_keepalive = self.nvme_keepalive, pci_id = ?self.device_id, "dropping nvme driver");
@@ -967,22 +979,25 @@ impl<T: DeviceBacking> AsyncRun<WorkerState> for DriverWorkerTask<T> {
         stop: &mut task_control::StopTask<'_>,
         state: &mut WorkerState,
     ) -> Result<(), task_control::Cancelled> {
-        stop.until_stopped(async {
-            loop {
-                match self.recv.next().await {
-                    Some(NvmeWorkerRequest::CreateIssuer(rpc)) => {
-                        rpc.handle(async |cpu| self.create_io_issuer(state, cpu).await)
-                            .await
+        let r = stop
+            .until_stopped(async {
+                loop {
+                    match self.recv.next().await {
+                        Some(NvmeWorkerRequest::CreateIssuer(rpc)) => {
+                            rpc.handle(async |cpu| self.create_io_issuer(state, cpu).await)
+                                .await
+                        }
+                        Some(NvmeWorkerRequest::Save(rpc)) => {
+                            rpc.handle(async |span| self.save(state).instrument(span).await)
+                                .await
+                        }
+                        None => break,
                     }
-                    Some(NvmeWorkerRequest::Save(rpc)) => {
-                        rpc.handle(async |span| self.save(state).instrument(span).await)
-                            .await
-                    }
-                    None => break,
                 }
-            }
-        })
-        .await
+            })
+            .await;
+        tracing::debug!("nvme worker task exiting");
+        r
     }
 }
 
@@ -1061,7 +1076,7 @@ impl<T: DeviceBacking> DriverWorkerTask<T> {
 
         let queue = QueuePair::new(
             self.driver.clone(),
-            &self.device,
+            self.device.deref(),
             qid,
             state.qsize,
             state.qsize,
