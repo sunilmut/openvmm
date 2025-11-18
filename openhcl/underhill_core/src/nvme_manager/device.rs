@@ -25,6 +25,7 @@ use tracing::Instrument;
 use tracing::Span;
 use user_driver::vfio::PciDeviceResetMethod;
 use user_driver::vfio::VfioDevice;
+use user_driver::vfio::VfioDmaClients;
 use user_driver::vfio::vfio_set_device_reset_method;
 use vmcore::vm_task::VmTaskDriverSource;
 
@@ -95,13 +96,19 @@ impl CreateNvmeDriver for VfioNvmeDriverSpawner {
             })
             .map_err(NvmeSpawnerError::DmaClient)?;
 
+        let dma_clients = if save_restore_supported {
+            VfioDmaClients::PersistentOnly(dma_client)
+        } else {
+            VfioDmaClients::EphemeralOnly(dma_client)
+        };
+
         let nvme_driver = if let Some(saved_state) = saved_state {
             // On restore, always disable FLR. This isn't necessary for the attach path (setting "keepalive"
             // is sufficient), but *is* necessary to avoid Vfio issuing a reset to the device on shutdown.
             tracing::debug!(pci_id = pci_id, "Disabling FLR for NVMe device restore");
             Self::try_update_reset_method(pci_id, PciDeviceResetMethod::NoReset, "nvme_restore");
 
-            let vfio_device = VfioDevice::restore(driver_source, pci_id, true, dma_client)
+            let vfio_device = VfioDevice::restore(driver_source, pci_id, true, dma_clients)
                 .instrument(tracing::info_span!("nvme_vfio_device_restore", pci_id))
                 .await
                 .map_err(NvmeSpawnerError::Vfio)?;
@@ -126,7 +133,7 @@ impl CreateNvmeDriver for VfioNvmeDriverSpawner {
                 vp_count,
                 self.nvme_always_flr,
                 self.is_isolated,
-                dma_client,
+                dma_clients,
             )
             .await?
         };
@@ -145,7 +152,7 @@ impl VfioNvmeDriverSpawner {
         vp_count: u32,
         nvme_always_flr: bool,
         is_isolated: bool,
-        dma_client: Arc<dyn user_driver::DmaClient>,
+        dma_clients: VfioDmaClients,
     ) -> Result<nvme_driver::NvmeDriver<VfioDevice>, NvmeSpawnerError> {
         let mut last_err = None;
         let reset_methods = if nvme_always_flr {
@@ -164,7 +171,7 @@ impl VfioNvmeDriverSpawner {
                 pci_id,
                 vp_count,
                 is_isolated,
-                dma_client.clone(),
+                dma_clients.clone(),
             )
             .await
             {
@@ -201,9 +208,9 @@ impl VfioNvmeDriverSpawner {
         pci_id: &str,
         vp_count: u32,
         is_isolated: bool,
-        dma_client: Arc<dyn user_driver::DmaClient>,
+        dma_clients: VfioDmaClients,
     ) -> Result<nvme_driver::NvmeDriver<VfioDevice>, NvmeSpawnerError> {
-        let device = VfioDevice::new(driver_source, pci_id, dma_client)
+        let device = VfioDevice::new(driver_source, pci_id, dma_clients)
             .instrument(tracing::info_span!("nvme_vfio_device_open", pci_id))
             .await
             .map_err(NvmeSpawnerError::Vfio)?;
