@@ -36,8 +36,11 @@ const IPV4_HEADER_LENGTH: usize = 54;
 const MAX_GDMA_SGE_PER_TX_PACKET: usize = 31;
 
 struct TxPacketBuilder {
+    /// Tracks segments for all the packets
     segments: Vec<TxSegment>,
+    /// Total length of all the segments
     total_len: u64,
+    /// Tracks the length of each packet. The length of this vector is the number of packets.
     pkt_len: Vec<u64>,
 }
 
@@ -427,10 +430,6 @@ async fn test_multi_packet(driver: DefaultDriver) {
     num_packets += 1;
 
     let mut expected_stats = QueueStats {
-        tx_packets: Counter::new(),
-        rx_packets: Counter::new(),
-        tx_errors: Counter::new(),
-        rx_errors: Counter::new(),
         ..Default::default()
     };
     expected_stats.tx_packets.add(num_packets);
@@ -480,10 +479,6 @@ async fn test_multi_lso_packet(driver: DefaultDriver) {
     num_packets += 1;
 
     let mut expected_stats = QueueStats {
-        tx_packets: Counter::new(),
-        rx_packets: Counter::new(),
-        tx_errors: Counter::new(),
-        rx_errors: Counter::new(),
         ..Default::default()
     };
     expected_stats.tx_packets.add(num_packets);
@@ -532,10 +527,6 @@ async fn test_multi_mixed_packet(driver: DefaultDriver) {
     num_packets += 1;
 
     let mut expected_stats = QueueStats {
-        tx_packets: Counter::new(),
-        rx_packets: Counter::new(),
-        tx_errors: Counter::new(),
-        rx_errors: Counter::new(),
         ..Default::default()
     };
     expected_stats.tx_packets.add(num_packets);
@@ -665,7 +656,6 @@ fn build_tx_segments(
 ) {
     // Packet length must be divisible by number of segments.
     assert_eq!(packet_len % num_segments, 0);
-    let data_to_send = (0..packet_len).map(|v| v as u8).collect::<Vec<u8>>();
     let tx_id = 1;
     let segment_len = packet_len / num_segments;
     let mut tx_metadata = net_backend::TxMetadata {
@@ -686,7 +676,6 @@ fn build_tx_segments(
         IPV4_HEADER_LENGTH
     );
     assert_eq!(packet_len % num_segments, 0);
-    assert_eq!(data_to_send.len(), packet_len);
 
     let mut gpa = pkt_builder.data_len();
     pkt_builder.push(TxSegment {
