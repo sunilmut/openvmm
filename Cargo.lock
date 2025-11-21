@@ -2717,6 +2717,7 @@ dependencies = [
  "vmbus_async",
  "vmbus_ring",
  "vmbus_user_channel",
+ "vmcore",
  "vpci",
  "zerocopy 0.8.27",
 ]
