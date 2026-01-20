@@ -1108,7 +1108,10 @@ pub struct HclNetworkVFManager {
     _task: Task<()>,
 }
 
+/// Provides for serializing the network adapter index generation across multiple
+/// network VF managers.
 pub struct NetworkAdapterIndex {
+    /// The next adapter index to issue.
     index: AtomicU32,
 }
 
@@ -1122,10 +1125,12 @@ impl NetworkAdapterIndex {
         }
     }
 
+    /// Returns the next adapter index and increments the internal counter.
     pub fn next(&self) -> u32 {
         self.index.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Returns the current adapter index without incrementing the internal counter.
     pub fn get(&self) -> u32 {
         self.index.load(Ordering::Relaxed)
     }

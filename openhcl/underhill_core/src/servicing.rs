@@ -87,6 +87,7 @@ mod state {
         pub vmbus_client: Option<vmbus_client::SavedState>,
         #[mesh(10003)]
         pub mana_state: Option<Vec<ManaSavedState>>,
+        /// Index of the next network adapter to create.
         #[mesh(10004)]
         pub network_adapter_index: Option<u32>,
     }
@@ -209,6 +210,7 @@ pub mod transposed {
         pub nvme_state: Option<Option<NvmeSavedState>>,
         pub dma_manager_state: Option<Option<OpenhclDmaManagerState>>,
         pub vmbus_client: Option<Option<vmbus_client::SavedState>>,
+        /// Index of the next network adapter to create.
         pub network_adapter_index: Option<u32>,
     }
 
