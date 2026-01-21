@@ -275,6 +275,8 @@ struct HclNetworkVFManagerWorker {
     dma_clients: VfioDmaClients,
     #[inspect(skip)]
     vf_reconfig_receiver: Option<mesh::Receiver<()>>,
+    #[inspect(skip)]
+    network_adapter_index: Arc<NetworkAdapterIndex>,
 }
 
 impl HclNetworkVFManagerWorker {
@@ -291,6 +293,7 @@ impl HclNetworkVFManagerWorker {
         max_sub_channels: u16,
         dma_mode: GuestDmaMode,
         dma_clients: VfioDmaClients,
+        network_adapter_index: Arc<NetworkAdapterIndex>,
     ) -> (Self, mesh::Sender<HclNetworkVfManagerMessage>) {
         let (tx_to_worker, worker_rx) = mesh::channel();
         let vtl0_bus_control = if save_state.hidden_vtl0.lock().unwrap_or(false) {
@@ -322,12 +325,13 @@ impl HclNetworkVFManagerWorker {
                 dma_mode,
                 dma_clients,
                 vf_reconfig_receiver: None,
+                network_adapter_index,
             },
             tx_to_worker,
         )
     }
 
-    pub async fn connect_endpoints(&mut self) -> anyhow::Result<Vec<MacAddress>> {
+    pub async fn connect_endpoints(&mut self) -> anyhow::Result<Vec<(MacAddress, u32)>> {
         let device = self.mana_device.as_ref().expect("valid endpoint");
         let indices = (0..device.num_vports()).collect::<Vec<u32>>();
         let result = futures::future::try_join_all(
@@ -344,7 +348,8 @@ impl HclNetworkVFManagerWorker {
                             .await
                             .context("failed to create mana vport")?;
                         let mac_address = vport.mac_address();
-                        vport.set_serial_no(*index).await.with_context(|| {
+                        let adapter_index = self.network_adapter_index.next();
+                        vport.set_serial_no(adapter_index).await.with_context(|| {
                             format!("failed to set vport serial number {mac_address}")
                         })?;
                         let mana_ep = Box::new(
@@ -363,15 +368,18 @@ impl HclNetworkVFManagerWorker {
                                 format!("failed to connect new endpoint {mac_address}")
                             })?;
                         tracing::info!(%mac_address, "Network endpoint connected",);
-                        anyhow::Ok((mac_address, control))
+                        anyhow::Ok((mac_address, adapter_index, control))
                     }
                 },
             ),
         )
         .await?;
-        let (addresses, pkt_capture_controls): (Vec<_>, Vec<_>) = result.into_iter().unzip();
+        let (endpoint_info, pkt_capture_controls): (Vec<(MacAddress, u32)>, Vec<_>) = result
+            .into_iter()
+            .map(|(mac, idx, ctrl)| ((mac, idx), ctrl))
+            .unzip();
         self.pkt_capture_controls = Some(pkt_capture_controls);
-        Ok(addresses)
+        Ok(endpoint_info)
     }
 
     async fn send_vf_state_change_notifications(&self) -> anyhow::Result<()> {
@@ -1151,7 +1159,7 @@ impl HclNetworkVFManager {
         keepalive_mode: KeepAliveConfig,
         dma_clients: VfioDmaClients,
         mana_state: Option<&ManaSavedState>,
-        network_adapter_index: &NetworkAdapterIndex,
+        network_adapter_index: Arc<NetworkAdapterIndex>,
     ) -> anyhow::Result<(
         Self,
         Vec<HclNetworkVFManagerEndpointInfo>,
@@ -1215,10 +1223,11 @@ impl HclNetworkVFManager {
             max_sub_channels,
             dma_mode,
             dma_clients,
+            network_adapter_index.clone(),
         );
 
         // Queue new endpoints.
-        let mac_addresses = worker.connect_endpoints().await?;
+        let endpoint_info = worker.connect_endpoints().await?;
         // The proxy endpoints are not yet in use, so run them here to switch to the queued endpoints.
         // N.B Endpoint should not return any other action type other than `RestartRequired`
         //     at this time because the notification task hasn't been started yet.
@@ -1235,12 +1244,14 @@ impl HclNetworkVFManager {
         worker.vf_reconfig_receiver = Some(device.subscribe_vf_reconfig().await);
         let endpoints = endpoints
             .into_iter()
-            .zip(mac_addresses)
-            .map(|(endpoint, mac_address)| HclNetworkVFManagerEndpointInfo {
-                adapter_index: network_adapter_index.next(),
-                mac_address,
-                endpoint,
-            })
+            .zip(endpoint_info)
+            .map(
+                |(endpoint, (mac_address, adapter_index))| HclNetworkVFManagerEndpointInfo {
+                    adapter_index,
+                    mac_address,
+                    endpoint,
+                },
+            )
             .collect();
 
         let task = driver_source

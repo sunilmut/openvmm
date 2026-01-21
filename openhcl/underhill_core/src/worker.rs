@@ -791,7 +791,7 @@ impl UhVmNetworkSettings {
         is_isolated: bool,
         keepalive_mode: KeepAliveConfig,
         saved_mana_state: Option<&ManaSavedState>,
-        network_adapter_index: &NetworkAdapterIndex,
+        network_adapter_index: Arc<NetworkAdapterIndex>,
     ) -> anyhow::Result<RuntimeSavedState> {
         let instance_id = nic_config.instance_id;
         let nic_max_sub_channels = nic_config
@@ -978,7 +978,7 @@ impl LoadedVmNetworkSettings for UhVmNetworkSettings {
         is_isolated: bool,
         save_restore_supported: KeepAliveConfig,
         mana_state: Option<&ManaSavedState>,
-        network_adapter_index: &NetworkAdapterIndex,
+        network_adapter_index: Arc<NetworkAdapterIndex>,
     ) -> anyhow::Result<RuntimeSavedState> {
         if self.vf_managers.contains_key(&instance_id) {
             return Err(NetworkSettingsError::VFManagerExists(instance_id).into());
@@ -3327,7 +3327,9 @@ async fn new_underhill_vm(
         },
     };
     let mut netvsp_state = Vec::with_capacity(controllers.mana.len());
-    let network_adapter_index = NetworkAdapterIndex::new(servicing_state.network_adapter_index);
+    let network_adapter_index = Arc::new(NetworkAdapterIndex::new(
+        servicing_state.network_adapter_index,
+    ));
     if !controllers.mana.is_empty() {
         let _span = tracing::info_span!("network_settings", CVM_ALLOWED).entered();
         for nic_config in controllers.mana.into_iter() {
@@ -3352,7 +3354,7 @@ async fn new_underhill_vm(
                     isolation.is_isolated(),
                     env_cfg.mana_keep_alive.clone(),
                     nic_servicing_state,
-                    &network_adapter_index,
+                    network_adapter_index.clone(),
                 )
                 .await?;
 
@@ -3576,7 +3578,7 @@ async fn new_underhill_vm(
         test_configuration: env_cfg.test_configuration,
         dma_manager,
         config_timeout_in_seconds: env_cfg.config_timeout_in_seconds,
-        network_adapter_index,
+        network_adapter_index: network_adapter_index.clone(),
     };
 
     Ok(loaded_vm)
