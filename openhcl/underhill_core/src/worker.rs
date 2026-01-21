@@ -849,7 +849,7 @@ impl UhVmNetworkSettings {
             keepalive_mode,
             dma_clients,
             saved_mana_state,
-            &network_adapter_index,
+            network_adapter_index,
         )
         .await?;
 
