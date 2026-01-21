@@ -119,7 +119,7 @@ pub trait LoadedVmNetworkSettings: Inspect {
         is_isolated: bool,
         keepalive_mode: KeepAliveConfig,
         mana_state: Option<&ManaSavedState>,
-        network_adapter_index: &NetworkAdapterIndex,
+        network_adapter_index: Arc<NetworkAdapterIndex>,
     ) -> anyhow::Result<RuntimeSavedState>;
 
     /// Callback when network is removed externally.
@@ -201,7 +201,7 @@ pub(crate) struct LoadedVm {
     pub dma_manager: OpenhclDmaManager,
     pub config_timeout_in_seconds: u64,
     pub servicing_timeout_dump_collection_in_ms: u64,
-    pub network_adapter_index: NetworkAdapterIndex,
+    pub network_adapter_index: Arc<NetworkAdapterIndex>,
 }
 
 pub struct LoadedVmState<T> {
@@ -1026,7 +1026,7 @@ impl LoadedVm {
                 self.isolation.is_isolated(),
                 self.mana_keep_alive.clone(),
                 None, // No existing mana state
-                &self.network_adapter_index,
+                self.network_adapter_index.clone(),
             )
             .await?;
 
