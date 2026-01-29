@@ -89,7 +89,8 @@ mod state {
         pub mana_state: Option<Vec<ManaSavedState>>,
         /// Index of the next network adapter to create.
         #[mesh(10004)]
-        pub network_adapter_index: Option<u32>,
+        pub network_adapter_index:
+            Option<Vec<crate::emuplat::netvsp::NetworkAdapterIndexSavedState>>,
     }
 
     #[derive(Protobuf)]
@@ -210,8 +211,9 @@ pub mod transposed {
         pub nvme_state: Option<Option<NvmeSavedState>>,
         pub dma_manager_state: Option<Option<OpenhclDmaManagerState>>,
         pub vmbus_client: Option<Option<vmbus_client::SavedState>>,
-        /// Index of the next network adapter to create.
-        pub network_adapter_index: Option<u32>,
+        /// Network adapter index saved state.
+        pub network_adapter_index:
+            Option<Vec<crate::emuplat::netvsp::NetworkAdapterIndexSavedState>>,
     }
 
     /// A transposed `Option<EmuplatSavedState>`, where each field of
