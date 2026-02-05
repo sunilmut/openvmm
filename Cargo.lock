@@ -797,19 +797,26 @@ dependencies = [
 name = "consomme"
 version = "0.0.0"
 dependencies = [
+ "blocking",
+ "cfg-if",
  "futures",
  "getrandom 0.3.3",
  "heapless",
  "inspect",
  "inspect_counters",
  "libc",
+ "mesh_channel_core",
+ "pal",
  "pal_async",
  "parking_lot",
  "resolv-conf",
+ "slab",
  "smoltcp",
  "socket2",
  "thiserror 2.0.16",
+ "tracelimit",
  "tracing",
+ "winapi",
  "windows-sys 0.61.0",
 ]
 
