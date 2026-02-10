@@ -1989,6 +1989,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
+ "xshell",
 ]
 
 [[package]]
@@ -2043,7 +2044,6 @@ dependencies = [
  "target-lexicon",
  "vmm_test_images",
  "which 8.0.0",
- "xshell",
 ]
 
 [[package]]
