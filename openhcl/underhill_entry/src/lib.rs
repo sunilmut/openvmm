@@ -7,6 +7,7 @@
 #![cfg(target_os = "linux")]
 
 // Use mimalloc instead of the system malloc for performance.
+// For memory profiling, DHAT allocator is needed.
 #[global_allocator]
 #[cfg(not(feature = "mem-profile-tracing"))]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;

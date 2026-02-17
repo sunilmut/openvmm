@@ -736,21 +736,21 @@ impl DiagServiceHandler {
         &self,
         request: &MemoryProfileTraceRequest,
     ) -> anyhow::Result<diag_proto::MemoryProfileTraceResponse> {
-        #[cfg(feature = "mem-profile-tracing")]
-        {
-            let data = self
-                .request_send
-                .call_failable(DiagRequest::MemoryProfileTrace, request.pid)
-                .await?;
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "mem-profile-tracing")]
+            {
+                let data = self
+                    .request_send
+                    .call_failable(DiagRequest::MemoryProfileTrace, request.pid)
+                    .await?;
 
-            Ok(diag_proto::MemoryProfileTraceResponse { data })
-        }
-        #[cfg(not(feature = "mem-profile-tracing"))]
-        {
-            let _ = request;
-            anyhow::bail!(
-                "Profiler tracing feature disabled: rebuild with the `mem-profile-tracing` feature enabled"
-            )
+                Ok(diag_proto::MemoryProfileTraceResponse { data })
+            } else {
+                let _ = request;
+                anyhow::bail!(
+                    "Profiler tracing feature disabled: rebuild with the `mem-profile-tracing` feature enabled"
+                )
+            }
         }
     }
 }
