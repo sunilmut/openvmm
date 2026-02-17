@@ -3632,7 +3632,7 @@ async fn new_underhill_vm(
         config_timeout_in_seconds: env_cfg.config_timeout_in_seconds,
         servicing_timeout_dump_collection_in_ms: env_cfg.servicing_timeout_dump_collection_in_ms,
         #[cfg(feature = "mem-profile-tracing")]
-        profiler: dhat::Profiler::new_heap(),
+        profiler: mem_profile_tracing::HeapProfiler::new(),
     };
 
     Ok(loaded_vm)

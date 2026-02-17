@@ -3996,6 +3996,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mem_profile_tracing"
+version = "0.0.0"
+dependencies = [
+ "dhat",
+]
+
+[[package]]
 name = "membacking"
 version = "0.0.0"
 dependencies = [
@@ -8149,7 +8156,6 @@ dependencies = [
  "cvm_tracing",
  "debug_ptr",
  "debug_worker_defs",
- "dhat",
  "diag_proto",
  "diag_server",
  "disk_backend",
@@ -8193,6 +8199,7 @@ dependencies = [
  "local_clock",
  "mana_driver",
  "mcr_resources",
+ "mem_profile_tracing",
  "memory_range",
  "mesh",
  "mesh_process",
