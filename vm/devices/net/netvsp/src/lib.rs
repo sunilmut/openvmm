@@ -1320,6 +1320,20 @@ impl VmbusDevice for Nic {
         {
             let worker = &mut self.coordinator.state_mut().unwrap().workers[channel_idx as usize];
             worker.stop().await;
+            if let Some(worker_state) = worker.state_mut() {
+                // Send TX completions for all pending TX packets before
+                // removing the worker.
+                let ready = match &mut worker_state.state {
+                    WorkerState::Ready(ready) => Some(ready),
+                    WorkerState::WaitingForCoordinator(ready) => ready.as_mut(),
+                    WorkerState::Init(_) => None,
+                };
+                if let Some(ready) = ready {
+                    worker_state
+                        .channel
+                        .complete_pending_tx_on_close(&mut ready.state);
+                }
+            }
             if worker.has_state() {
                 worker.remove();
             }
@@ -5761,6 +5775,32 @@ impl<T: 'static + RingMem> NetChannel<T> {
             });
         }
         Ok(())
+    }
+
+    /// Sends TX completions for all pending TX packets on channel close.
+    ///
+    /// This handles both in-flight packets (submitted to the endpoint but not
+    /// yet completed) and already-queued completions that haven't been written
+    /// to the ring yet.
+    fn complete_pending_tx_on_close(&mut self, state: &mut ActiveState) {
+        // Complete any in-flight TX packets that were submitted to the endpoint.
+        for (id, inflight) in state.pending_tx_packets.iter_mut().enumerate() {
+            if inflight.pending_packet_count > 0 {
+                inflight.pending_packet_count = 0;
+                state.pending_tx_completions.push_back(PendingTxCompletion {
+                    transaction_id: inflight.transaction_id,
+                    tx_id: Some(TxId(id as u32)),
+                    status: protocol::Status::SUCCESS,
+                });
+            }
+        }
+
+        // Send all pending TX completions to the guest.
+        self.pending_send_size = 0;
+        while let Some(pending) = state.pending_tx_completions.front() {
+            let _ = self.try_send_tx_packet(pending.transaction_id, pending.status);
+            state.pending_tx_completions.pop_front();
+        }
     }
 }
 
