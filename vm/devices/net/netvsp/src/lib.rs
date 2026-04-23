@@ -5485,6 +5485,7 @@ impl<T: 'static + RingMem> NetChannel<T> {
                         .as_ref()
                         .is_some_and(|p| p.rndis_state == RndisState::Halted)
                     {
+                        tracelimit::info_ratelimited!("RNDIS halted, completing packet without processing");
                         self.send_completion(packet.transaction_id, None)?;
                         continue;
                     }
@@ -5821,6 +5822,7 @@ impl<T: 'static + RingMem> NetChannel<T> {
         // Send all pending TX completions to the guest.
         self.pending_send_size = 0;
         while let Some(pending) = state.pending_tx_completions.front() {
+            tracelimit::info_ratelimited!("completing pending Tx packets on halt");
             let _ = self.try_send_tx_packet(pending.transaction_id, pending.status);
             state.pending_tx_completions.pop_front();
         }
