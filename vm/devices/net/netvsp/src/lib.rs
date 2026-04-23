@@ -2414,7 +2414,8 @@ impl<T: RingMem> NetChannel<T> {
             .ok_or(WorkerError::NotSupportedOnSubChannel(message_type))?;
 
         if message_type == rndisprot::MESSAGE_TYPE_HALT_MSG {
-            // Currently ignored and does not require a response.
+            tracelimit::info_ratelimited!("received RNDIS halt message");
+            control.rndis_state = RndisState::Halted;
             return Ok(());
         }
 
@@ -5477,6 +5478,17 @@ impl<T: 'static + RingMem> NetChannel<T> {
             did_some_work = true;
             match packet.data {
                 PacketData::RndisPacket(_) => {
+                    // If the RNDIS state is halted, skip processing and
+                    // immediately complete the packet.
+                    if state
+                        .primary
+                        .as_ref()
+                        .is_some_and(|p| p.rndis_state == RndisState::Halted)
+                    {
+                        self.send_completion(packet.transaction_id, None)?;
+                        continue;
+                    }
+
                     let id = state.free_tx_packets.pop().unwrap();
                     let result: Result<usize, WorkerError> =
                         self.handle_rndis(buffers, id, state, &packet, &mut data.tx_segments);
@@ -5485,6 +5497,17 @@ impl<T: 'static + RingMem> NetChannel<T> {
                             total_packets += num_packets as u64;
                             if num_packets == 0 {
                                 self.complete_tx_packet(state, id, protocol::Status::SUCCESS)?;
+                            }
+                            // If a halt message was processed, complete all
+                            // pending TX packets and stop processing further
+                            // RNDIS messages.
+                            if state
+                                .primary
+                                .as_ref()
+                                .is_some_and(|p| p.rndis_state == RndisState::Halted)
+                            {
+                                self.complete_pending_tx_on_close(state);
+                                break;
                             }
                         }
                         Err(err) => {
