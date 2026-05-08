@@ -567,7 +567,6 @@ pub(crate) mod ioctls {
     pub const HCL_CAP_VTL_RETURN_ACTION: u32 = 2;
     pub const HCL_CAP_DR6_SHARED: u32 = 3;
     pub const HCL_CAP_LOWER_VTL_TIMER_VIRT: u32 = 4;
-    pub const HCL_CAP_LOWER_VTL_SNP_GUEST_REQUEST: u32 = 5;
 
     ioctl_write_ptr!(
         /// Check for the presence of an extension capability.
@@ -1386,8 +1385,7 @@ impl Hcl {
         self.supports_lower_vtl_timer_virt
     }
 
-    /// Returns true if SNP guest requests from lower VTLs are intercepted and
-    /// forwarded to VTL2.
+    /// Returns true if the partition supports SNP guest requests from lower VTLs.
     pub fn supports_lower_vtl_snp_guest_request(&self) -> bool {
         self.supports_lower_vtl_snp_guest_request
     }
@@ -1792,8 +1790,29 @@ impl Hcl {
         let dr6_shared = mshv_fd.check_extension(HCL_CAP_DR6_SHARED)?;
         let supports_lower_vtl_timer_virt =
             mshv_fd.check_extension(HCL_CAP_LOWER_VTL_TIMER_VIRT)?;
-        let supports_lower_vtl_snp_guest_request =
-            mshv_fd.check_extension(HCL_CAP_LOWER_VTL_SNP_GUEST_REQUEST)?;
+
+        let supports_lower_vtl_snp_guest_request = if cfg!(guest_arch = "x86_64") {
+            // xtask-fmt allow-target-arch cpu-intrinsic
+            #[cfg(target_arch = "x86_64")]
+            {
+                let result = safe_intrinsics::cpuid(
+                    hvdef::HV_CPUID_FUNCTION_MS_HV_ENLIGHTENMENT_INFORMATION,
+                    0,
+                );
+                let enlightenment_info = hvdef::HvEnlightenmentInformation::from_cpuid([
+                    result.eax, result.ebx, result.ecx, result.edx,
+                ]);
+                enlightenment_info.lower_vtl_guest_request_support()
+            }
+            // xtask-fmt allow-target-arch cpu-intrinsic
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                unreachable!()
+            }
+        } else {
+            false
+        };
+
         tracing::debug!(
             supports_vtl_ret_action,
             supports_register_page,

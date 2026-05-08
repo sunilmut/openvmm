@@ -433,10 +433,7 @@ pub struct SnpBackedShared {
     /// VMPCK keys extracted from the SNP secrets page at partition initialization.
     /// Indexed by VMPCK index (0-3), where each key is [`SNP_VMPCK_KEY_SIZE`] bytes.
     #[inspect(skip)]
-    vmpck_keys: [[u8; SNP_VMPCK_KEY_SIZE]; SNP_NUM_VMPCKS],
-    /// Whether the hypervisor supports intercepting SNP guest requests from lower
-    /// VTLs and forwarding them to VTL2.
-    supports_lower_vtl_snp_guest_request: bool,
+    vmpck_keys: Option<[[u8; SNP_VMPCK_KEY_SIZE]; SNP_NUM_VMPCKS]>,
 }
 
 impl SnpBackedShared {
@@ -470,16 +467,28 @@ impl SnpBackedShared {
         // Configure timer interface for lower VTLs.
         let guest_timer = hardware_cvm::VmTimeGuestTimer;
 
+        let required_len = SNP_SECRETS_VMPCK0_OFFSET + SNP_NUM_VMPCKS * SNP_VMPCK_KEY_SIZE;
+
         // Extract the four VMPCK keys from the SNP secrets page.
         let vmpck_keys = if let Some(secrets) = partition_params.snp_secrets {
-            let mut keys = [[0u8; SNP_VMPCK_KEY_SIZE]; SNP_NUM_VMPCKS];
-            for (i, key) in keys.iter_mut().enumerate() {
-                let offset = SNP_SECRETS_VMPCK0_OFFSET + i * SNP_VMPCK_KEY_SIZE;
-                key.copy_from_slice(&secrets[offset..offset + SNP_VMPCK_KEY_SIZE]);
+            if secrets.len() < required_len {
+                tracing::error!(
+                    "SNP secrets page too small: got {} bytes, expected at least {} bytes",
+                    secrets.len(),
+                    required_len
+                );
+
+                None
+            } else {
+                let mut keys = [[0u8; SNP_VMPCK_KEY_SIZE]; SNP_NUM_VMPCKS];
+                for (i, key) in keys.iter_mut().enumerate() {
+                    let offset = SNP_SECRETS_VMPCK0_OFFSET + i * SNP_VMPCK_KEY_SIZE;
+                    key.copy_from_slice(&secrets[offset..offset + SNP_VMPCK_KEY_SIZE]);
+                }
+                Some(keys)
             }
-            keys
         } else {
-            [[0u8; SNP_VMPCK_KEY_SIZE]; SNP_NUM_VMPCKS]
+            None
         };
 
         Ok(Self {
@@ -490,7 +499,6 @@ impl SnpBackedShared {
             cvm,
             guest_timer,
             vmpck_keys,
-            supports_lower_vtl_snp_guest_request: params.hcl.supports_lower_vtl_snp_guest_request(),
         })
     }
 }
@@ -3150,9 +3158,14 @@ impl TlbFlushLockAccess for SnpTlbLockFlushAccess<'_> {
 
 impl hv1_hypercall::GetSnpVmpck for UhHypercallHandler<'_, '_, SnpBacked> {
     fn get_snp_vmpck(&mut self) -> hvdef::HvResult<hvdef::hypercall::GetSnpVmpckOutput> {
-        if !self.vp.shared.supports_lower_vtl_snp_guest_request {
+        if !self.vp.partition.hcl.supports_lower_vtl_snp_guest_request() {
             return Err(HvError::AccessDenied);
         }
+
+        let vmpck_keys = match &self.vp.shared.vmpck_keys {
+            Some(keys) => keys,
+            None => return Err(HvError::NotFound),
+        };
 
         // The VMPCK index corresponds to the VMPL of the calling VTL:
         // VTL0 runs at VMPL2, VTL1 runs at VMPL1.
@@ -3160,8 +3173,9 @@ impl hv1_hypercall::GetSnpVmpck for UhHypercallHandler<'_, '_, SnpBacked> {
             GuestVtl::Vtl0 => 2,
             GuestVtl::Vtl1 => 1,
         };
-        let vmpck_key = self.vp.shared.vmpck_keys[index];
-        Ok(hvdef::hypercall::GetSnpVmpckOutput { vmpck_key })
+        Ok(hvdef::hypercall::GetSnpVmpckOutput {
+            vmpck_key: vmpck_keys[index],
+        })
     }
 }
 
