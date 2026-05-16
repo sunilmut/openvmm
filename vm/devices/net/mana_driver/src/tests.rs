@@ -337,7 +337,7 @@ async fn test_gdma_reset_request(driver: DefaultDriver) {
         .unwrap();
 
     assert!(
-        !gdma.get_reset_request_pending(),
+        !gdma.get_reset_request_pending().is_some(),
         "reset_request_pending should be false"
     );
 
@@ -355,7 +355,7 @@ async fn test_gdma_reset_request(driver: DefaultDriver) {
     gdma.generate_reset_request_eqe().await.unwrap();
 
     assert!(
-        gdma.get_reset_request_pending(),
+        gdma.get_reset_request_pending().is_some(),
         "reset_request_pending should be true after reset request"
     );
 
@@ -368,7 +368,7 @@ async fn test_gdma_reset_request(driver: DefaultDriver) {
         "unexpected error: {err_msg}"
     );
     assert!(
-        gdma.get_reset_request_pending(),
+        gdma.get_reset_request_pending().is_some(),
         "reset_request_pending should remain true after deregister_device"
     );
 }
