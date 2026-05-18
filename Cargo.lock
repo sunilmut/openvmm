@@ -5427,7 +5427,6 @@ dependencies = [
  "input_core",
  "inspect",
  "inspect_proto",
- "memory_range",
  "mesh",
  "mesh_process",
  "mesh_rpc",
@@ -6020,7 +6019,6 @@ dependencies = [
  "kmsg",
  "libtest-mimic",
  "linkme",
- "memory_range",
  "mesh",
  "mesh_process",
  "mesh_worker",
@@ -9516,6 +9514,7 @@ dependencies = [
  "serial_pl011_resources",
  "thiserror 2.0.16",
  "vm_resource",
+ "vmm_core_defs",
  "vmotherboard",
 ]
 

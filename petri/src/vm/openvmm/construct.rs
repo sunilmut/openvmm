@@ -23,7 +23,6 @@ use crate::UefiConfig;
 use crate::VmbusStorageType;
 use crate::linux_direct_serial_agent::LinuxDirectSerialAgent;
 
-use crate::MmioConfig;
 use crate::SIZE_1_MB;
 use crate::VmbusStorageController;
 use crate::openvmm::memdiff_vmgs;
@@ -46,10 +45,6 @@ use mesh_process::Mesh;
 use nvme_resources::NamespaceDefinition;
 use nvme_resources::NvmeControllerHandle;
 use openvmm_defs::config::Config;
-use openvmm_defs::config::DEFAULT_MMIO_GAPS_AARCH64;
-use openvmm_defs::config::DEFAULT_MMIO_GAPS_AARCH64_WITH_VTL2;
-use openvmm_defs::config::DEFAULT_MMIO_GAPS_X86;
-use openvmm_defs::config::DEFAULT_MMIO_GAPS_X86_WITH_VTL2;
 use openvmm_defs::config::DEFAULT_PCAT_BOOT_ORDER;
 use openvmm_defs::config::DeviceVtl;
 use openvmm_defs::config::HypervisorConfig;
@@ -353,6 +348,7 @@ impl PetriVmConfigOpenVmm {
         let mut vsock_listener = Some(vsock_listener);
         let vsock_path_string = vsock_path.to_string_lossy();
 
+        let layout_config = chipset.layout_config();
         let chipset = chipset
             .build()
             .context("failed to build chipset configuration")?;
@@ -361,7 +357,6 @@ impl PetriVmConfigOpenVmm {
             let MemoryConfig {
                 startup_bytes,
                 dynamic_memory_range,
-                mmio_gaps,
                 numa_mem_sizes,
             } = memory;
 
@@ -380,24 +375,6 @@ impl PetriVmConfigOpenVmm {
 
             openvmm_defs::config::MemoryConfig {
                 mem_size,
-                mmio_gaps: match mmio_gaps {
-                    MmioConfig::Platform => {
-                        if firmware.is_openhcl() {
-                            match arch {
-                                MachineArch::X86_64 => DEFAULT_MMIO_GAPS_X86_WITH_VTL2.into(),
-                                MachineArch::Aarch64 => DEFAULT_MMIO_GAPS_AARCH64_WITH_VTL2.into(),
-                            }
-                        } else {
-                            match arch {
-                                MachineArch::X86_64 => DEFAULT_MMIO_GAPS_X86.into(),
-                                MachineArch::Aarch64 => DEFAULT_MMIO_GAPS_AARCH64.into(),
-                            }
-                        }
-                    }
-                    MmioConfig::Custom(ranges) => ranges,
-                },
-                pci_ecam_gaps: vec![],
-                pci_mmio_gaps: vec![],
                 prefetch_memory: false,
                 private_memory: false,
                 transparent_hugepages: false,
@@ -520,6 +497,7 @@ impl PetriVmConfigOpenVmm {
             chipset_devices,
             pci_chipset_devices,
             chipset_capabilities: capabilities,
+            layout: layout_config,
 
             // Basic virtualization device support
             hypervisor: HypervisorConfig {

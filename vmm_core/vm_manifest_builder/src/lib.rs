@@ -43,6 +43,7 @@ use vm_resource::PlatformResource;
 use vm_resource::Resource;
 use vm_resource::ResourceId;
 use vm_resource::kind::SerialBackendHandle;
+pub use vmm_core_defs::LayoutConfig;
 use vmotherboard::ChipsetDeviceHandle;
 use vmotherboard::LegacyPciChipsetDeviceHandle;
 use vmotherboard::options::BaseChipsetManifest;
@@ -391,6 +392,36 @@ impl VmManifestBuilder {
         }
 
         Ok(result)
+    }
+
+    /// Returns the default memory layout sizing for this VM type and
+    /// architecture.
+    ///
+    /// This is separate from [`Self::build`] because not every consumer runs
+    /// the layout engine. In particular, OpenHCL (Underhill) receives its
+    /// memory layout from the host and does not use these defaults.
+    pub fn layout_config(&self) -> LayoutConfig {
+        let default_low = match self.arch {
+            MachineArch::X86_64 => 128 * 1024 * 1024,
+            MachineArch::Aarch64 => 512 * 1024 * 1024,
+        };
+        let default_high: u64 = 512 * 1024 * 1024;
+        let default_vtl2: u64 = 1024 * 1024 * 1024;
+        match self.ty {
+            BaseChipsetType::HypervGen1
+            | BaseChipsetType::HypervGen2Uefi
+            | BaseChipsetType::HyperVGen2LinuxDirect
+            | BaseChipsetType::UnenlightenedLinuxDirect => LayoutConfig {
+                chipset_low_mmio_size: default_low,
+                chipset_high_mmio_size: default_high,
+                vtl2_chipset_mmio_size: 0,
+            },
+            BaseChipsetType::HclHost => LayoutConfig {
+                chipset_low_mmio_size: default_low,
+                chipset_high_mmio_size: default_high,
+                vtl2_chipset_mmio_size: default_vtl2,
+            },
+        }
     }
 }
 
