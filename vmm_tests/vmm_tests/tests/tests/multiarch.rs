@@ -5,6 +5,7 @@
 
 use anyhow::Context;
 use futures::StreamExt;
+use petri::EfiDiagnosticsLogLevel;
 use petri::MemoryConfig;
 use petri::PetriHaltReason;
 use petri::PetriVmBuilder;
@@ -495,6 +496,44 @@ async fn efi_diagnostics_no_boot<T: PetriVmmBackend>(
     }
 
     anyhow::bail!("Did not find expected message in kmsg");
+}
+
+/// Test EFI diagnostics with INFO-level logging enabled
+/// TODO:
+///  - change hyperv tests to use WMI instead of env_cfg once
+///    CI runners support it
+#[vmm_test_with(noagent(
+    openvmm_openhcl_uefi_x64(none),
+    hyperv_openhcl_uefi_x64(none),
+    hyperv_openhcl_uefi_aarch64(none)
+))]
+async fn efi_diagnostics_info_level<T: PetriVmmBackend>(
+    config: PetriVmBuilder<T>,
+) -> anyhow::Result<()> {
+    let vm = config
+        .with_uefi_frontpage(true)
+        .with_efi_diagnostics_log_level(EfiDiagnosticsLogLevel::Info)
+        .run_without_agent()
+        .await?;
+
+    // Marker emitted by `firmware_uefi::service::diagnostics` for every
+    // UEFI log entry tagged with `DEBUG_INFO`.
+    //
+    // Presence of this marker in the kmsg output validates that.
+    const INFO_MARKER: &str = "debug_level=INFO";
+
+    let mut kmsg = vm.kmsg().await?;
+
+    while let Some(data) = kmsg.next().await {
+        let data = data.context("reading kmsg")?;
+        let msg = kmsg::KmsgParsedEntry::new(&data).unwrap();
+        let raw = msg.message.as_raw();
+        if raw.contains(INFO_MARKER) {
+            return Ok(());
+        }
+    }
+
+    anyhow::bail!("Did not find any INFO-level UEFI diagnostics entry ({INFO_MARKER:?}) in kmsg");
 }
 
 /// Boot our guest-test UEFI image, which will run some tests,
