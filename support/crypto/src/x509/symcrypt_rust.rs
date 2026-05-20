@@ -9,11 +9,6 @@ use der::Encode;
 use x509_cert::Certificate;
 
 #[cfg(symcrypt)]
-fn err(err: symcrypt::errors::SymCryptError, op: &'static str) -> X509Error {
-    X509Error(crate::BackendError::SymCrypt(err, op))
-}
-
-#[cfg(symcrypt)]
 fn der_err(err: der::Error, op: &'static str) -> X509Error {
     X509Error(crate::BackendError::Der(err, op))
 }
@@ -42,7 +37,7 @@ impl X509CertificateInner {
         Ok(Self(cert))
     }
 
-    pub fn public_key(&self) -> Result<crate::rsa::RsaPublicKey, X509Error> {
+    pub fn public_key(&self) -> Result<crate::rsa::RsaPublicKey, crate::rsa::RsaError> {
         // Currently we only expect RSA public keys.
         // If someday we need to support other public key types, the return
         // type of this function will need to change.
@@ -53,19 +48,11 @@ impl X509CertificateInner {
                 .subject_public_key
                 .raw_bytes(),
         )
-        .map_err(|e| der_err(e, "parsing PKCS#1 RSA public key"))?;
-        #[cfg(symcrypt)]
-        let key = symcrypt::rsa::RsaKey::set_public_key(
+        .map_err(|e| rsa_der_err(e, "parsing PKCS#1 RSA public key"))?;
+        crate::rsa::RsaPublicKey::from_components(
             key.modulus.as_bytes(),
             key.public_exponent.as_bytes(),
-            symcrypt::rsa::RsaKeyUsage::SignAndEncrypt,
         )
-        .map_err(|e| err(e, "constructing RSA public key"))?;
-        #[cfg(rust)]
-        let key = key.try_into().unwrap();
-        Ok(crate::rsa::RsaPublicKey(
-            crate::rsa::sys::RsaPublicKeyInner(key),
-        ))
     }
 
     pub fn verify(
