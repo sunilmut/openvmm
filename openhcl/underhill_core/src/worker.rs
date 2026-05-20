@@ -24,6 +24,7 @@ use crate::dispatch::vtl2_settings_worker::InitialControllers;
 use crate::dispatch::vtl2_settings_worker::disk_from_disk_type;
 use crate::dispatch::vtl2_settings_worker::wait_for_mana;
 use crate::emuplat::EmuplatServicing;
+use crate::emuplat::cmos_rtc_time_source::UnderhillCmosRtcTimeSourceResolver;
 use crate::emuplat::firmware::UnderhillLogger;
 use crate::emuplat::firmware::UnderhillVsmConfig;
 use crate::emuplat::framebuffer::FramebufferRemoteControl;
@@ -152,6 +153,7 @@ use virt_mshv_vtl::UhPartitionNewParams;
 use virt_mshv_vtl::UhProtoPartition;
 use vm_loader::initial_regs::initial_regs;
 use vm_resource::IntoResource;
+use vm_resource::PlatformResource;
 use vm_resource::Resource;
 use vm_resource::ResourceResolver;
 use vm_resource::kind::DiskHandleKind;
@@ -2308,7 +2310,6 @@ async fn new_underhill_vm(
         Some(n) => n.to_ne_bytes(),
     };
 
-    // TODO: move to instantiate via a resource.
     let rtc_time_source = ArcMutexUnderhillLocalClock(Arc::new(Mutex::new(
         UnderhillLocalClock::new(
             get_client.clone(),
@@ -2324,6 +2325,10 @@ async fn new_underhill_vm(
         .await
         .context("failed to initialize UnderhillLocalClock emuplat")?,
     )));
+
+    resolver.add_resolver(UnderhillCmosRtcTimeSourceResolver {
+        time_source: rtc_time_source.new_linked_clock(),
+    });
 
     let mut serial_inputs = [None, None, None, None];
 
@@ -2802,7 +2807,7 @@ async fn new_underhill_vm(
 
     #[cfg(guest_arch = "x86_64")]
     let deps_piix4_cmos_rtc = chipset.with_piix4_cmos_rtc.then(|| dev::Piix4CmosRtcDeps {
-        time_source: Box::new(rtc_time_source.new_linked_clock()),
+        time_source: PlatformResource.into_resource(),
         initial_cmos: Some(firmware_pcat::default_cmos_values(&mem_layout)),
         enlightened_interrupts: true, // As advertised by the PCAT BIOS.
     });
@@ -2861,7 +2866,7 @@ async fn new_underhill_vm(
         .with_generic_cmos_rtc
         .then(|| dev::GenericCmosRtcDeps {
             irq: 8,
-            time_source: Box::new(rtc_time_source.new_linked_clock()),
+            time_source: PlatformResource.into_resource(),
             century_reg_idx: 0x32,
             initial_cmos: None,
         });
