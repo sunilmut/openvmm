@@ -4299,7 +4299,6 @@ dependencies = [
  "thiserror 2.0.16",
  "tracing",
  "virt",
- "vm_topology",
  "vmcore",
 ]
 
