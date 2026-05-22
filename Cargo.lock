@@ -3147,6 +3147,7 @@ dependencies = [
 name = "hcl"
 version = "0.0.0"
 dependencies = [
+ "aarch64defs",
  "anyhow",
  "arrayvec",
  "bitfield-struct 0.11.0",
@@ -3309,6 +3310,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 name = "hv1_emulator"
 version = "0.0.0"
 dependencies = [
+ "aarch64defs",
  "build_rs_guest_arch",
  "guestmem",
  "hv1_structs",
@@ -7972,6 +7974,7 @@ dependencies = [
  "guestmem",
  "hvdef",
  "loader",
+ "memory_range",
  "mesh",
  "object 0.37.3",
  "page_table",
@@ -7982,6 +7985,7 @@ dependencies = [
  "tracing-subscriber",
  "tracing_helpers",
  "underhill_mem",
+ "user_driver",
  "virt",
  "virt_hvf",
  "virt_kvm",
@@ -8711,6 +8715,7 @@ dependencies = [
 name = "underhill_mem"
 version = "0.0.0"
 dependencies = [
+ "aarch64defs",
  "anyhow",
  "build_rs_guest_arch",
  "cvm_tracing",

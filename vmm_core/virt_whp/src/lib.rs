@@ -23,6 +23,8 @@ mod vtl2;
 
 use crate::memory::vtl2_mapper::MappingState;
 use crate::memory::vtl2_mapper::ResetMappingState;
+#[cfg(guest_arch = "aarch64")]
+use aarch64defs::Vendor;
 use guestmem::DoorbellRegistration;
 use guestmem::GuestMemory;
 use hv1_emulator::hv::GlobalHv;
@@ -72,6 +74,7 @@ use vmcore::reference_time::ReferenceTimeSource;
 use vmcore::vmtime::VmTimeAccess;
 use vmcore::vmtime::VmTimeSource;
 use vp_state::WhpVpStateAccess;
+#[cfg(guest_arch = "x86_64")]
 use x86defs::cpuid::Vendor;
 
 #[cfg(guest_arch = "aarch64")]
@@ -1082,26 +1085,29 @@ impl WhpPartitionInner {
             caps.dr6_tsx_broken = true;
             caps
         };
-        #[cfg(guest_arch = "aarch64")]
-        let caps = {
-            let features =
-                whp::capabilities::processor_features().for_op("get processor features")?;
-            virt::aarch64::Aarch64PartitionCapabilities {
-                supports_aarch32_el0: features
-                    .bank0
-                    .is_set(whp::abi::WHV_PROCESSOR_FEATURES::El0Aarch32),
-            }
-        };
-
         let vendor = match whp::capabilities::processor_vendor().for_op("get processor vendor")? {
+            #[cfg(guest_arch = "x86_64")]
             whp::abi::WHvProcessorVendorIntel => Vendor::INTEL,
             #[cfg(guest_arch = "x86_64")]
             whp::abi::WHvProcessorVendorAmd => Vendor::AMD,
             #[cfg(guest_arch = "x86_64")]
             whp::abi::WHvProcessorVendorHygon => Vendor::HYGON,
             #[cfg(guest_arch = "aarch64")]
-            whp::abi::WHvProcessorVendorArm => Vendor([0; 12]),
+            whp::abi::WHvProcessorVendorArm => Vendor::ARM,
             _ => panic!("unsupported processor vendor"),
+        };
+
+        #[cfg(guest_arch = "aarch64")]
+        let caps = {
+            let features =
+                whp::capabilities::processor_features().for_op("get processor features")?;
+            virt::aarch64::Aarch64PartitionCapabilities {
+                isolation: IsolationType::None,
+                supports_aarch32_el0: features
+                    .bank0
+                    .is_set(whp::abi::WHV_PROCESSOR_FEATURES::El0Aarch32),
+                vendor,
+            }
         };
 
         let hvstate = if proto_config.hv_config.is_some() {
