@@ -391,6 +391,26 @@ impl Vplc {
             start_vp_context: Default::default(),
         }
     }
+
+    /// Resets the pending per-VTL VP signals to the initial state from `Vplc::new`.
+    ///
+    /// This is used when resetting the partition or scrubbing a VTL, so that
+    /// the freshly-reinitialized VTL does not observe stale events queued
+    /// before the reset.
+    fn reset(&self) {
+        let Self {
+            message_queues,
+            check_queues,
+            extint_pending,
+            start_vp_context,
+            start_vp,
+        } = self;
+        message_queues.clear();
+        check_queues.store(false, Ordering::Relaxed);
+        extint_pending.store(false, Ordering::Relaxed);
+        *start_vp_context.lock() = None;
+        start_vp.store(false, Ordering::Relaxed);
+    }
 }
 
 impl<'a> WhpVpRef<'a> {
@@ -1636,13 +1656,18 @@ impl<'p> virt::Processor for WhpProcessor<'p> {
         let is_bsp = self.inner.vp_info.base.is_bsp();
         self.state.reset(false, is_bsp);
 
+        // For each enabled VTL: apply arch fixups that WHP doesn't handle
+        // and clear any pending `start_vp_context` (via `finish_reset`),
+        // then clear stale pending per-VTL VP signal flags (via
+        // `Vplc::reset`).
         // VTL0 is always present.
         self.finish_reset(Vtl::Vtl0);
-        self.vplc(Vtl::Vtl0).message_queues.clear();
+        self.vplc(Vtl::Vtl0).reset();
         if self.state.vtls.vtl2.is_some() {
             self.finish_reset(Vtl::Vtl2);
-            self.vplc(Vtl::Vtl2).message_queues.clear();
+            self.vplc(Vtl::Vtl2).reset();
         }
+        self.inner.vtl2_wake.store(false, Ordering::Relaxed);
 
         if cfg!(debug_assertions) {
             let vp_info = &self.inner.vp_info;
@@ -1657,11 +1682,30 @@ impl<'p> virt::Processor for WhpProcessor<'p> {
     fn scrub(&mut self, vtl: Vtl) -> Result<(), impl std::error::Error + Send + Sync + 'static> {
         assert_eq!(vtl, Vtl::Vtl2);
         let is_bsp = self.inner.vp_info.base.is_bsp();
+
+        // Reset per-VP VTL2-enable state on non-BSP VPs. The new VTL2 will
+        // re-issue `HvCallEnableVpVtl` on each AP to program its startup
+        // context (RIP/RSP/CR3/GDT/IDT)
+        //
+        // Leave `enabled_vtls` alone so that `state.reset` keeps `active_vtl`
+        // at VTL2 on the AP, allowing it to idle in VTL2 (in startup suspend)
+        // during the servicing window.
+        if !is_bsp {
+            self.inner.vtl2_enable.store(false, Ordering::Relaxed);
+        }
+
         self.state.reset(true, is_bsp);
 
-        // Scrub only resets VTL2.
+        // Scrub only resets VTL2. Reset the Vplc to clear any stale pending
+        // signals (message queue notifications, external interrupts, start-VP
+        // requests, etc.) -- the hypervisor zeroes the equivalent per-VTL
+        // activity flags during a VTL scrub.
         self.finish_reset(Vtl::Vtl2);
-        self.vplc(Vtl::Vtl2).message_queues.clear();
+        self.vplc(Vtl::Vtl2).reset();
+
+        // Clear any pending VTL2 wake signal, since VTL2 is now back in
+        // startup suspend and any prior wake request is stale.
+        self.inner.vtl2_wake.store(false, Ordering::Relaxed);
 
         if cfg!(debug_assertions) {
             let vp_info = &self.inner.vp_info;
