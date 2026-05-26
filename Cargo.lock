@@ -2050,13 +2050,17 @@ dependencies = [
  "async-trait",
  "bitfield-struct 0.11.0",
  "chipset_device",
+ "chipset_device_resources",
+ "chipset_resources",
  "crypto",
  "der",
  "firmware_uefi_custom_vars",
+ "firmware_uefi_resources",
  "generation_id",
  "getrandom 0.4.2",
  "guestmem",
  "guid",
+ "hcl_compat_uefi_nvram_storage",
  "inspect",
  "jiff",
  "local_clock",
@@ -2071,7 +2075,9 @@ dependencies = [
  "uefi_nvram_specvars",
  "uefi_nvram_storage",
  "uefi_specs",
+ "vm_resource",
  "vmcore",
+ "vmm_core",
  "watchdog_core",
  "wchar",
  "zerocopy",
@@ -2085,6 +2091,21 @@ dependencies = [
  "mesh_protobuf",
  "thiserror 2.0.16",
  "uefi_specs",
+]
+
+[[package]]
+name = "firmware_uefi_resources"
+version = "0.0.0"
+dependencies = [
+ "chipset_resources",
+ "firmware_uefi_custom_vars",
+ "hcl_compat_uefi_nvram_resources",
+ "inspect",
+ "mesh",
+ "mesh_protobuf",
+ "uefi_specs",
+ "vm_resource",
+ "watchdog_core",
 ]
 
 [[package]]
@@ -2496,11 +2517,13 @@ dependencies = [
  "arbitrary",
  "crypto",
  "firmware_uefi",
+ "firmware_uefi_resources",
  "guestmem",
  "guid",
  "libfuzzer-sys",
  "ucs2 0.0.0",
  "uefi_nvram_specvars",
+ "uefi_specs",
  "xtask_fuzz",
  "zerocopy",
 ]
@@ -3178,6 +3201,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hcl_compat_uefi_nvram_resources"
+version = "0.0.0"
+dependencies = [
+ "inspect",
+ "mesh_protobuf",
+]
+
+[[package]]
 name = "hcl_compat_uefi_nvram_storage"
 version = "0.0.0"
 dependencies = [
@@ -3185,6 +3216,7 @@ dependencies = [
  "async-trait",
  "cvm_tracing",
  "guid",
+ "hcl_compat_uefi_nvram_resources",
  "inspect",
  "open_enum",
  "pal_async",
@@ -5399,8 +5431,8 @@ dependencies = [
  "disk_backend",
  "fdt",
  "firmware_pcat",
- "firmware_uefi",
  "firmware_uefi_custom_vars",
+ "firmware_uefi_resources",
  "floppy",
  "floppy_resources",
  "framebuffer",
@@ -5410,7 +5442,6 @@ dependencies = [
  "getrandom 0.4.2",
  "guestmem",
  "guid",
- "hcl_compat_uefi_nvram_storage",
  "hvdef",
  "hyperv_dump",
  "hypervisor_resources",
@@ -5421,7 +5452,6 @@ dependencies = [
  "input_core",
  "inspect",
  "loader",
- "local_clock",
  "membacking",
  "memory_range",
  "mesh",
@@ -5445,7 +5475,6 @@ dependencies = [
  "storvsp",
  "thiserror 2.0.16",
  "tracing",
- "uefi_nvram_storage",
  "uefi_specs",
  "vfio_assigned_device",
  "vfio_assigned_device_resources",
@@ -5519,6 +5548,7 @@ dependencies = [
  "disk_backend_resources",
  "disk_crypt_resources",
  "firmware_uefi_custom_vars",
+ "firmware_uefi_resources",
  "floppy_resources",
  "framebuffer",
  "fs-err",
@@ -5612,6 +5642,7 @@ dependencies = [
  "chipset_resources",
  "debug_worker",
  "disk_striped",
+ "firmware_uefi",
  "guest_watchdog",
  "hyperv_ic",
  "mesh_worker",
@@ -5697,6 +5728,7 @@ dependencies = [
  "disk_vhdmp",
  "disklayer_ram",
  "disklayer_sqlite",
+ "firmware_uefi",
  "gdma",
  "guest_crash_device",
  "guest_emulation_device",
@@ -6112,6 +6144,7 @@ dependencies = [
  "disk_vhd1",
  "disk_vhdmp",
  "fatfs",
+ "firmware_uefi_resources",
  "flate2",
  "framebuffer",
  "fs-err",
@@ -8539,8 +8572,8 @@ dependencies = [
  "disk_get_vmgs",
  "disk_nvme",
  "firmware_pcat",
- "firmware_uefi",
  "firmware_uefi_custom_vars",
+ "firmware_uefi_resources",
  "framebuffer",
  "fs-err",
  "futures",
@@ -8553,7 +8586,6 @@ dependencies = [
  "guestmem",
  "guid",
  "hcl",
- "hcl_compat_uefi_nvram_storage",
  "hvdef",
  "hyperv_ic_guest",
  "hyperv_ic_resources",
@@ -8622,7 +8654,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing_helpers",
- "uefi_nvram_storage",
  "uevent",
  "uidevices_resources",
  "underhill_attestation",
@@ -9639,6 +9670,9 @@ name = "vm_manifest_builder"
 version = "0.0.0"
 dependencies = [
  "chipset_resources",
+ "firmware_uefi_custom_vars",
+ "firmware_uefi_resources",
+ "getrandom 0.4.2",
  "input_core",
  "mesh",
  "missing_dev_resources",
@@ -10309,7 +10343,6 @@ dependencies = [
  "closeable_mutex",
  "cvm_tracing",
  "firmware_pcat",
- "firmware_uefi",
  "floppy",
  "floppy_pcat_stub",
  "framebuffer",
@@ -10319,7 +10352,6 @@ dependencies = [
  "ide",
  "inspect",
  "inspect_counters",
- "local_clock",
  "mesh",
  "missing_dev",
  "pal_async",
@@ -10332,12 +10364,10 @@ dependencies = [
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",
- "uefi_nvram_storage",
  "vga",
  "vga_proxy",
  "vm_resource",
  "vmcore",
- "watchdog_core",
 ]
 
 [[package]]
