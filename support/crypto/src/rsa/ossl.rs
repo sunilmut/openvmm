@@ -29,6 +29,7 @@ impl RsaKeyPairInner {
         Ok(Self(pkey))
     }
 
+    #[cfg(any(test, feature = "test_helpers"))]
     pub fn to_pkcs8_der(&self) -> Result<Vec<u8>, RsaError> {
         self.0
             .private_key_to_pkcs8()

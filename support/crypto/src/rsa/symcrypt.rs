@@ -5,12 +5,8 @@
 
 use super::RsaError;
 use der::Decode;
-use der::Encode;
-use der::asn1::OctetString;
-use der::asn1::UintRef;
 use symcrypt::rsa::RsaKey;
 use symcrypt::rsa::RsaKeyUsage;
-use x509_cert::spki::AlgorithmIdentifierOwned;
 
 fn err(err: symcrypt::errors::SymCryptError, op: &'static str) -> RsaError {
     RsaError(crate::BackendError::SymCrypt(err, op))
@@ -58,7 +54,13 @@ impl RsaKeyPairInner {
         Ok(Self(rsa))
     }
 
+    #[cfg(any(test, feature = "test_helpers"))]
     pub fn to_pkcs8_der(&self) -> Result<Vec<u8>, RsaError> {
+        use der::Encode;
+        use der::asn1::OctetString;
+        use der::asn1::UintRef;
+        use x509_cert::spki::AlgorithmIdentifierOwned;
+
         let blob = self
             .0
             .export_key_pair_blob()

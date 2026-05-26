@@ -55,6 +55,7 @@ impl RsaKeyPair {
         sys::RsaKeyPairInner::from_pkcs8_der(der).map(Self)
     }
 
+    #[cfg(any(test, feature = "test_helpers"))]
     /// Convert the RSA private key to PKCS#8 DER-encoded bytes.
     pub fn to_pkcs8_der(&self) -> Result<Vec<u8>, RsaError> {
         self.0.to_pkcs8_der()
