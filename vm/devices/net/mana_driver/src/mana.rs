@@ -251,7 +251,6 @@ impl<T: DeviceBacking> ManaDevice<T> {
                             if let Some(sender) = inner.vf_reset_request_sender.lock().await.take()
                             {
                                 sender.send(revoke_vtl0_vf);
-
                             }
                         }
                     }

@@ -615,3 +615,10 @@ pub struct GdmaChangeMsixVectorIndexForEq {
     pub reserved1: u32,
     pub reserved2: u32,
 }
+
+#[repr(C)]
+#[derive(Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct GdmaGenerateResetEventReq {
+    pub queue_index: u32,
+    pub data: EqeVfReset,
+}

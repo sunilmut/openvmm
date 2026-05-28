@@ -42,6 +42,8 @@ use gdma_defs::GdmaCreateQueueResp;
 use gdma_defs::GdmaDestroyDmaRegionReq;
 use gdma_defs::GdmaDevId;
 use gdma_defs::GdmaDisableQueueReq;
+#[cfg(test)]
+use gdma_defs::GdmaGenerateResetEventReq;
 use gdma_defs::GdmaGenerateTestEventReq;
 use gdma_defs::GdmaListDevicesResp;
 use gdma_defs::GdmaMsgHdr;
@@ -1045,8 +1047,9 @@ impl<T: DeviceBacking> GdmaDriver<T> {
                 }
                 GDMA_EQE_HWC_RESET_REQUEST => {
                     let data = EqeVfReset::read_from_prefix(&eqe.data[..]).unwrap().0;
-                    tracing::info!("HWC VF reconfiguration event");
-                    self.reset_request_pending = Some(data.revoke_vtl0_vf());
+                    let revoke_vtl0_vf = data.revoke_vtl0_vf();
+                    tracing::info!(revoke_vtl0_vf, "HWC VF reset request");
+                    self.reset_request_pending = Some(revoke_vtl0_vf);
                 }
                 ty => tracing::error!(ty, "unknown eq event"),
             }
@@ -1240,12 +1243,14 @@ impl<T: DeviceBacking> GdmaDriver<T> {
 
     #[cfg(test)]
     #[tracing::instrument(skip(self), level = "debug", err)]
-    pub async fn generate_reset_request_eqe(&mut self) -> anyhow::Result<()> {
+    pub async fn generate_reset_request_eqe(&mut self, revoke_vtl0_vf: bool) -> anyhow::Result<()> {
+        let reset = EqeVfReset::new().with_revoke_vtl0_vf(revoke_vtl0_vf);
         self.request::<_, ()>(
             GdmaRequestType::GDMA_GENERATE_RESET_REQUEST_EQE.0,
             HWC_DEV_ID,
-            GdmaGenerateTestEventReq {
+            GdmaGenerateResetEventReq {
                 queue_index: self.eq.id(),
+                data: reset,
             },
         )
         .await?;

@@ -1034,9 +1034,9 @@ impl HclNetworkVFManagerWorker {
         vtl2_device_state: &mut Vtl2DeviceState,
         revoke_vtl0_vf: bool,
     ) -> Option<VfReconfigBackoff> {
-        // Remove VTL0 VF if present
-        *self.guest_state.vtl0_vfid.lock().await = None;
+        // Remove VTL0 VF if requested.
         if revoke_vtl0_vf && self.guest_state.is_offered_to_guest().await {
+            *self.guest_state.vtl0_vfid.lock().await = None;
             tracing::warn!(
                 vtl2_vfid = vtl2_vfid_from_bus_control(&self.vtl2_bus_control),
                 vtl0_vfid = vtl0_vfid_from_bus_control(&self.vtl0_bus_control),
