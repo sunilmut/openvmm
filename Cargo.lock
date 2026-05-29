@@ -5939,6 +5939,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "paravisor_measured_config"
+version = "0.0.0"
+dependencies = [
+ "guest_emulation_transport",
+ "loader_defs",
+ "vm_resource",
+]
+
+[[package]]
+name = "paravisor_measured_cwcow"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "guest_emulation_transport",
+ "loader_defs",
+ "mesh",
+ "mesh_protobuf",
+ "paravisor_measured_config",
+ "vm_resource",
+ "zerocopy",
+]
+
+[[package]]
 name = "parking"
 version = "2.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8638,6 +8662,8 @@ dependencies = [
  "pal",
  "pal_async",
  "pal_uring",
+ "paravisor_measured_config",
+ "paravisor_measured_cwcow",
  "parking_lot",
  "profiler_worker",
  "safe_intrinsics",

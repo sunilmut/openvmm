@@ -1,0 +1,23 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "paravisor_measured_cwcow"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+guest_emulation_transport.workspace = true
+loader_defs.workspace = true
+mesh.workspace = true
+mesh_protobuf.workspace = true
+paravisor_measured_config.workspace = true
+vm_resource.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+futures.workspace = true
+
+[lints]
+workspace = true

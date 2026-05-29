@@ -52,6 +52,8 @@ members = [
   "vm/devices/get/test_igvm_agent_rpc_server",
   "vm/devices/tpm/tpm_guest_tests",
   "vm/loader/igvmfilegen",
+  "vm/loader/paravisor_measured_cwcow",
+  "vm/loader/paravisor_measured_config",
   "vm/vmgs/vmgs_lib",
   "vm/vmgs/vmgstool",
   # opentmk
@@ -392,7 +394,9 @@ vhd1_defs = { path = "vm/vhd1_defs" }
 kvm = { path = "vm/kvm" }
 loader = { path = "vm/loader" }
 igvmfilegen_config = { path = "vm/loader/igvmfilegen_config" }
+paravisor_measured_cwcow = { path = "vm/loader/paravisor_measured_cwcow" }
 loader_defs = { path = "vm/loader/loader_defs" }
+paravisor_measured_config = { path = "vm/loader/paravisor_measured_config" }
 page_table = { path = "vm/loader/page_table" }
 page_pool_alloc = { path = "vm/page_pool_alloc" }
 vbs_defs = { path = "vm/vbs_defs" }

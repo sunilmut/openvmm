@@ -1480,6 +1480,10 @@ async fn new_underhill_vm(
     // Read the initial configuration from the IGVM parameters.
     let (runtime_params, measured_vtl2_info) =
         crate::loader::vtl2_config::read_vtl2_params().context("failed to read load parameters")?;
+    measured_vtl2_info
+        .product_measured_config
+        .apply_config_checks()
+        .map_err(|err| anyhow::anyhow!("product measured config checks failed: {err}"))?;
 
     // Log information about VTL2 memory
     let memory_allocation_mode = runtime_params.parsed_openhcl_boot().memory_allocation_mode;

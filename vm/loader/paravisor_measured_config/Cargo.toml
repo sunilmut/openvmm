@@ -1,0 +1,15 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "paravisor_measured_config"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+guest_emulation_transport.workspace = true
+loader_defs.workspace = true
+vm_resource.workspace = true
+
+[lints]
+workspace = true

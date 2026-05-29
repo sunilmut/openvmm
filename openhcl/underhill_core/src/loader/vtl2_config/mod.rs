@@ -9,6 +9,7 @@
 //! expected to be already validated by the bootloader.
 
 use crate::nvme_manager::save_restore_helpers::VPInterruptState;
+use anyhow::anyhow;
 use anyhow::Context;
 use bootloader_fdt_parser::IsolationType;
 use bootloader_fdt_parser::ParsedBootDtInfo;
@@ -18,19 +19,104 @@ use inspect::Inspect;
 use loader_defs::paravisor::PARAVISOR_CONFIG_PPTT_PAGE_INDEX;
 use loader_defs::paravisor::PARAVISOR_CONFIG_SLIT_PAGE_INDEX;
 use loader_defs::paravisor::PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_INDEX;
+use loader_defs::paravisor::PARAVISOR_MEASURED_VTL2_CONFIG_SIZE_PAGES;
 use loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_CPUID_PAGE_INDEX;
 use loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_CPUID_SIZE_PAGES;
 use loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_SECRETS_PAGE_INDEX;
 use loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_SECRETS_SIZE_PAGES;
 use loader_defs::paravisor::ParavisorMeasuredVtl2Config;
+use loader_defs::paravisor::ParavisorMeasuredVtl2ProductType;
+use paravisor_measured_config::ParavisorMeasuredVtl2ParserKind;
+use paravisor_measured_config::ParavisorMeasuredVtl2ProductParser;
+use paravisor_measured_config::ProductMeasuredConfig;
+use paravisor_measured_config::ProductMeasuredVtl2Blob;
+use mesh::MeshPayload;
 use loader_defs::shim::MemoryVtlType;
 use memory_range::MemoryRange;
 use sparse_mmap::SparseMapping;
 use string_page_buf::StringBuffer;
 use vm_topology::memory::MemoryRangeWithNode;
+use vm_resource::Resource;
+use vm_resource::ResourceId;
+use vm_resource::ResourceResolver;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
+
+#[derive(Debug)]
+struct OpenhclProductMeasuredConfig;
+
+impl ProductMeasuredConfig for OpenhclProductMeasuredConfig {
+    fn apply_config_checks(
+        &self,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct OpenhclMeasuredVtl2ProductParser;
+
+impl ParavisorMeasuredVtl2ProductParser for OpenhclMeasuredVtl2ProductParser {
+    fn product_type(&self) -> ParavisorMeasuredVtl2ProductType {
+        ParavisorMeasuredVtl2ProductType::OPENHCL
+    }
+
+    fn parse_product_data(
+        &self,
+        blob: ProductMeasuredVtl2Blob<'_>,
+    ) -> Result<Box<dyn ProductMeasuredConfig>, Box<dyn std::error::Error + Send + Sync>> {
+        if blob.product_type() != ParavisorMeasuredVtl2ProductType::OPENHCL {
+            return Err(anyhow!("unexpected product type for openhcl parser").into());
+        }
+        Ok(Box::new(OpenhclProductMeasuredConfig))
+    }
+}
+
+#[derive(MeshPayload)]
+struct OpenhclMeasuredVtl2ParserHandle;
+
+impl ResourceId<ParavisorMeasuredVtl2ParserKind> for OpenhclMeasuredVtl2ParserHandle {
+    const ID: &'static str = "openhcl";
+}
+
+struct OpenhclMeasuredVtl2ParserResolver;
+
+impl vm_resource::ResolveResource<ParavisorMeasuredVtl2ParserKind, OpenhclMeasuredVtl2ParserHandle>
+    for OpenhclMeasuredVtl2ParserResolver
+{
+    type Output = Box<dyn ParavisorMeasuredVtl2ProductParser>;
+    type Error = core::convert::Infallible;
+
+    fn resolve(
+        &self,
+        _resource: OpenhclMeasuredVtl2ParserHandle,
+        _input: (),
+    ) -> Result<Self::Output, Self::Error> {
+        Ok(Box::new(OpenhclMeasuredVtl2ProductParser))
+    }
+}
+
+vm_resource::declare_static_resolver!(
+    OpenhclMeasuredVtl2ParserResolver,
+    (
+        ParavisorMeasuredVtl2ParserKind,
+        OpenhclMeasuredVtl2ParserHandle,
+    ),
+);
+
+vm_resource::register_static_resolvers!(OpenhclMeasuredVtl2ParserResolver);
+
+fn parser_resource_for_product_type(
+    product_type: ParavisorMeasuredVtl2ProductType,
+) -> Option<Resource<ParavisorMeasuredVtl2ParserKind>> {
+    match product_type {
+        ParavisorMeasuredVtl2ProductType::OPENHCL => {
+            Some(Resource::new(OpenhclMeasuredVtl2ParserHandle))
+        }
+        _ => paravisor_measured_cwcow::parser_resource_for_product_type(product_type),
+    }
+}
 
 /// Structure that holds parameters provided at runtime. Some are read from the
 /// guest address space, and others from openhcl_boot provided via devicetree.
@@ -93,6 +179,8 @@ pub struct MeasuredVtl2Info {
     #[inspect(with = "inspect_helpers::accepted_regions")]
     accepted_regions: Vec<MemoryRange>,
     pub vtom_offset_bit: Option<u8>,
+    #[inspect(skip)]
+    pub product_measured_config: Box<dyn ProductMeasuredConfig>,
 }
 
 impl MeasuredVtl2Info {
@@ -417,6 +505,24 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
         )
         .context("failed to read measured vtl2 config")?;
 
+    let measured_config_offset = (PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_INDEX * HV_PAGE_SIZE) as usize;
+    let mut measured_config_bytes =
+        vec![0; (PARAVISOR_MEASURED_VTL2_CONFIG_SIZE_PAGES * HV_PAGE_SIZE) as usize];
+    mapping
+        .read_at(measured_config_offset, measured_config_bytes.as_mut_slice())
+        .context("failed to read measured vtl2 config bytes")?;
+    let blob = ProductMeasuredVtl2Blob::new(&measured_config, &measured_config_bytes)
+        .map_err(|err| anyhow!("invalid measured vtl2 config: {err:?}"))?;
+
+    let parser_resource = parser_resource_for_product_type(blob.product_type())
+        .ok_or_else(|| anyhow!("no measured config parser for product type"))?;
+    let resolver = ResourceResolver::new();
+    let parser = futures::executor::block_on(resolver.resolve(parser_resource, ()))
+        .context("failed to resolve product measured config parser")?;
+    let product_measured_config: Box<dyn ProductMeasuredConfig> = parser
+        .parse_product_data(blob)
+        .map_err(|err| anyhow!("failed to parse product measured config: {err}"))?;
+
     drop(mapping);
 
     assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
@@ -440,6 +546,7 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
     let measured_vtl2_info = MeasuredVtl2Info {
         accepted_regions,
         vtom_offset_bit,
+        product_measured_config,
     };
 
     Ok((runtime_params, measured_vtl2_info))

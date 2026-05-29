@@ -889,6 +889,11 @@ where
         magic: ParavisorMeasuredVtl2Config::MAGIC,
         vtom_offset_bit: shared_gpa_boundary_bits.unwrap_or(0),
         padding: [0; 7],
+        version: ParavisorMeasuredVtl2Config::VERSION,
+        product_type: ParavisorMeasuredVtl2ProductType::OPENHCL,
+        total_size: size_of::<ParavisorMeasuredVtl2Config>() as u32,
+        product_data_offset: size_of::<ParavisorMeasuredVtl2Config>() as u32,
+        product_data_size: 0,
     };
 
     importer
@@ -1453,6 +1458,11 @@ where
         magic: ParavisorMeasuredVtl2Config::MAGIC,
         vtom_offset_bit: 0,
         padding: [0; 7],
+        version: ParavisorMeasuredVtl2Config::VERSION,
+        product_type: ParavisorMeasuredVtl2ProductType::OPENHCL,
+        total_size: size_of::<ParavisorMeasuredVtl2Config>() as u32,
+        product_data_offset: size_of::<ParavisorMeasuredVtl2Config>() as u32,
+        product_data_size: 0,
     };
 
     importer

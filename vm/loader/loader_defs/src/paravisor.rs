@@ -367,9 +367,157 @@ pub struct ParavisorMeasuredVtl2Config {
     pub vtom_offset_bit: u8,
     /// Padding.
     pub padding: [u8; 7],
+    /// Header version. Must be [`Self::VERSION`].
+    pub version: u16,
+    /// Product type selecting parser/semantics for product-specific payloads.
+    pub product_type: ParavisorMeasuredVtl2ProductType,
+    /// Total measured config size in bytes (header + table + payloads).
+    pub total_size: u32,
+    /// Offset to opaque product data from start of this header.
+    pub product_data_offset: u32,
+    /// Opaque product data size in bytes.
+    pub product_data_size: u32,
 }
 
 impl ParavisorMeasuredVtl2Config {
     /// Magic value for the measured config, which is "OHCLVTL2".
     pub const MAGIC: u64 = 0x4F48434C56544C32;
+    /// Current merged header version.
+    pub const VERSION: u16 = 1;
+
+    /// Returns the validated byte range containing opaque product data.
+    pub fn product_data_range(
+        &self,
+    ) -> Result<core::ops::Range<usize>, ParavisorMeasuredVtl2ConfigValidationError> {
+        if self.magic != Self::MAGIC {
+            return Err(ParavisorMeasuredVtl2ConfigValidationError::BadMagic {
+                expected: Self::MAGIC,
+                actual: self.magic,
+            });
+        }
+
+        if self.version != Self::VERSION {
+            return Err(ParavisorMeasuredVtl2ConfigValidationError::UnsupportedVersion {
+                expected: Self::VERSION,
+                actual: self.version,
+            });
+        }
+
+        let header_size = size_of::<Self>();
+        let total_size = self.total_size as usize;
+        let product_data_offset = self.product_data_offset as usize;
+        let product_data_size = self.product_data_size as usize;
+
+        if total_size < header_size {
+            return Err(ParavisorMeasuredVtl2ConfigValidationError::TotalSizeTooSmall {
+                min: header_size,
+                actual: total_size,
+            });
+        }
+
+        if product_data_offset < header_size {
+            return Err(
+                ParavisorMeasuredVtl2ConfigValidationError::ProductDataOffsetTooSmall {
+                    min: header_size,
+                    actual: product_data_offset,
+                },
+            );
+        }
+
+        let product_data_end = product_data_offset.checked_add(product_data_size).ok_or(
+            ParavisorMeasuredVtl2ConfigValidationError::ProductDataRangeOverflow,
+        )?;
+
+        if product_data_end > total_size {
+            return Err(ParavisorMeasuredVtl2ConfigValidationError::ProductDataOutOfBounds {
+                total_size,
+                offset: product_data_offset,
+                size: product_data_size,
+            });
+        }
+
+        Ok(product_data_offset..product_data_end)
+    }
+
+    /// Validates this header against `full_config` and returns the opaque product blob.
+    pub fn product_data<'a>(
+        &self,
+        full_config: &'a [u8],
+    ) -> Result<&'a [u8], ParavisorMeasuredVtl2ConfigValidationError> {
+        let total_size = self.total_size as usize;
+        if full_config.len() < total_size {
+            return Err(ParavisorMeasuredVtl2ConfigValidationError::InputTooSmall {
+                min: total_size,
+                actual: full_config.len(),
+            });
+        }
+
+        let range = self.product_data_range()?;
+        Ok(&full_config[range])
+    }
 }
+
+open_enum! {
+    /// Product type for extensible measured VTL2 config payloads.
+    #[derive(IntoBytes, Immutable, KnownLayout, FromBytes)]
+    #[cfg_attr(feature = "inspect", derive(Inspect))]
+    pub enum ParavisorMeasuredVtl2ProductType : u16 {
+        /// OpenHCL product profile.
+        OPENHCL = 1,
+        /// CWCOW product profile.
+        CWCOW = 2,
+    }
+}
+
+/// Validation error for [`ParavisorMeasuredVtl2Config`] header and blob bounds.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ParavisorMeasuredVtl2ConfigValidationError {
+    /// The header magic does not match [`ParavisorMeasuredVtl2Config::MAGIC`].
+    BadMagic {
+        /// Expected magic value.
+        expected: u64,
+        /// Actual magic value found in the header.
+        actual: u64,
+    },
+    /// The header version does not match [`ParavisorMeasuredVtl2Config::VERSION`].
+    UnsupportedVersion {
+        /// Expected version value.
+        expected: u16,
+        /// Actual version value found in the header.
+        actual: u16,
+    },
+    /// `total_size` is smaller than the V2 header itself.
+    TotalSizeTooSmall {
+        /// Minimum valid value.
+        min: usize,
+        /// Actual value found in the header.
+        actual: usize,
+    },
+    /// `product_data_offset` points inside the fixed header.
+    ProductDataOffsetTooSmall {
+        /// Minimum valid value.
+        min: usize,
+        /// Actual value found in the header.
+        actual: usize,
+    },
+    /// `product_data_offset + product_data_size` overflowed `usize`.
+    ProductDataRangeOverflow,
+    /// Product data range exceeds `total_size`.
+    ProductDataOutOfBounds {
+        /// Total measured config size from the header.
+        total_size: usize,
+        /// Product blob start offset from the header.
+        offset: usize,
+        /// Product blob size in bytes.
+        size: usize,
+    },
+    /// Input byte buffer is smaller than `total_size`.
+    InputTooSmall {
+        /// Minimum required input length.
+        min: usize,
+        /// Actual input length.
+        actual: usize,
+    },
+}
+
+const_assert_eq!(size_of::<ParavisorMeasuredVtl2Config>(), 32);
