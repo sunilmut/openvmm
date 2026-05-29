@@ -297,8 +297,8 @@ impl std::fmt::Display for Vtl0Bus {
 // rather than a single enum:
 //
 // - `self.is_shutdown_active` gates guest-driven transitions.
-// - `Vtl2DeviceState` tracks whether the VTL2 VF is present, missing, or in the
-//   middle of a reconfiguration retry loop.
+// - `Vtl2DeviceState` tracks whether the VTL2 VF is enumerated (but not present),
+//      present, missing, or in the middle of a reconfiguration retry loop.
 // - `self.vtl0_bus_control` tracks whether the VTL0 VF exists and whether it is
 //   currently hidden from the guest.
 // - `self.guest_state` is the guest-visible projection of that internal state.
@@ -348,6 +348,8 @@ struct HclNetworkVFManagerWorker {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Vtl2DeviceState {
+    /// The VTL2 VF has been enumerated on vPCI and is waiting for uevent add.
+    DeviceEnumerated,
     /// The VTL2 VF is bound and VTL0 updates may be applied immediately.
     Present,
     /// The VTL2 VF is gone; VTL0 changes are recorded locally until it returns.
@@ -1120,7 +1122,7 @@ impl HclNetworkVFManagerWorker {
     async fn mana_device_arrived(
         &mut self,
         vtl2_device_state: &mut Vtl2DeviceState,
-        is_surprise_add: bool,
+        surprise_add: bool,
     ) {
         let mut ctx = mesh::CancelContext::new().with_timeout(std::time::Duration::from_secs(1));
         // Ignore error here for waiting for the PCI path and continue to create the MANA device.
@@ -1139,10 +1141,7 @@ impl HclNetworkVFManagerWorker {
 
         // For surprise add events, do not notify the host as the host is
         // not expecting it.
-        if self
-            .startup_vtl2_device(!is_surprise_add)
-            .await
-        {
+        if self.startup_vtl2_device(!surprise_add).await {
             *vtl2_device_state = Vtl2DeviceState::Present;
         }
     }
@@ -1158,7 +1157,7 @@ impl HclNetworkVFManagerWorker {
         &mut self,
         vtl2_device_state: &mut Vtl2DeviceState,
         vf_reconfig_backoff: &mut Option<VfReconfigBackoff>,
-        is_surprise_remove: bool,
+        surprise_remove: bool,
     ) {
         *self.guest_state.vtl0_vfid.lock().await = None;
         // Revoke the VTL0 VF even for surprise remove of VTL2 device to keep
@@ -1182,7 +1181,7 @@ impl HclNetworkVFManagerWorker {
 
         // For surprise remove, do not update the host of any change as the
         // host is not expecting it.
-        if !is_surprise_remove {
+        if !surprise_remove {
             if let Err(err) = self.update_vtl2_device_bind_state(false).await {
                 tracing::error!(
                     vtl2_vfid = vtl2_vfid_from_bus_control(&self.vtl2_bus_control),
@@ -1198,8 +1197,9 @@ impl HclNetworkVFManagerWorker {
         enum NextWorkItem {
             Continue,
             ManagerMessage(HclNetworkVfManagerMessage),
-            ManaDeviceArrived(bool), // bool: true = surprise add, false = vPCI event
-            ManaDeviceRemoved(bool), // bool: true = surprise remove, false = vPCI event
+            ManaDeviceEnumerated,
+            ManaDeviceArrived { surprise_add: bool },
+            ManaDeviceRemoved { surprise_remove: bool },
             VfReconfig(bool),
             VfReconfigRestart,
             ExitWorker,
@@ -1208,7 +1208,6 @@ impl HclNetworkVFManagerWorker {
         let mut vtl2_device_state = Vtl2DeviceState::Present;
         let mut vf_reconfig_backoff: Option<VfReconfigBackoff> = None;
         let vtl2_vfid = vtl2_vfid_from_bus_control(&self.vtl2_bus_control);
-        let seen_device_enumerated = Arc::new(std::sync::atomic::AtomicBool::new(false));
         loop {
             let next_work_item = {
                 let next_message = self
@@ -1221,16 +1220,16 @@ impl HclNetworkVFManagerWorker {
                 let device_change = self.vtl2_bus_control.notifier().map(|device| match device {
                     VpciBusEvent::DeviceEnumerated => {
                         tracing::info!(vtl2_vfid, "MANA device enumerated, waiting for uevent.");
-                        seen_device_enumerated.store(true, std::sync::atomic::Ordering::Relaxed);
-                        NextWorkItem::Continue
+                        NextWorkItem::ManaDeviceEnumerated
                     }
                     VpciBusEvent::PrepareForRemoval => {
                         tracing::info!(
                             vtl2_vfid,
                             "MANA device removal signaled by VPCI PrepareForRemoval"
                         );
-                        seen_device_enumerated.store(false, std::sync::atomic::Ordering::Relaxed);
-                        NextWorkItem::ManaDeviceRemoved(false)
+                        NextWorkItem::ManaDeviceRemoved {
+                            surprise_remove: false,
+                        }
                     }
                 });
                 // UEVENT notifications are the primary source of surprise hotplug signals.
@@ -1244,25 +1243,26 @@ impl HclNetworkVFManagerWorker {
                     let exists = Path::new(&device_path).exists();
                     match (vtl2_device_state, action, exists) {
                         (Vtl2DeviceState::Present, UeventAction::Remove, _) => {
-                            seen_device_enumerated
-                                .store(false, std::sync::atomic::Ordering::Relaxed);
-                            NextWorkItem::ManaDeviceRemoved(true)
+                            NextWorkItem::ManaDeviceRemoved {
+                                surprise_remove: true,
+                            }
                         }
+                        (
+                            Vtl2DeviceState::DeviceEnumerated,
+                            UeventAction::Add | UeventAction::Rescan,
+                            true,
+                        ) => NextWorkItem::ManaDeviceArrived {
+                            surprise_add: false,
+                        },
                         (
                             Vtl2DeviceState::Missing,
                             UeventAction::Add | UeventAction::Rescan,
                             true,
-                        ) => {
-                            let arrived_with_enumerated =
-                                seen_device_enumerated.load(std::sync::atomic::Ordering::Relaxed);
-                            seen_device_enumerated
-                                .store(false, std::sync::atomic::Ordering::Relaxed);
-                            NextWorkItem::ManaDeviceArrived(!arrived_with_enumerated)
-                        }
+                        ) => NextWorkItem::ManaDeviceArrived { surprise_add: true },
                         (state, UeventAction::Add, false)
                         | (state, UeventAction::Rescan, false)
                         | (state, UeventAction::Remove, true) => {
-                            tracelimit::warn_ratelimited!(
+                            tracing::debug!(
                                 ?state,
                                 ?action,
                                 exists,
@@ -1309,6 +1309,20 @@ impl HclNetworkVFManagerWorker {
 
             match next_work_item {
                 NextWorkItem::Continue => continue,
+                NextWorkItem::ManaDeviceEnumerated => {
+                    if !self.is_shutdown_active
+                        && matches!(vtl2_device_state, Vtl2DeviceState::Missing)
+                    {
+                        vtl2_device_state = Vtl2DeviceState::DeviceEnumerated;
+                    } else {
+                        tracing::warn!(
+                            vtl2_vfid,
+                            vtl2_device_state = ?vtl2_device_state,
+                            shutdown_active = self.is_shutdown_active,
+                            "ignoring VPCI DeviceEnumerated notification, invalid device state"
+                        );
+                    }
+                }
                 NextWorkItem::ManagerMessage(HclNetworkVfManagerMessage::Inspect(deferred)) => {
                     deferred.inspect(&self)
                 }
@@ -1413,14 +1427,13 @@ impl HclNetworkVFManagerWorker {
                 }
                 NextWorkItem::VfReconfig(revoke_vtl0_vf) => {
                     if self.is_shutdown_active
-                        || matches!(vtl2_device_state, Vtl2DeviceState::Missing)
+                        || !matches!(vtl2_device_state, Vtl2DeviceState::Present)
                     {
                         tracing::debug!(
                             vtl2_vfid,
                             is_shutdown_active = self.is_shutdown_active,
-                            vtl2_device_state_missing =
-                                matches!(vtl2_device_state, Vtl2DeviceState::Missing),
-                            "Skipping VF reconfiguration during shutdown or when device is missing"
+                            vtl2_device_state = ?vtl2_device_state,
+                            "Skipping VF reconfiguration unless device is present"
                         );
                         continue;
                     }
@@ -1454,7 +1467,7 @@ impl HclNetworkVFManagerWorker {
                         .await
                         .unwrap_or(None);
                 }
-                NextWorkItem::ManaDeviceArrived(is_surprise_add) => {
+                NextWorkItem::ManaDeviceArrived { surprise_add } => {
                     if self.is_shutdown_active {
                         tracing::error!(vtl2_vfid, "MANA device arrival during shutdown");
                         continue;
@@ -1463,11 +1476,11 @@ impl HclNetworkVFManagerWorker {
                         vf_reconfig_backoff.is_none(),
                         "device arrival should only occur after device removal and not vf reconfiguration"
                     );
-                    self.mana_device_arrived(&mut vtl2_device_state, is_surprise_add)
+                    self.mana_device_arrived(&mut vtl2_device_state, surprise_add)
                         .instrument(tracing::info_span!("VTL2 VF arrived", vtl2_vfid))
                         .await;
                 }
-                NextWorkItem::ManaDeviceRemoved(is_surprise_remove) => {
+                NextWorkItem::ManaDeviceRemoved { surprise_remove } => {
                     if self.is_shutdown_active {
                         tracing::warn!(vtl2_vfid, "MANA device removal during shutdown");
                         continue;
@@ -1475,7 +1488,7 @@ impl HclNetworkVFManagerWorker {
                     self.mana_device_removed(
                         &mut vtl2_device_state,
                         &mut vf_reconfig_backoff,
-                        is_surprise_remove,
+                        surprise_remove,
                     )
                     .instrument(tracing::info_span!("VTL2 VF removal", vtl2_vfid))
                     .await;
