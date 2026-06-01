@@ -2020,6 +2020,42 @@ async fn new_underhill_vm(
         tracing::warn!(CVM_ALLOWED, "confidential debug enabled");
     }
 
+    // Get VMGS provenance claims. If the provenance doc can't be read or if it
+    // isn't valid, proceed as if it doesn't exist. In that case, OpenHCL will
+    // not produce attestation claims for provenance. It's up to the VM owner's
+    // key release policy to enforce the presence of provenance claims.
+    let prov_claims = if let Some((_, vmgs)) = vmgs.as_mut() {
+        let prov_info = vmgs.get_file_info(vmgs::FileId::PROVENANCE_DOC);
+        if prov_info.is_ok() {
+            vmgs.read_file(vmgs::FileId::PROVENANCE_DOC)
+                .await
+                .inspect_err(|e| {
+                    tracing::warn!(
+                        CVM_ALLOWED,
+                        error = e as &dyn std::error::Error,
+                        "failed to read provenance doc"
+                    )
+                })
+                .map(|file| {
+                    underhill_attestation::get_provenance_claims(&file)
+                        .inspect_err(|e| {
+                            tracing::warn!(
+                                CVM_ALLOWED,
+                                error = e as &dyn std::error::Error,
+                                "failed to get provenance claims"
+                            )
+                        })
+                        .ok()
+                })
+                .ok()
+                .flatten()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Create the `AttestationVmConfig` from `dps`, which will be used in
     // - stateful mode (the attestation is not suppressed)
     // - stateless mode (isolated VM with attestation suppressed)
@@ -2042,6 +2078,7 @@ async fn new_underhill_vm(
             && dps.general.vpci_boot_enabled
             && isolation.is_isolated(),
         vm_unique_id: dps.general.bios_guid.to_string(),
+        vmgs_provisioner: prov_claims.clone(),
     };
 
     let tee_call: Option<Box<dyn tee_call::TeeCall>> = match isolation {
@@ -2107,6 +2144,21 @@ async fn new_underhill_vm(
             }
         }
     };
+
+    // Check VMGS ID from provisioner
+    if let Some(prov) = prov_claims {
+        let vmgs = vmgs.as_mut().unwrap();
+        let vmgsid_file = vmgs
+            .1
+            .read_file(vmgs::FileId::PLATFORM_SEED)
+            .await
+            .context("failed to read VMGSID seed doc")?;
+        let derived_vmgsid = underhill_attestation::derive_vmgsid(&vmgsid_file)?;
+        if derived_vmgsid != prov.id {
+            tracing::error!(CVM_ALLOWED, "provisioning VMGSID mismatch");
+            anyhow::bail!("provisioning VMGSID mismatch");
+        }
+    }
 
     let mut resolver = ResourceResolver::new();
     // Make the GET available for other resources.
