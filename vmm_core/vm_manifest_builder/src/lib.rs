@@ -80,6 +80,7 @@ pub struct VmManifestBuilder {
     platform_pm_timer_assist: bool,
     uefi: Option<UefiManifest>,
     debugcon: Option<(Resource<SerialBackendHandle>, u16)>,
+    vmbus: bool,
 }
 
 /// Configuration for the Hyper-V UEFI helper device.
@@ -207,6 +208,7 @@ impl VmManifestBuilder {
     /// Create a new VM manifest builder for the given chipset type and
     /// architecture.
     pub fn new(ty: BaseChipsetType, arch: MachineArch) -> Self {
+        let vmbus = !matches!(ty, BaseChipsetType::UnenlightenedLinuxDirect);
         VmManifestBuilder {
             ty,
             arch,
@@ -221,6 +223,7 @@ impl VmManifestBuilder {
             platform_pm_timer_assist: false,
             uefi: None,
             debugcon: None,
+            vmbus,
         }
     }
 
@@ -330,6 +333,16 @@ impl VmManifestBuilder {
     pub fn with_uefi(mut self, uefi: UefiManifest) -> Self {
         assert!(matches!(self.ty, BaseChipsetType::HypervGen2Uefi));
         self.uefi = Some(uefi);
+        self
+    }
+
+    /// Mark this VM as not having VMBus.
+    ///
+    /// This affects the default memory layout: the chipset high MMIO region
+    /// (used for VMBus) is not allocated, while the low MMIO region is kept
+    /// for architecturally required address space.
+    pub fn without_vmbus(mut self) -> Self {
+        self.vmbus = false;
         self
     }
 
@@ -522,12 +535,12 @@ impl VmManifestBuilder {
             | BaseChipsetType::HyperVGen2LinuxDirect
             | BaseChipsetType::UnenlightenedLinuxDirect => LayoutConfig {
                 chipset_low_mmio_size: default_low,
-                chipset_high_mmio_size: default_high,
+                chipset_high_mmio_size: if self.vmbus { default_high } else { 0 },
                 vtl2_chipset_mmio_size: 0,
             },
             BaseChipsetType::HclHost => LayoutConfig {
                 chipset_low_mmio_size: default_low,
-                chipset_high_mmio_size: default_high,
+                chipset_high_mmio_size: if self.vmbus { default_high } else { 0 },
                 vtl2_chipset_mmio_size: default_vtl2,
             },
         }

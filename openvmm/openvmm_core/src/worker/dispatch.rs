@@ -2725,6 +2725,7 @@ impl LoadedVmInner {
                                     &self.chipset_cfg,
                                     &self.chipset_capabilities,
                                     enable_serial,
+                                    self.vmbus_server.is_some(),
                                     &self.chipset_mmio,
                                     self.virtio_mmio_region,
                                     self.virtio_mmio_irq,
@@ -2765,6 +2766,7 @@ impl LoadedVmInner {
                             add_devices_to_dsdt_arm64(
                                 dsdt,
                                 enable_serial,
+                                self.vmbus_server.is_some(),
                                 &self.chipset_mmio,
                                 self.hypervisor_cfg.with_hv,
                             )
@@ -2799,6 +2801,7 @@ impl LoadedVmInner {
                 uefi_console_mode,
                 default_boot_always_attempt,
                 bios_guid,
+                enable_vmbus,
             } => {
                 let madt = acpi_builder.build_madt();
                 let srat = acpi_builder.build_srat();
@@ -2816,6 +2819,7 @@ impl LoadedVmInner {
                     uefi_console_mode,
                     default_boot_always_attempt,
                     bios_guid,
+                    vmbus: enable_vmbus,
                 };
                 let regs = super::vm_loaders::uefi::load_uefi(
                     firmware,
@@ -3529,6 +3533,7 @@ fn add_devices_to_dsdt_x64(
     cfg: &BaseChipsetManifest,
     capabilities: &VmChipsetCapabilities,
     serial_uarts: bool,
+    with_vmbus: bool,
     chipset_mmio: &ChipsetMmioRanges,
     virtio_mmio_region: MemoryRange,
     virtio_mmio_irq: u32,
@@ -3568,7 +3573,8 @@ fn add_devices_to_dsdt_x64(
     }
 
     // The chipset MMIO module or PCI bus describes the chipset low/high
-    // MMIO regions to the guest.
+    // MMIO regions to the guest. Either range may be empty (e.g. when
+    // VMBus is disabled, chipset high MMIO is not allocated).
     if cfg.with_generic_pci_bus || capabilities.with_i440bx_host_pci_bridge {
         // TODO: actually plumb through legacy PCI interrupts
         dsdt.add_pci(chipset_mmio.low, chipset_mmio.high, pci_legacy_interrupts);
@@ -3576,10 +3582,12 @@ fn add_devices_to_dsdt_x64(
         dsdt.add_mmio_module(chipset_mmio.low, chipset_mmio.high);
     }
 
-    dsdt.add_vmbus(
-        cfg.with_generic_pci_bus || capabilities.with_i440bx_host_pci_bridge,
-        None,
-    );
+    if with_vmbus {
+        dsdt.add_vmbus(
+            cfg.with_generic_pci_bus || capabilities.with_i440bx_host_pci_bridge,
+            None,
+        );
+    }
     dsdt.add_rtc();
 }
 
@@ -3587,6 +3595,7 @@ fn add_devices_to_dsdt_x64(
 fn add_devices_to_dsdt_arm64(
     dsdt: &mut dsdt::Dsdt,
     enable_serial: bool,
+    with_vmbus: bool,
     chipset_mmio: &ChipsetMmioRanges,
     with_hv: bool,
 ) {
@@ -3602,7 +3611,9 @@ fn add_devices_to_dsdt_arm64(
 
     if with_hv {
         dsdt.add_mmio_module(chipset_mmio.low, chipset_mmio.high);
+    }
 
+    if with_vmbus {
         // VMBus on ARM64 ACPI needs a per-CPU interrupt (PPI) in _CRS.
         // Always place under VMOD, not PCI0 — ARM64 doesn't use the x86
         // PCI0 DSDT node.

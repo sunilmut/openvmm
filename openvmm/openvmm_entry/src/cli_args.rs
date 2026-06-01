@@ -182,6 +182,24 @@ Examples:
     #[clap(long, conflicts_with("get"))]
     pub no_get: bool,
 
+    /// Run without VMBus, even if --hv or --uefi are specified.
+    #[clap(
+        long,
+        conflicts_with_all = [
+            "vmbus_vsock_path",
+            "vmbus_vtl2_vsock_path",
+            "vmbus_redirect",
+            "vmbus_max_version",
+            "vmbus_com1_serial",
+            "vmbus_com2_serial",
+            "disk",
+            "vtl2",
+            "get",
+            "pcat",
+        ],
+    )]
+    pub no_vmbus: bool,
+
     /// disable the VTL0 alias map presented to VTL2 by default
     #[clap(long, requires("vtl2"))]
     pub no_alias_map: bool,
