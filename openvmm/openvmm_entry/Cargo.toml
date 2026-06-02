@@ -88,6 +88,7 @@ futures-concurrency.workspace = true
 getrandom.workspace = true
 prost.workspace = true
 rustyline = { workspace = true, features = ["derive"] }
+sha2.workspace = true
 shell-words.workspace = true
 socket2 = { workspace = true, features = ["all"] }
 tempfile.workspace = true
