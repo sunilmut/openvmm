@@ -8972,6 +8972,7 @@ dependencies = [
  "pal_async",
  "pci_core",
  "pci_resources",
+ "test_with_tracing",
  "tracelimit",
  "tracing",
  "vfio-bindings",
