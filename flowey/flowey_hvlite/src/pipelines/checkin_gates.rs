@@ -750,6 +750,8 @@ impl IntoPipeline for CheckinGatesCli {
                 pipeline.new_typed_artifact(format!("{arch_tag}-linux-musl-openvmm"));
             let (pub_openvmm_vhost_musl, use_openvmm_vhost_musl) =
                 pipeline.new_typed_artifact(format!("{arch_tag}-linux-musl-openvmm_vhost"));
+            let (pub_prep_steps, use_prep_steps) =
+                pipeline.new_typed_artifact(format!("{arch_tag}-linux-prep_steps"));
 
             // skim off interesting artifacts required by the VMM tests job
             match arch {
@@ -757,9 +759,12 @@ impl IntoPipeline for CheckinGatesCli {
                     vmm_tests_artifacts_linux_x86.use_openvmm = Some(use_openvmm.clone());
                     vmm_tests_artifacts_linux_x86.use_openvmm_vhost =
                         Some(use_openvmm_vhost.clone());
+                    vmm_tests_artifacts_linux_x86.use_prep_steps = Some(use_prep_steps.clone());
                     vmm_tests_artifacts_linux_musl_x86.use_openvmm = Some(use_openvmm_musl.clone());
                     vmm_tests_artifacts_linux_musl_x86.use_openvmm_vhost =
                         Some(use_openvmm_vhost_musl.clone());
+                    vmm_tests_artifacts_linux_musl_x86.use_prep_steps =
+                        Some(use_prep_steps.clone());
                 }
                 CommonArch::Aarch64 => {}
             }
@@ -879,6 +884,16 @@ impl IntoPipeline for CheckinGatesCli {
                             profile: CommonProfile::from_release(release),
                         },
                         openvmm_vhost,
+                    }
+                })
+                .publish(pub_prep_steps, |prep_steps| {
+                    flowey_lib_hvlite::build_prep_steps::Request {
+                        target: CommonTriple::Common {
+                            arch,
+                            platform: CommonPlatform::LinuxMusl,
+                        },
+                        profile: CommonProfile::from_release(release),
+                        prep_steps,
                     }
                 });
 
@@ -1316,7 +1331,7 @@ impl IntoPipeline for CheckinGatesCli {
             resolve_vmm_tests_artifacts: vmm_tests_artifact_builders::ResolveVmmTestsDepArtifacts,
             nextest_filter_expr: String,
             test_artifacts: Vec<KnownTestArtifacts>,
-            needs_prep_run: bool,
+            prep_steps_variants: Vec<String>,
             hugetlb_2mb_overcommit_pages: Option<u64>,
         }
 
@@ -1369,6 +1384,10 @@ impl IntoPipeline for CheckinGatesCli {
             KnownTestArtifacts::VmgsWith16kTpm,
         ];
 
+        // Prep variants needed by tests in the standard x64 filter
+        // (e.g. boot_no_vmbus_windows needs the no-vmbus prepped VHD).
+        let standard_x64_prep_variants: Vec<String> = vec!["no-vmbus".into()];
+
         let cvm_filter = |isolation_type| {
             let mut filter = format!(
                 "test({isolation_type}) + (test(vbs) & test(hyperv)) + test(very_heavy) + test(openvmm_openhcl_uefi_x64_windows_datacenter_core_2025_x64_prepped_vbs)"
@@ -1414,7 +1433,7 @@ impl IntoPipeline for CheckinGatesCli {
             resolve_vmm_tests_artifacts,
             nextest_filter_expr,
             test_artifacts,
-            needs_prep_run,
+            prep_steps_variants,
             hugetlb_2mb_overcommit_pages,
         } in [
             VmmTestJobParams {
@@ -1427,7 +1446,7 @@ impl IntoPipeline for CheckinGatesCli {
                 resolve_vmm_tests_artifacts: vmm_tests_artifacts_windows_intel_x86,
                 nextest_filter_expr: standard_filter.clone(),
                 test_artifacts: standard_x64_test_artifacts.clone(),
-                needs_prep_run: false,
+                prep_steps_variants: standard_x64_prep_variants.clone(),
                 hugetlb_2mb_overcommit_pages: None,
             },
             VmmTestJobParams {
@@ -1441,7 +1460,7 @@ impl IntoPipeline for CheckinGatesCli {
                 nextest_filter_expr: "test(openhcl) & !test(servicing) & !test(cvm) & !test(memory_validation) & !test(very_heavy) & !test(hyperv_openhcl_pcat) & !test(prepped_vbs) & !test(256mb)"
                     .to_string(),
                 test_artifacts: standard_x64_test_artifacts.clone(),
-                needs_prep_run: false,
+                prep_steps_variants: Vec::new(),
                 hugetlb_2mb_overcommit_pages: None,
             },
             VmmTestJobParams {
@@ -1454,7 +1473,7 @@ impl IntoPipeline for CheckinGatesCli {
                 resolve_vmm_tests_artifacts: vmm_tests_artifacts_windows_intel_tdx_x86,
                 nextest_filter_expr: cvm_filter("tdx"),
                 test_artifacts: cvm_x64_test_artifacts.clone(),
-                needs_prep_run: true,
+                prep_steps_variants: vec!["standard".into()],
                 hugetlb_2mb_overcommit_pages: None,
             },
             VmmTestJobParams {
@@ -1467,7 +1486,7 @@ impl IntoPipeline for CheckinGatesCli {
                 resolve_vmm_tests_artifacts: vmm_tests_artifacts_windows_amd_x86,
                 nextest_filter_expr: standard_filter.clone(),
                 test_artifacts: standard_x64_test_artifacts.clone(),
-                needs_prep_run: false,
+                prep_steps_variants: standard_x64_prep_variants.clone(),
                 hugetlb_2mb_overcommit_pages: None,
             },
             VmmTestJobParams {
@@ -1480,7 +1499,7 @@ impl IntoPipeline for CheckinGatesCli {
                 resolve_vmm_tests_artifacts: vmm_tests_artifacts_windows_amd_snp_x86,
                 nextest_filter_expr: cvm_filter("snp"),
                 test_artifacts: cvm_x64_test_artifacts,
-                needs_prep_run: true,
+                prep_steps_variants: vec!["standard".into()],
                 hugetlb_2mb_overcommit_pages: None,
             },
             VmmTestJobParams {
@@ -1494,7 +1513,7 @@ impl IntoPipeline for CheckinGatesCli {
                 // - No legal way to obtain gen1 pcat blobs on non-msft linux machines
                 nextest_filter_expr: format!("{standard_filter} & !test(pcat_x64)"),
                 test_artifacts: standard_x64_test_artifacts.clone(),
-                needs_prep_run: false,
+                prep_steps_variants: standard_x64_prep_variants.clone(),
                 hugetlb_2mb_overcommit_pages: Some(HUGETLB_2MB_OVERCOMMIT_PAGES),
             },
             VmmTestJobParams {
@@ -1508,7 +1527,7 @@ impl IntoPipeline for CheckinGatesCli {
                 // - No legal way to obtain gen1 pcat blobs on non-msft linux machines
                 nextest_filter_expr: format!("{standard_filter} & !test(pcat_x64)"),
                 test_artifacts: standard_x64_test_artifacts.clone(),
-                needs_prep_run: false,
+                prep_steps_variants: standard_x64_prep_variants.clone(),
                 hugetlb_2mb_overcommit_pages: None,
             },
             VmmTestJobParams {
@@ -1527,7 +1546,7 @@ impl IntoPipeline for CheckinGatesCli {
                     KnownTestArtifacts::VmgsWithBootEntry,
                     KnownTestArtifacts::VmgsWith16kTpm,
                 ],
-                needs_prep_run: false,
+                prep_steps_variants: Vec::new(),
                 hugetlb_2mb_overcommit_pages: None,
             },
         ] {
@@ -1571,7 +1590,7 @@ impl IntoPipeline for CheckinGatesCli {
                     test_artifacts,
                     fail_job_on_test_fail: true,
                     artifact_dir: pub_vmm_tests_results.map(|x| ctx.publish_artifact(x)),
-                    needs_prep_run,
+                    prep_steps_variants,
                     hugetlb_2mb_overcommit_pages,
                     done: ctx.new_done_handle(),
                 }
@@ -1716,6 +1735,7 @@ mod vmm_tests_artifact_builders {
         pub use_openvmm: Option<UseTypedArtifact<OpenvmmOutput>>,
         pub use_openvmm_vhost: Option<UseTypedArtifact<OpenvmmVhostOutput>>,
         pub use_pipette_linux_musl: Option<UseTypedArtifact<PipetteOutput>>,
+        pub use_prep_steps: Option<UseTypedArtifact<PrepStepsOutput>>,
         // any machine
         pub use_guest_test_uefi: Option<UseTypedArtifact<GuestTestUefiOutput>>,
         pub use_tmks: Option<UseTypedArtifact<TmksOutput>>,
@@ -1729,6 +1749,7 @@ mod vmm_tests_artifact_builders {
                 use_guest_test_uefi,
                 use_pipette_windows,
                 use_pipette_linux_musl,
+                use_prep_steps,
                 use_tmk_vmm,
                 use_tmks,
             } = self;
@@ -1753,7 +1774,7 @@ mod vmm_tests_artifact_builders {
                 // not currently required, since OpenHCL tests cannot be run on OpenVMM on linux
                 artifact_dir_openhcl_igvm_files: None,
                 tmk_vmm_linux_musl: None,
-                prep_steps: None,
+                prep_steps: use_prep_steps.as_ref().map(|a| ctx.use_typed_artifact(a)),
                 vmgstool: None,
                 tpm_guest_tests_windows: None,
                 tpm_guest_tests_linux: None,

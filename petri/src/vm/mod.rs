@@ -653,12 +653,16 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
 
     /// Disable VMBus entirely.
     ///
-    /// This removes all VMBus storage controllers and forces virtio-vsock
-    /// for pipette communication. The guest must boot from a non-VMBus
-    /// device (e.g. PCIe NVMe).
+    /// This removes all VMBus storage controllers. For Linux guests,
+    /// virtio-vsock is used for pipette communication. For Windows guests,
+    /// the caller must also configure TCP pipette transport via
+    /// `modify_backend(|b| b.with_tcp_pipette_nic())`. The guest must boot
+    /// from a non-VMBus device (e.g. PCIe NVMe).
     pub fn with_no_vmbus(mut self) -> Self {
         self.no_vmbus = true;
-        self.use_virtio_vsock = true;
+        if self.config.firmware.os_flavor() != OsFlavor::Windows {
+            self.use_virtio_vsock = true;
+        }
         self.config.vmbus_storage_controllers.clear();
         self
     }
