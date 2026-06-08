@@ -2275,7 +2275,13 @@ mod tests {
         let mock_msi = MockSignalMsi::new();
 
         let (translating_gm, smmu_msi) = {
-            let gm_wrapper = shared_state.create_translating_memory(bus_range, STREAM_ID_BASE, &gm);
+            let translator = shared_state.translator(STREAM_ID_BASE);
+            let gm_wrapper = iommu_common::TranslatingMemory::new_guest_memory(
+                "smmu-translating",
+                translator,
+                bus_range,
+                gm.clone(),
+            );
             let msi = Arc::new(SmmuSignalMsi::new(
                 shared_state.clone(),
                 STREAM_ID_BASE,
@@ -2490,9 +2496,14 @@ mod tests {
         // Create translating memory wrapper (holds Arc to same shared state).
         let bus_range = AssignedBusRange::new();
         bus_range.set_bus_range(BUS, BUS);
-        let translating_gm =
-            dev.shared_state()
-                .create_translating_memory(bus_range, STREAM_ID_BASE, &gm);
+        let shared_state = dev.shared_state().clone();
+        let translator = shared_state.translator(STREAM_ID_BASE);
+        let translating_gm = iommu_common::TranslatingMemory::new_guest_memory(
+            "smmu-translating",
+            translator,
+            bus_range,
+            gm.clone(),
+        );
 
         // Write test data and verify DMA read works.
         let test_data = b"save-restore-test";
