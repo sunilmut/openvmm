@@ -233,8 +233,8 @@ pub struct PetriVmConfig {
     pub vmbus_storage_controllers: HashMap<Guid, VmbusStorageController>,
     /// PCIe NVMe drives.
     pub pcie_nvme_drives: Vec<PcieNvmeDrive>,
-    /// Physical NVMe devices to attach.
-    pub physical_nvme_devices: Vec<PhysicalNvmeDevice>,
+    /// Physical NVMe devices to attach
+    pub physical_nvme_devices: HashMap<Guid, PhysicalNvmeDevice>,
 }
 
 /// PCIe NVMe drive configuration.
@@ -254,8 +254,6 @@ pub struct PcieNvmeDrive {
 pub struct PhysicalNvmeDevice {
     /// The VTL to assign the physical NVMe device to.
     pub target_vtl: Vtl,
-    /// VSID for the device.
-    pub vsid: Guid,
     /// NVMe namespace ID.
     pub nsid: u32,
     /// Namespace size in MiB
@@ -441,7 +439,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 tpm: None,
                 vmbus_storage_controllers: HashMap::new(),
                 pcie_nvme_drives: Vec::new(),
-                physical_nvme_devices: Vec::new(),
+                physical_nvme_devices: HashMap::new(),
             },
             modify_vmm_config: None,
             resources: PetriVmResources {
@@ -517,7 +515,7 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
                 tpm: None,
                 vmbus_storage_controllers: HashMap::new(),
                 pcie_nvme_drives: Vec::new(),
-                physical_nvme_devices: Vec::new(),
+                physical_nvme_devices: HashMap::new(),
             },
             modify_vmm_config: None,
             resources: PetriVmResources {
@@ -1594,9 +1592,16 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
         self
     }
 
-    /// Add a physical NVMe device to the VM.
-    pub fn add_physical_nvme_device(mut self, device: PhysicalNvmeDevice) -> Self {
-        self.config.physical_nvme_devices.push(device);
+    /// Add a physical NVMe device to the VM
+    pub fn add_physical_nvme_device(mut self, vsid: Guid, device: PhysicalNvmeDevice) -> Self {
+        if self
+            .config
+            .physical_nvme_devices
+            .insert(vsid, device)
+            .is_some()
+        {
+            panic!("physical NVMe device {vsid} already existed");
+        }
         self
     }
 
