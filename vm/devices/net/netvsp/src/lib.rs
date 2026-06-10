@@ -2711,8 +2711,9 @@ impl<T: RingMem> NetChannel<T> {
 
     /// Notify the adapter that the guest VF state has changed and it may
     /// need to send a message to the guest.
-    /// Pass `vfid: Some(id)` to advertise VF availability; the serial number
-    /// will be computed and stored in `primary.advertised_vf_serial_number`.
+    /// Pass `vfid: Some(id)` to advertise VF availability; if an association
+    /// message is queued successfully, its serial number is stored in
+    /// `primary.advertised_vf_serial_number`.
     /// Pass `vfid: None` to send a disassociation; the stored serial number
     /// from the most recent association is reused.
     fn guest_vf_is_available(
