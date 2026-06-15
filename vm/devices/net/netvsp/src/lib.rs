@@ -4289,6 +4289,31 @@ impl Coordinator {
             );
         }
         if let Some(primary) = self.primary_mut() {
+            // In some restart cases (such as from a VTL2 VF reconfig), it is possible that the
+            // data path state maintained by the backend can get into an inconsistent
+            // state (for example: if during reconfig, the backend is down and switching
+            // the data path to synthetic fails).
+            // Handle those cases here by forcing the data path back to synthetic when the
+            // backend still reports guest datapath, but the VTL0 VF state is not switched.
+            let endpoint_data_path_to_guest = state.endpoint.get_data_path_to_guest_vf().await.ok();
+            let vtl0_vf_is_switched = matches!(
+                primary.guest_vf_state,
+                PrimaryChannelGuestVfState::DataPathSwitched
+                    | PrimaryChannelGuestVfState::Restoring(
+                        saved_state::GuestVfState::DataPathSwitched,
+                    )
+            );
+            let force_data_path_to_synthetic =
+                !vtl0_vf_is_switched && endpoint_data_path_to_guest == Some(true);
+
+            if force_data_path_to_synthetic {
+                if let Err(err) = state.endpoint.set_data_path_to_guest_vf(false).await {
+                    tracing::warn!(
+                        error = err.as_ref() as &dyn std::error::Error,
+                        "Failed forcing data path back to synthetic after VTL2 restart"
+                    );
+                }
+            }
             primary.is_data_path_switched = state.endpoint.get_data_path_to_guest_vf().await.ok();
             tracing::info!(
                 is_data_path_switched = primary.is_data_path_switched,
@@ -4335,7 +4360,7 @@ impl Coordinator {
                 let WorkerState::WaitingForCoordinator(Some(ready)) =
                     std::mem::replace(&mut worker.state, WorkerState::WaitingForCoordinator(None))
                 else {
-                    unreachable!("valid ready state")
+                    unreachable!("valid ready state");
                 };
                 let _ = std::mem::replace(&mut worker.state, WorkerState::Ready(ready));
             }
@@ -4545,8 +4570,9 @@ impl Coordinator {
                                 err = err.as_ref() as &dyn std::error::Error,
                                 "Failed setting data path back to synthetic after guest VF was removed."
                             );
+                        } else {
+                            primary.is_data_path_switched = Some(false);
                         }
-                        primary.is_data_path_switched = Some(false);
                     }
                 }
                 PrimaryChannelGuestVfState::DataPathSwitched
@@ -4558,8 +4584,9 @@ impl Coordinator {
                             err = err.as_ref() as &dyn std::error::Error,
                             "Failed setting data path back to synthetic after guest VF was removed."
                         );
+                    } else {
+                        primary.is_data_path_switched = Some(false);
                     }
-                    primary.is_data_path_switched = Some(false);
                 }
                 _ => (),
             }
