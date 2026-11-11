@@ -74,6 +74,52 @@ Only files corresponding to platforms present in the manifest are emitted.
 The `.idblock` file is the SNP signing payload used by the production signing
 mode described below.
 
+### Supply a product policy file
+
+Use `--product-policy` to supply a product policy separately from the layout
+manifest when packaging prebuilt OpenHCL artifacts:
+
+```bash
+cargo run -p igvmfilegen -- manifest \
+  --manifest path/to/manifest.json \
+  --resources path/to/resources.json \
+  --product-policy path/to/product-policy.json \
+  --output path/to/openhcl.bin
+```
+
+The policy file uses the same JSON schema as the manifest's
+`image.openhcl.product_policy` field, including the product variant:
+
+```json
+{
+  "sivm": {
+    "require_ephemeral_vmgs": false,
+    "require_secure_boot": true,
+    "require_secure_boot_vars": false,
+    "require_bcd_integrity": false,
+    "custom_uefi_json": ""
+  }
+}
+```
+
+`custom_uefi_json` is a required base64-encoded string. It must be non-empty
+when `require_secure_boot` and either `require_secure_boot_vars` or
+`require_bcd_integrity` are true. Unknown products, unknown fields, and malformed
+base64 are rejected. The ephemeral-VMGS, secure-boot-vars, and BCD-integrity
+requirements are reserved and are not yet enforced at runtime.
+
+The policy applies to every OpenHCL image in the manifest, including all
+platforms in a combined image. The command rejects a manifest without an
+OpenHCL image or with any inline OpenHCL product policy. Without the option,
+existing inline-policy behavior is unchanged.
+
+`igvmfilegen` encodes the policy as a magic-wrapped protobuf binary and appends
+it to the initrd as `/openhcl-product-policy` before generating launch
+measurements. The source initrd on disk is unchanged. If an earlier initrd layer
+already contains that file, the appended policy takes precedence. Policy
+changes affect the measured image; generate signing material from the resulting
+IGVM rather than reusing material from an image with another policy.
+
 ## Inspect an IGVM
 
 Dump headers and directives in a human-readable form:

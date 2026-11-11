@@ -141,6 +141,13 @@ enum Options {
         /// file.
         #[clap(short, long = "resources")]
         resources: PathBuf,
+        /// ProductPolicy JSON file to embed in every OpenHCL initrd.
+        ///
+        /// Uses the same schema as image.openhcl.product_policy. Requires an
+        /// OpenHCL image and conflicts with any inline OpenHCL product policy.
+        /// The source initrd is not modified.
+        #[clap(long)]
+        product_policy: Option<PathBuf>,
         /// Output file path for the built igvm file
         #[clap(short = 'o', long)]
         output: PathBuf,
@@ -342,6 +349,7 @@ fn main() -> anyhow::Result<()> {
         Options::Manifest {
             manifest,
             resources,
+            product_policy,
             output,
             debug_validation,
             disable_secure_avic,
@@ -352,6 +360,13 @@ fn main() -> anyhow::Result<()> {
                 &fs_err::read_to_string(manifest).context("reading manifest")?,
             )
             .context("parsing manifest")?;
+
+            if let Some(path) = product_policy {
+                let json = fs_err::read_to_string(&path)
+                    .with_context(|| format!("reading product policy file {}", path.display()))?;
+                product_policy_initrd::apply_to_config(&mut config, &json)
+                    .with_context(|| format!("applying product policy file {}", path.display()))?;
+            }
 
             if disable_secure_avic {
                 for guest_config in &mut config.guest_configs {
@@ -1614,6 +1629,39 @@ fn load_linux<R: IgvmfilegenRegister + GuestArch + 'static>(
     let load_info = R::load_linux_kernel_and_initrd(loader, &mut kernel, 0, initrd, None)
         .context("loading linux kernel and initrd")?;
     Ok(load_info)
+}
+
+#[cfg(test)]
+mod product_policy_cli_tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn manifest_accepts_optional_product_policy_path() {
+        let args = [
+            "igvmfilegen",
+            "manifest",
+            "--manifest",
+            "manifest.json",
+            "--resources",
+            "resources.json",
+            "--output",
+            "openhcl.bin",
+        ];
+        let Options::Manifest { product_policy, .. } = Options::try_parse_from(args).unwrap()
+        else {
+            panic!("expected manifest command");
+        };
+        assert_eq!(product_policy, None);
+
+        let Options::Manifest { product_policy, .. } =
+            Options::try_parse_from(args.into_iter().chain(["--product-policy", "policy.json"]))
+                .unwrap()
+        else {
+            panic!("expected manifest command");
+        };
+        assert_eq!(product_policy, Some(PathBuf::from("policy.json")));
+    }
 }
 
 #[cfg(test)]
