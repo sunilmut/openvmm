@@ -222,6 +222,24 @@ impl HvCall {
         output.result()
     }
 
+    /// Allows the parent to intercept a VBS-isolated partition's I/O port.
+    #[cfg(target_arch = "x86_64")]
+    pub fn allow_parent_io_port_access(&mut self, port: u16) -> Result<(), hvdef::HvError> {
+        let input = hvdef::hypercall::InstallIntercept {
+            partition_id: hvdef::HV_PARTITION_ID_SELF,
+            access_type_mask: hvdef::hypercall::HV_INTERCEPT_ACCESS_MASK_READ_WRITE,
+            intercept_type: hvdef::hypercall::HvInterceptType::HvInterceptTypeX64IsolatedIoPort,
+            intercept_parameters: hvdef::hypercall::HvInterceptParameters::new_io_port(port),
+        };
+
+        input
+            .write_to_prefix(Self::input_page().buffer.as_mut_slice())
+            .unwrap();
+
+        self.dispatch_hvcall(hvdef::HypercallCode::HvCallInstallIntercept, None)
+            .result()
+    }
+
     /// Hypercall for setting a register to a value.
     pub fn get_register(
         &mut self,

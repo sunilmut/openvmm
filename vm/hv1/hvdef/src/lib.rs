@@ -1659,6 +1659,7 @@ pub mod hypercall {
             HvInterceptTypeX64ApicEoi = 0x0000000E,
             HvInterceptTypeRetargetInterruptWithUnknownDeviceId = 0x0000000F,
             HvInterceptTypeX64IoPortRange = 0x00000011,
+            HvInterceptTypeX64IsolatedIoPort = 0x00000013,
         }
     }
 

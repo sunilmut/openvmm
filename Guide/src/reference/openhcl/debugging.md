@@ -77,6 +77,12 @@ Set-VMComPort -VMName $VmName -Number 3 -Path "\\.\pipe\openhcl-com3"
 hvc serial -c -p 3 -r $VmName
 ```
 
+For x64 VBS-isolated VMs, COM3 also requires a host hypervisor that supports
+guest-authorized I/O port interception and `OPENHCL_CONFIDENTIAL_DEBUG=1` in
+the measured command line. OpenHCL grants COM3 access before initializing the
+serial logger and keeps it enabled for the Linux console. If the hypervisor
+rejects the request, OpenHCL logs the failure and disables the serial console.
+
 ```admonish note
 The `flowey` test runner (`install_vmm_tests_external_deps`) sets this registry key
 automatically when running VMM tests. If you run `cargo xflowey` to execute

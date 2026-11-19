@@ -667,17 +667,39 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
         Err(e) => panic!("unable to read device tree params {:?}", e),
     };
 
-    // Enable logging ASAP. This is fine even when isolated, as we don't have
-    // any access to secrets in the boot shim.
-    boot_logger_runtime_init(p.isolation_type, partition_info.com3_serial.clone());
-    log::info!("openhcl_boot: logging enabled");
-    log::info!("serial configuration: {:#x?}", partition_info.com3_serial);
-
     // Confidential debug will show up in boot_options only if included in the
     // static command line, or if can_trust_host is true (so the dynamic command
     // line has been parsed).
     let is_confidential_debug =
         static_confidential_debug || partition_info.boot_options.confidential_debug;
+
+    #[cfg(target_arch = "x86_64")]
+    if p.isolation_type == IsolationType::Vbs
+        && is_confidential_debug
+        && matches!(partition_info.com3_serial, ComInfo::Ns16550 { .. })
+    {
+        // Keep permission enabled after the shim exits so Linux can use COM3.
+        let result = (minimal_rt::arch::COM3..minimal_rt::arch::COM3 + 8).try_for_each(|port| {
+            hvcall()
+                .allow_parent_io_port_access(port)
+                .map_err(|err| (port, err))
+        });
+        match result {
+            Ok(()) => log::info!("enabled VBS COM3 parent I/O port intercepts"),
+            Err((port, err)) => {
+                log::error!(
+                    "failed to enable VBS COM3 parent I/O port intercept at {port:#x}: {err}; disabling serial console"
+                );
+                partition_info.com3_serial = ComInfo::None;
+            }
+        }
+    }
+
+    // Enable logging ASAP. This is fine even when isolated, as we don't have
+    // any access to secrets in the boot shim.
+    boot_logger_runtime_init(p.isolation_type, partition_info.com3_serial.clone());
+    log::info!("openhcl_boot: logging enabled");
+    log::info!("serial configuration: {:#x?}", partition_info.com3_serial);
 
     // Fill out the non-devicetree derived parts of PartitionInfo.
     if !p.isolation_type.is_hardware_isolated()
