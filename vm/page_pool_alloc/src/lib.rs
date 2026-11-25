@@ -887,6 +887,9 @@ impl user_driver::DmaClient for PagePoolAllocator {
 
 #[cfg(test)]
 mod test {
+    mod behavior_tests;
+    mod restore_tests;
+
     use crate::PAGE_SIZE;
     use crate::PagePool;
     use crate::PoolSource;
