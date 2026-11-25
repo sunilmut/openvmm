@@ -241,3 +241,60 @@ async fn keyboard_input_eof_preserves_guest_request_handling() {
         .expect("repeated negotiation must terminate the public runner")
         .expect("protocol failure is not task cancellation");
 }
+
+// Test: Queue a modifier/repeated-key sequence before rejected versions, then retry.
+// Expected: Input stays inactive until acceptance, then every make/repeat/break
+//       arrives once and in order with its original extended-key flags.
+#[async_test]
+async fn keyboard_version_retry_preserves_queued_modifier_and_repeat_events() {
+    let (host, guest, memory) = connected_gpadl_channels();
+    let mut guest = MessagePipe::new_raw(guest).unwrap();
+    let (source, mut sink) = input_pair();
+    let mut keyboard = Keyboard::new(Box::new(source));
+    let mut channel = keyboard.open(host, memory).unwrap();
+    for (code, make) in [
+        (0xe01d, true),
+        (0x1e, true),
+        (0x1e, true),
+        (0x9e, false),
+        (0xe09d, false),
+    ] {
+        sink.send(KeyboardData { code, make });
+    }
+    let mut run = pin!(StopTask::run_unstoppable(async |stop| keyboard
+        .run(stop, &mut channel)
+        .await));
+    for (version, accepted) in [(0, 0), (u32::MAX, 0), (protocol::VERSION_WIN8, 1)] {
+        send_packet(
+            &mut guest,
+            protocol::MESSAGE_PROTOCOL_REQUEST,
+            &protocol::MessageProtocolRequest { version },
+        )
+        .await
+        .unwrap();
+        assert!(run.as_mut().now_or_never().is_none());
+        let Some(Packet::ProtocolResponse(response)) = recv_packet(&mut guest).await else {
+            panic!("expected protocol response before input");
+        };
+        assert_eq!(response.accepted, accepted);
+        assert_eq!(sink.is_active(), accepted != 0);
+        if accepted == 0 {
+            let mut buffer = [0; 64];
+            assert!(guest.recv(&mut buffer).now_or_never().is_none());
+        }
+    }
+    for (code, flags) in [
+        (0x1d, protocol::KEYSTROKE_IS_E0),
+        (0x1e, 0),
+        (0x1e, 0),
+        (0x1e, protocol::KEYSTROKE_IS_BREAK),
+        (
+            0x1d,
+            protocol::KEYSTROKE_IS_E0 | protocol::KEYSTROKE_IS_BREAK,
+        ),
+    ] {
+        assert_keystroke(&mut guest, code, flags).await;
+    }
+    let mut buffer = [0; 64];
+    assert!(guest.recv(&mut buffer).now_or_never().is_none());
+}
