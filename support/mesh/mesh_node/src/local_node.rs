@@ -3028,4 +3028,6 @@ pub mod tests {
         let err = p2.recv().await.unwrap_err();
         assert!(matches!(err, RecvError::Failed));
     }
+
+    mod behavior;
 }

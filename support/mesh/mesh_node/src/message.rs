@@ -590,4 +590,6 @@ mod tests {
                 .is_err()
         );
     }
+
+    mod compatibility;
 }

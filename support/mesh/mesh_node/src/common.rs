@@ -161,9 +161,36 @@ impl Debug for Address {
 #[cfg(test)]
 mod tests {
     use super::Uuid;
+    use test_with_tracing::test;
 
     #[test]
     fn test_uuid() {
         Uuid::new();
+    }
+
+    // Test: Parse hexadecimal IDs, including zero, mixed case, and the u128 limit.
+    // Expected: Valid IDs round-trip; signs, empty input, and overflow are rejected.
+    #[test]
+    fn uuid_text_roundtrips_and_rejects_malformed_identifiers() {
+        for (text, expected) in [
+            ("0", 0),
+            ("aBcD", 0xabcd),
+            ("ffffffffffffffffffffffffffffffff", u128::MAX),
+        ] {
+            let id: Uuid = text.parse().unwrap();
+            assert_eq!(id.0, expected.to_be_bytes());
+            assert_eq!(id.to_string().parse::<Uuid>().unwrap(), id);
+        }
+        for text in [
+            "",
+            "+1",
+            "-1",
+            " 1",
+            "0x1",
+            "g",
+            "100000000000000000000000000000000",
+        ] {
+            assert!(text.parse::<Uuid>().is_err(), "{text:?}");
+        }
     }
 }

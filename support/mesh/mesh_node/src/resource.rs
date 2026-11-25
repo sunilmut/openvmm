@@ -117,3 +117,39 @@ impl TryFrom<Resource> for std::os::windows::io::OwnedSocket {
 }
 
 pub type SerializedMessage = mesh_protobuf::SerializedMessage<Resource>;
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::io::Write;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use test_with_tracing::test;
+
+    // Test: Convert live ports and file descriptors through mesh resources.
+    // Expected: Correct conversions retain usable ownership; wrong types fail.
+    #[test]
+    fn resource_conversions_preserve_live_endpoints_and_reject_wrong_types() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        let fd: OwnedFd = socket.into();
+        let fd = OwnedFd::try_from(Resource::from(fd)).unwrap();
+        let mut socket = UnixStream::from(fd);
+        socket.write_all(b"mesh").unwrap();
+        let mut bytes = [0; 4];
+        peer.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"mesh");
+        assert!(matches!(
+            Port::try_from(Resource::from(OwnedFd::from(socket))),
+            Err(ResourceError::BadResourceType)
+        ));
+        let (port, peer) = Port::new_pair();
+        let port = Port::try_from(Resource::from(port)).unwrap();
+        assert!(!peer.is_closed().unwrap());
+        assert!(matches!(
+            OwnedFd::try_from(Resource::from(port)),
+            Err(ResourceError::BadResourceType)
+        ));
+        assert!(peer.is_closed().unwrap());
+    }
+}
