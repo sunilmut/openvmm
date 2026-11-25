@@ -506,3 +506,42 @@ fn bad_runtime_claims_do_not_prevent_a_later_valid_key_release() {
         256
     );
 }
+
+// Test: Alternate transfer-key recipients and their JWK positions on one agent.
+// Expected: Each response decrypts with its current recipient and releases the
+//       same persistent private key, including when returning to the first client.
+#[test]
+fn key_release_uses_each_requests_transfer_key_without_rotating_the_persistent_key() {
+    let recipients = [
+        RsaKeyPair::generate(2048).unwrap(),
+        RsaKeyPair::generate(2048).unwrap(),
+    ];
+    for setting in [None, Some(successful_plan())] {
+        let mut agent = TestIgvmAgent::new("changing-transfer-keys");
+        if let Some(setting) = setting {
+            agent.install_plan_from_setting(&setting);
+        }
+        let mut persistent_key = None;
+        for recipient in [0, 1, 0] {
+            let transfer = &recipients[recipient];
+            let mut runtime_claims = claims(transfer);
+            if recipient == 1 {
+                runtime_claims.keys.swap(0, 1);
+            }
+            let release = request(
+                IgvmAttestRequestType::KEY_RELEASE_REQUEST,
+                &serde_json::to_vec(&runtime_claims).unwrap(),
+                WrapScheme::Sha384,
+            );
+            let payload = success(agent.handle_request(&release).unwrap(), WrapScheme::Sha384);
+            let key = released_key(&payload, transfer, WrapScheme::Sha384)
+                .to_components()
+                .unwrap();
+            if let Some(expected) = &persistent_key {
+                assert_eq!(&key, expected);
+            } else {
+                persistent_key = Some(key);
+            }
+        }
+    }
+}
