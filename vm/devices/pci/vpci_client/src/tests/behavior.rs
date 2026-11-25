@@ -456,3 +456,58 @@ async fn invalid_tdisp_responses_fail_without_poisoning_the_worker(driver: Defau
     drop((device, eject, added));
     client.shutdown().await;
 }
+
+// Test: Disable decoding and relocate a 64-bit BAR twice, with status-only writes.
+// Expected: Each enable publishes the current BAR pair before the command;
+//       status byte lanes neither clear command bits nor trigger another BAR flush.
+#[async_test]
+async fn bar_relocation_cycles_preserve_status_and_command_byte_lanes(driver: DefaultDriver) {
+    let (mut host, client, mut devices, added, log) = connect(&driver, &[description(0, 1)]).await;
+    let (device, eject) = host
+        .init(devices.pop().unwrap(), [0xffff_f004, u32::MAX, 0, 0, 0, 0])
+        .await;
+    for (low, high) in [(0x8000, 1), (0x9000, 2)] {
+        device.write_cfg(
+            4,
+            ByteEnabledDwordWrite::new(0, PciConfigByteEnable::LOW_WORD),
+        );
+        assert_eq!(read_cfg(&device, 4) & 6, 0);
+        log.lock().writes.clear();
+        device.write_cfg(0x10, ByteEnabledDwordWrite::with_all_bytes_enabled(low));
+        device.write_cfg(0x14, ByteEnabledDwordWrite::with_all_bytes_enabled(high));
+        assert_eq!(read_cfg(&device, 0x10), low | 4);
+        assert_eq!(read_cfg(&device, 0x14), high);
+        assert!(log.lock().writes.is_empty());
+        device.write_cfg(
+            4,
+            ByteEnabledDwordWrite::new(6, PciConfigByteEnable::LOW_WORD),
+        );
+        let mut expected = Vec::new();
+        for (index, value) in [low | 4, high, 0, 0, 0, 0].into_iter().enumerate() {
+            expected.push((
+                BASE + protocol::MMIO_PAGE_CONFIG_SPACE + 0x10 + index as u64 * 4,
+                value.to_ne_bytes().to_vec(),
+            ));
+        }
+        expected.push((
+            BASE + protocol::MMIO_PAGE_CONFIG_SPACE + 4,
+            6u16.to_ne_bytes().to_vec(),
+        ));
+        assert_eq!(log.lock().writes, expected);
+        log.lock().writes.clear();
+        device.write_cfg(
+            4,
+            ByteEnabledDwordWrite::new(0xa500_0000, PciConfigByteEnable::HIGH_WORD),
+        );
+        assert_eq!(
+            log.lock().writes,
+            [(
+                BASE + protocol::MMIO_PAGE_CONFIG_SPACE + 6,
+                0xa500u16.to_ne_bytes().to_vec(),
+            )]
+        );
+        assert_eq!(read_cfg(&device, 4) & 6, 6);
+    }
+    drop((device, eject, added));
+    client.shutdown().await;
+}
