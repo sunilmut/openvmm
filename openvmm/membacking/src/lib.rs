@@ -106,3 +106,6 @@ pub use region_manager::DmaMapperClient;
 pub use region_manager::DmaMapperHandle;
 pub use region_manager::DmaTarget;
 pub use region_manager::MappingType;
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests;

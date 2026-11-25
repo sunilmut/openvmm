@@ -107,3 +107,7 @@ impl<T: 'static + Send + Sync> ObjectCache<T> {
         r
     }
 }
+
+#[cfg(test)]
+#[path = "object_cache_tests.rs"]
+mod tests;
