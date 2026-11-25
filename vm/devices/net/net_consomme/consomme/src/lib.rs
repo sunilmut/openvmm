@@ -1239,3 +1239,6 @@ impl<T: Client> Access<'_, T> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod protocol_behavior;

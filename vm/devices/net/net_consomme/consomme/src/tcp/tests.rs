@@ -4194,3 +4194,6 @@ fn test_retransmission_state_follows_rfc_6298() {
     syn_state.on_handshake_complete();
     assert_eq!(syn_state.rto, Duration::from_secs(3));
 }
+
+#[path = "behavior.rs"]
+mod behavior;
