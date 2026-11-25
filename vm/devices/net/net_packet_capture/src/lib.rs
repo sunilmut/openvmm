@@ -567,3 +567,6 @@ impl InspectMut for PacketCaptureQueue {
         self.current_mut().inspect_mut(req)
     }
 }
+
+#[cfg(test)]
+mod tests;

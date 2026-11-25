@@ -5256,11 +5256,14 @@ dependencies = [
  "async-trait",
  "futures",
  "futures-concurrency",
+ "guestmem",
  "inspect",
  "mesh",
  "net_backend",
+ "pal_async",
  "parking_lot",
  "pcap-file",
+ "test_with_tracing",
  "tracing",
 ]
 
