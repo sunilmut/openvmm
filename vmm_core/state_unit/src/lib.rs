@@ -1535,4 +1535,6 @@ mod tests {
 
         units.restore(state).await.unwrap();
     }
+
+    mod behavior;
 }
