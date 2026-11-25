@@ -14,3 +14,6 @@ pub mod device;
 pub mod services;
 
 pub mod test_chipset;
+
+#[cfg(test)]
+mod tests;
