@@ -33,6 +33,7 @@ guestmem.workspace = true
 libtest-mimic.workspace = true
 net_backend.workspace = true
 pal_async.workspace = true
+test_with_tracing.workspace = true
 
 [[test]]
 name = "tap_tests"

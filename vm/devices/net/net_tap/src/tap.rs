@@ -208,3 +208,6 @@ impl Write for PolledTap {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod queue_tests;

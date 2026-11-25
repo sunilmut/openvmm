@@ -731,6 +731,8 @@ mod tap_tests {
     // Harness
     // ---------------------------------------------------------------------------
 
+    mod behavior_tests;
+
     pub(crate) fn main() {
         let args = Arguments::from_args();
 
@@ -761,6 +763,10 @@ mod tap_tests {
             async_trial("tap_tx_wouldblock_drops", test_tap_tx_wouldblock_drops),
             async_trial("tap_tx_with_offloads", test_tap_tx_with_offloads),
             async_trial("tap_tso_ipv4_checksum", test_tap_tso_ipv4_checksum),
+            async_trial(
+                "tap_resolve_reconfigure",
+                behavior_tests::resolve_reconfigure,
+            ),
         ]
         .map(|t| t.with_ignored_flag(ignored))
         .into();

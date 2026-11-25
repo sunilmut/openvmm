@@ -836,6 +836,8 @@ mod tests {
     use super::*;
     use net_backend::TxFlags;
 
+    mod boundary_tests;
+
     fn all_rx_offloads() -> RxOffloadSupport {
         RxOffloadSupport {
             checksum: true,
