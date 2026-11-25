@@ -137,3 +137,6 @@ pub enum Response {
     #[mesh(2, transparent)]
     Payload(Vec<u8>),
 }
+
+#[cfg(test)]
+mod tests;
