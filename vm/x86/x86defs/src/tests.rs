@@ -369,3 +369,21 @@ fn arbitrary_register_generation_retains_full_width_fields() {
     }
     assert!(known && other);
 }
+
+// Test: Flip each bit of positive and negative canonical guest addresses.
+// Expected: Payload bits stay valid; any broken sign-extension bit is rejected.
+#[test]
+fn canonical_validation_checks_every_sign_extension_bit() {
+    for bits in [48, 57] {
+        for address in [0x1234_5678_u64, !0x1234_5678_u64] {
+            for bit in 0..64 {
+                let changed = address ^ (1_u64 << bit);
+                assert_eq!(
+                    is_canonical_address(changed, bits),
+                    bit < bits - 1,
+                    "{bits}-bit address {changed:#018x}, changed bit {bit}"
+                );
+            }
+        }
+    }
+}
