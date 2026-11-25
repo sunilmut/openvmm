@@ -504,4 +504,6 @@ mod tests {
             std::io::ErrorKind::BrokenPipe
         );
     }
+
+    mod reference_tests;
 }
