@@ -3041,6 +3041,7 @@ dependencies = [
  "serde_helpers",
  "serde_json",
  "static_assertions",
+ "test_with_tracing",
  "zerocopy",
 ]
 

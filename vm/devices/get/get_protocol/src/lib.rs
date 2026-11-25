@@ -1990,3 +1990,6 @@ pub mod test_utilities {
     pub const TEST_VMGS_SECTOR_SIZE: u32 = 512;
     pub const TEST_VMGS_CAPACITY: usize = 4194816; // 4 MB
 }
+
+#[cfg(test)]
+mod tests;

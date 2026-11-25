@@ -19,6 +19,7 @@ zerocopy.workspace = true
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["std"] }
+test_with_tracing.workspace = true
 
 [lints]
 workspace = true
