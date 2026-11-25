@@ -458,3 +458,5 @@ fn checkpoint_rejects_mismatched_vector_count() {
         Err(vmcore::save_restore::RestoreError::InvalidSavedState(_))
     ));
 }
+
+mod reference_tests;
