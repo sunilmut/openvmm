@@ -760,6 +760,9 @@ impl SintState {
 mod behavior_tests;
 
 #[cfg(test)]
+mod reference_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
