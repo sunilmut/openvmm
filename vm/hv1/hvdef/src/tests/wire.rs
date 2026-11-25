@@ -163,3 +163,28 @@ fn pending_event_wire_formats_preserve_exception_details_and_future_tags() {
         assert_eq!(decoded.event_type(), typ);
     }
 }
+
+// Test: Encode post-message hypercall inputs with empty, one-byte, and full
+//       payloads using distinct connection and message-type identifiers.
+// Expected: The hypercall header precedes every payload byte in TLFS order,
+//       independently of the different SynIC delivery-header layout.
+#[test]
+fn post_message_hypercall_inputs_match_the_transport_wire_contract() {
+    let payload: [u8; 240] = core::array::from_fn(|index| index as u8);
+    for len in [0, 1, 240] {
+        let mut input = hypercall::PostMessage {
+            connection_id: 0x00123456,
+            padding: 0,
+            message_type: 0x80000042,
+            payload_size: len as u32,
+            payload: [0; 240],
+        };
+        input.payload[..len].copy_from_slice(&payload[..len]);
+        let mut expected = [0; 256];
+        expected[..16].copy_from_slice(&[
+            0x56, 0x34, 0x12, 0, 0, 0, 0, 0, 0x42, 0, 0, 0x80, len as u8, 0, 0, 0,
+        ]);
+        expected[16..16 + len].copy_from_slice(&payload[..len]);
+        assert_eq!(input.as_bytes(), expected);
+    }
+}
