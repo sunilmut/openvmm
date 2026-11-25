@@ -35,7 +35,7 @@ use vmcore::vm_task::VmTaskDriverSource;
 use zerocopy::FromZeros;
 use zerocopy::IntoBytes;
 
-fn instantiate_controller(
+pub(super) fn instantiate_controller(
     driver: DefaultDriver,
     gm: &GuestMemory,
     int_controller: Option<&TestPciInterruptController>,
@@ -1349,7 +1349,7 @@ fn get_feature_command(fid: spec::Feature, cdw11: u32) -> spec::Command {
 
 /// Submits a single admin command in slot `admin_slot` and returns its
 /// completion.
-async fn submit_admin_command(
+pub(super) async fn submit_admin_command(
     nvmec: &mut NvmeController,
     gm: &GuestMemory,
     asq: &PrpRange,
