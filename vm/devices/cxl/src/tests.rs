@@ -335,3 +335,43 @@ fn register_locator_is_read_only_through_the_pci_interface() {
     );
     assert_eq!(high, 0x1234);
 }
+
+// Test: Disable and re-enable a committed decoder after writing endpoint memory.
+// Expected: Disabled accesses fail without changing data or the committed mapping.
+#[test]
+fn endpoint_decoder_disable_preserves_memory_across_reenable() {
+    let mut device = CxlTestDevice::new(&mut Registrar, SIZE).unwrap();
+    map_bar(&mut device);
+    let cap = find_hdm(&mut device);
+    let global_control = cap + CXL_HDM_DECODER_GLOBAL_CONTROL_OFFSET;
+    let enabled = CxlHdmDecoderGlobalControlRegister::new()
+        .with_hdm_decoder_enable(true)
+        .into_bits();
+    program_decoder(&mut device, cap, SIZE);
+    write_register(&mut device, global_control, enabled);
+    let address = HDM + SIZE - 4;
+    let expected = [0x12, 0x34, 0x56, 0x78];
+    assert!(matches!(
+        device.mmio_write(address, &expected),
+        IoResult::Ok
+    ));
+
+    write_register(&mut device, global_control, 0);
+    let mut bytes = [0xa5; 4];
+    assert!(matches!(
+        device.mmio_read(address, &mut bytes),
+        IoResult::Err(IoError::InvalidRegister)
+    ));
+    assert_eq!(bytes, [0xa5; 4]);
+    assert!(matches!(
+        device.mmio_write(address, &[0xff; 4]),
+        IoResult::Err(IoError::InvalidRegister)
+    ));
+
+    write_register(&mut device, global_control, enabled);
+    assert!(matches!(
+        device.mmio_read(address, &mut bytes),
+        IoResult::Ok
+    ));
+    assert_eq!(bytes, expected);
+}
