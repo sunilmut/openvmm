@@ -9110,6 +9110,7 @@ dependencies = [
  "clap",
  "parking_lot",
  "serde_json",
+ "test_with_tracing",
  "tpm_lib",
  "tpm_protocol",
  "zerocopy",

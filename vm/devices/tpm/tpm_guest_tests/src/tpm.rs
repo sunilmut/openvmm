@@ -201,6 +201,9 @@ mod unix {
             Ok(resp)
         }
     }
+
+    #[cfg(test)]
+    mod tests;
 }
 
 #[cfg(windows)]
@@ -346,3 +349,6 @@ mod windows {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

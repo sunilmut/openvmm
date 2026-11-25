@@ -838,6 +838,8 @@ mod tests {
     use serde_json::json;
     use zerocopy::IntoBytes;
 
+    mod behavior_tests;
+
     #[test]
     fn runtime_claims_json_parses_version1() {
         let runtime_json = serde_json::to_vec(&json!({
