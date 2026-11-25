@@ -333,3 +333,70 @@ async fn pci_snapshots_validate_feature_and_queue_shapes(driver: DefaultDriver) 
         restored.pci_device.teardown().await;
     }
 }
+
+// Test: Resume a split queue just before its 16-bit available/used indices wrap.
+// Expected: Every descriptor completes exactly once with the correct payload,
+//       ring entry and published index across 65535-to-zero and subsequent reuse.
+#[async_test]
+async fn split_queue_completions_survive_u16_index_wrap(driver: DefaultDriver) {
+    let initial_index = u16::MAX - 1;
+    let (memory, mut queue) = new_bound_test_queue(
+        &driver,
+        false,
+        Some(QueueState {
+            avail_index: initial_index,
+            used_index: initial_index,
+        }),
+    );
+    memory
+        .write_at(
+            BOUND_TEST_AVAIL_ADDR + AVAIL_OFFSET_IDX,
+            &initial_index.to_le_bytes(),
+        )
+        .unwrap();
+    memory
+        .write_at(
+            BOUND_TEST_USED_ADDR + USED_OFFSET_IDX,
+            &initial_index.to_le_bytes(),
+        )
+        .unwrap();
+    let mut available_index = initial_index;
+    for (head, ring_index, expected_index) in [
+        (3, initial_index, u16::MAX),
+        (1, u16::MAX, 0),
+        (0, 0, 1),
+        (2, 1, 2),
+    ] {
+        assert!(queue.try_next().unwrap().is_none());
+        make_available(
+            &memory,
+            BOUND_TEST_AVAIL_ADDR,
+            BOUND_TEST_QUEUE_SIZE,
+            head,
+            &mut available_index,
+        );
+        let work = queue.try_next().unwrap().expect("published descriptor");
+        assert_eq!(work.descriptor_index(), head);
+        work.write(&memory, &[head as u8 + 1]).unwrap();
+        queue.complete(work, 1);
+        assert_eq!(
+            crate::test_helpers::read_used_idx(&memory, BOUND_TEST_USED_ADDR),
+            expected_index
+        );
+        assert_eq!(
+            read_used_entry(
+                &memory,
+                BOUND_TEST_USED_ADDR,
+                BOUND_TEST_QUEUE_SIZE,
+                ring_index
+            ),
+            (u32::from(head), 1)
+        );
+        let mut bytes = [0xff; 2];
+        memory
+            .read_at(BOUND_TEST_DATA_ADDR + u64::from(head) * 0x100, &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, [head as u8 + 1, 0]);
+        assert!(queue.try_next().unwrap().is_none());
+    }
+}
