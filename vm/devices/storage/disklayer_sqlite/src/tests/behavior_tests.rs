@@ -126,3 +126,43 @@ async fn sparse_reads_and_both_unmap_modes_preserve_layered_data() {
         expected
     );
 }
+
+// Test: Abort the third sector statement of a four-sector write after earlier statements replaced both zero and nonzero data, then remove the fault and retry.
+// Expected: The failed transaction preserves every original sector; the retry commits all replacement sectors without changing guards, and the result survives reopen.
+#[async_test]
+async fn interior_sector_failure_rolls_back_whole_write_and_allows_durable_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollback.dbhd");
+    let layer = format(&path, false);
+    let original: Vec<u8> = (0..8).flat_map(|sector| [0x20 + sector; 512]).collect();
+    write(&layer, 0, &original).await;
+    let faults = Connection::open(&path).unwrap();
+    faults.execute_batch("CREATE TRIGGER fail_sector BEFORE INSERT ON sectors WHEN NEW.sector = 4 BEGIN SELECT RAISE(ABORT, 'injected sector failure'); END;").unwrap();
+    let mut replacement = vec![0; 4 * 512];
+    replacement[512..1024].fill(0x81);
+    replacement[1536..].fill(0xff);
+    let memory = GuestMemory::allocate(replacement.len());
+    memory.write_at(0, &replacement).unwrap();
+    let request = OwnedRequestBuffers::linear(0, replacement.len(), false);
+    let error = layer
+        .write(&request.buffer(&memory), 2, false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&error, DiskError::Io(source) if source.to_string().contains("injected sector failure")),
+        "{error:?}"
+    );
+    assert_eq!(read_layers(&[&path], 0, 8).await, original);
+    faults.execute_batch("DROP TRIGGER fail_sector;").unwrap();
+    layer
+        .write(&request.buffer(&memory), 2, false)
+        .await
+        .unwrap();
+    let mut expected = original;
+    expected[2 * 512..6 * 512].copy_from_slice(&replacement);
+    assert_eq!(read_layers(&[&path], 0, 8).await, expected);
+    layer.sync_cache().await.unwrap();
+    drop(faults);
+    drop(layer);
+    assert_eq!(read_layers(&[&path], 0, 8).await, expected);
+}
