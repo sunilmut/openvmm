@@ -132,3 +132,32 @@ fn completion_metadata_matches_the_accepted_option_names() {
     assert_eq!(options[7].help, "Use guest memory.");
     assert_eq!(options[1].help, "");
 }
+
+// Test: Parse paths and scalar/group values containing additional equals signs.
+// Expected: The positional token stays verbatim, only the first option equals sign
+//       separates its key, and explicit off still selects the mapped absent value.
+#[test]
+fn generated_parser_preserves_equals_inside_user_values() {
+    let disk: Disk = concat!(
+        "disk=nightly.raw,size=4096,label=mode=rw,serial==token==,",
+        "host-file=backing=2026.raw,readonly=off,cache=off,policy=off"
+    )
+    .parse()
+    .unwrap();
+    assert_eq!(
+        disk,
+        Disk {
+            path: "disk=nightly.raw".into(),
+            common: Common {
+                size: 4096,
+                queues: 4,
+                label: "mode=rw".into(),
+                serial: Some("=token==".into()),
+                readonly: false,
+                cache: Some(false),
+                policy: 3,
+            },
+            backend: Backend::File("backing=2026.raw".into()),
+        }
+    );
+}
