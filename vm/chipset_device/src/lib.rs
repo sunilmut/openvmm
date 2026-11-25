@@ -151,3 +151,6 @@ pub mod mmio;
 pub mod pci;
 pub mod pio;
 pub mod poll_device;
+
+#[cfg(test)]
+mod tests;
