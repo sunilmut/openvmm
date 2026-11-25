@@ -527,3 +527,37 @@ async fn construction_validates_configuration_and_maps_rom_aliases(driver: Defau
         [(0xfffc0000, 0, 0x40000), (0xf0000, 0x30000, 0x10000)]
     );
 }
+
+// Test: Save and restore after reading part of a nonzero E820 descriptor.
+// Expected: The remaining high address word and end marker resume in order.
+#[async_test]
+async fn e820_descriptor_continuation_survives_save_restore(driver: DefaultDriver) {
+    let mut f = Fixture::new(&driver).await;
+    f.write(PcatAddress::E820_ENTRY, 1);
+    assert_eq!(f.next(), (128 << 3) | 1);
+    assert_eq!(f.next(), 0x4000_0000);
+    let saved = f.device.save().unwrap();
+
+    let mut restored = Fixture::new(&driver).await;
+    restored.device.restore(saved).unwrap();
+    assert_eq!(restored.next(), 2);
+    assert_eq!(restored.next(), 0);
+    restored.write(PcatAddress::E820_ENTRY, 0);
+    assert_eq!(
+        [restored.next(), restored.next(), restored.next()],
+        [(256 << 3) | 5, 0, 1]
+    );
+}
+
+// IGNORED: Adding one to the eight-bit E820 index overflows before the missing
+//         range can be rejected; checked builds panic on a guest port read.
+//
+// Test: Select the maximum E820 descriptor index through the BIOS ports.
+// Expected: The missing entry returns zero rather than wrapping or panicking.
+#[async_test]
+#[ignore = "product bug: maximum E820 index overflows before range validation"]
+async fn e820_maximum_index_reports_a_missing_entry(driver: DefaultDriver) {
+    let mut f = Fixture::new(&driver).await;
+    f.write(PcatAddress::E820_ENTRY, u32::from(u8::MAX));
+    assert_eq!(f.next(), 0);
+}
