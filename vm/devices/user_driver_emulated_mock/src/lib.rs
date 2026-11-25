@@ -379,3 +379,6 @@ impl<C: DeviceTestDmaClientCallbacks> DmaClient for DeviceTestDmaClient<C> {
         self.callbacks.attach_pending_buffers(&self.inner)
     }
 }
+
+#[cfg(test)]
+mod tests;

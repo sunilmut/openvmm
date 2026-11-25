@@ -9913,6 +9913,7 @@ dependencies = [
  "page_pool_alloc",
  "parking_lot",
  "pci_core",
+ "test_with_tracing",
  "tracing",
  "user_driver",
 ]

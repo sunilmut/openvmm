@@ -18,5 +18,8 @@ pci_core.workspace = true
 tracing.workspace = true
 user_driver.workspace = true
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
