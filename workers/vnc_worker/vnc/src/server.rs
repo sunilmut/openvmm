@@ -814,6 +814,8 @@ impl<F: Framebuffer, I: Input> Server<F, I> {
 
 #[cfg(test)]
 mod tests {
+    mod behavior_tests;
+
     use super::*;
     use crate::rfb;
     use pal_async::local::block_with_io;
