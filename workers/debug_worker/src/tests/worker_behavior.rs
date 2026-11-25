@@ -19,7 +19,7 @@ impl RunningWorker {
         let (req_chan, vp_count) = vm.proxy.take().unwrap().into_params();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
-        let target_arch = match architecture {
+        let architecture = match architecture {
             Architecture::X86_64 => debug_worker_defs::TargetArch::X86_64,
             Architecture::I8086 => debug_worker_defs::TargetArch::I8086,
             Architecture::Aarch64 => debug_worker_defs::TargetArch::Aarch64,
@@ -28,7 +28,7 @@ impl RunningWorker {
             listener,
             req_chan,
             vp_count,
-            target_arch,
+            target_arch: architecture,
         };
         let (control, receive) = mesh::channel();
         let thread = std::thread::spawn(move || DebuggerWorker::new(parameters)?.run(receive));
@@ -381,4 +381,53 @@ fn kill_and_control_channel_closure_release_worker_connections() {
     drop(worker.control.take());
     worker.thread.take().unwrap().join().unwrap().unwrap();
     assert_closed(&mut next.0);
+}
+
+// Test: Remove one RSP breakpoint, step a selected thread, then remove the
+//       remaining breakpoint and reconnect before continuing.
+// Expected: VM resume requests retain only the active breakpoint and selected
+//       step action; the explicitly cleaned-up session leaves neither behind.
+#[test_with_tracing::test]
+fn rsp_breakpoint_removal_and_thread_actions_survive_session_turnover() {
+    let worker = RunningWorker::new(Architecture::X86_64);
+    let mut client = worker.connect();
+    assert_eq!(client.command(b"Z1,100,1"), b"OK");
+    assert_eq!(client.command(b"Z1,200,1"), b"OK");
+    assert_eq!(client.command(b"z1,100,1"), b"OK");
+    client.send(b"vCont;s:2;c:1");
+    for vp in 0..2 {
+        let Observed::Debug(index, state) = event(&worker.vm.observed) else {
+            panic!("missing debug configuration")
+        };
+        assert_eq!(index, vp);
+        assert_eq!(state.single_step, vp == 1);
+        let active: Vec<_> = state.breakpoints.into_iter().flatten().collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].address, 0x200);
+        assert_eq!(active[0].ty, BreakpointType::Execute);
+    }
+    let Observed::Resume(response) = event(&worker.vm.observed) else {
+        panic!("missing resume response")
+    };
+    response.send(DebugStopReason::SingleStep { vp: 1 });
+    assert_eq!(signal(&client.receive()), 5);
+    assert_eq!(client.command(b"z1,200,1"), b"OK");
+    assert_eq!(client.command(b"D"), b"OK");
+
+    let mut client = worker.connect();
+    client.send(b"vCont;c");
+    for vp in 0..2 {
+        let Observed::Debug(index, state) = event(&worker.vm.observed) else {
+            panic!("missing clean debug configuration")
+        };
+        assert_eq!(index, vp);
+        assert!(!state.single_step);
+        assert!(state.breakpoints.into_iter().all(|slot| slot.is_none()));
+    }
+    let Observed::Resume(response) = event(&worker.vm.observed) else {
+        panic!("missing clean resume response")
+    };
+    response.send(DebugStopReason::Break);
+    assert_eq!(signal(&client.receive()), 2);
+    assert_eq!(client.command(b"D"), b"OK");
 }
