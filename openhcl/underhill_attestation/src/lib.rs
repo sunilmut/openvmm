@@ -2115,6 +2115,8 @@ pub mod test_utils {
 #[cfg(test)]
 mod tests {
     mod flush_fault;
+    mod gsp_recovery;
+    mod protocol_errors;
 
     use super::*;
     use crate::test_utils::MockTeeCallNoGetDerivedKey;
