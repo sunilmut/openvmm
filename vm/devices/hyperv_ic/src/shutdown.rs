@@ -498,6 +498,7 @@ mod save_restore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::channels as save_restore_channels;
     use futures::FutureExt;
     use hyperv_ic_protocol::Header;
     use hyperv_ic_protocol::HeaderFlags;
@@ -511,15 +512,9 @@ mod tests {
     use vmbus_async::async_dgram::AsyncRecvExt;
     use vmbus_async::pipe::MessagePipe;
     use vmbus_channel::connected_async_channels;
-    use vmbus_channel::gpadl::GpadlId;
-    use vmbus_channel::gpadl::GpadlMap;
-    use vmbus_channel::gpadl_ring::AlignedGpadlView;
     use vmbus_channel::test_helpers::gated_channels;
     use vmbus_channel::test_helpers::stop_with_timeout;
     use vmbus_channel::test_helpers::with_timeout;
-    use vmbus_ring::IncomingRing;
-    use vmbus_ring::OutgoingRing;
-    use vmbus_ring::gparange::MultiPagedRangeBuf;
     use zerocopy::FromBytes;
     use zerocopy::FromZeros;
 
@@ -1057,37 +1052,6 @@ mod tests {
                 ..
             }
         ));
-    }
-
-    fn save_restore_channels() -> (RawAsyncChannel<GpadlRingMem>, RawAsyncChannel<GpadlRingMem>) {
-        let memory = guestmem::GuestMemory::allocate(10 * 4096);
-        let map = GpadlMap::new();
-        map.add(
-            GpadlId(1),
-            MultiPagedRangeBuf::from_range_buffer(1, vec![10 * 4096, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
-                .unwrap(),
-        );
-        let rings = AlignedGpadlView::new(map.view().map(GpadlId(1)).unwrap()).unwrap();
-        let (host_ring, guest_ring) = rings.split(5).ok().unwrap();
-        let (host, guest) = connected_async_channels(16384);
-        (
-            RawAsyncChannel {
-                in_ring: IncomingRing::new(GpadlRingMem::new(host_ring.clone(), &memory).unwrap())
-                    .unwrap(),
-                out_ring: OutgoingRing::new(
-                    GpadlRingMem::new(guest_ring.clone(), &memory).unwrap(),
-                )
-                .unwrap(),
-                signal: host.signal,
-            },
-            RawAsyncChannel {
-                in_ring: IncomingRing::new(GpadlRingMem::new(guest_ring, &memory).unwrap())
-                    .unwrap(),
-                out_ring: OutgoingRing::new(GpadlRingMem::new(host_ring, &memory).unwrap())
-                    .unwrap(),
-                signal: guest.signal,
-            },
-        )
     }
 
     #[async_test]

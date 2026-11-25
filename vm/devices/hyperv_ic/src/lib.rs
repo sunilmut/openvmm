@@ -20,3 +20,8 @@ pub mod kvp;
 pub mod resolver;
 pub mod shutdown;
 pub mod timesync;
+
+#[cfg(test)]
+mod test_helpers;
+#[cfg(test)]
+mod tests;
