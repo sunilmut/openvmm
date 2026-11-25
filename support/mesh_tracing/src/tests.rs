@@ -246,3 +246,44 @@ fn backend_routes_metadata_flushes_and_shuts_down() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// Test: Saturate a trace writer, drain one event, and send again before closing the producer.
+// Expected: Overflow reports failure without overwriting accepted events; capacity recovers and accepted IDs/payloads drain in order.
+#[test]
+fn trace_writer_overflow_preserves_accepted_events_and_recovers_capacity() {
+    use futures::StreamExt;
+
+    let (send, mut receive) = bounded::<TracingRequest>(2);
+    let writer = TraceWriter::from(send);
+    let event = |sequence: u64| {
+        writer.send(
+            Type::Event,
+            sequence,
+            Level::Info,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            sequence.to_le_bytes().to_vec(),
+        )
+    };
+    assert!(event(1));
+    assert!(event(2));
+    assert!(!event(3));
+    let first = receive.next().now_or_never().unwrap().unwrap();
+    assert_eq!(first.timestamp, 1);
+    assert_eq!(first.message, 1u64.to_le_bytes());
+    assert!(event(4));
+    assert!(!event(5));
+    drop(writer);
+    let remaining = futures::executor::block_on(receive.collect::<Vec<_>>());
+    assert_eq!(remaining.len(), 2);
+    for (request, sequence) in remaining.iter().zip([2u64, 4]) {
+        assert!(matches!(request.log_type, Type::Event));
+        assert!(matches!(request.level, Level::Info));
+        assert_eq!(request.timestamp, sequence);
+        assert_eq!(request.message, sequence.to_le_bytes());
+    }
+}
