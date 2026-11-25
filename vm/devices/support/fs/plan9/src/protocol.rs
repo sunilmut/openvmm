@@ -470,3 +470,6 @@ mod tests {
         assert_eq!(w.size(), HEADER_SIZE + 2);
     }
 }
+
+#[cfg(test)]
+mod tests_behavior;

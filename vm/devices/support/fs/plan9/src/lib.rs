@@ -645,4 +645,7 @@ mod tests {
         assert_error_reply(&fs, &message, Error::EXDEV);
         assert!(!root.path().join("link").exists());
     }
+
+    #[cfg(target_os = "linux")]
+    mod behavior;
 }
