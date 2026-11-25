@@ -273,3 +273,71 @@ fn tx_partial_writes_complete_once_and_failed_batches_are_not_replayed() {
     let mut buffer = [0; 512];
     assert!(guest.recv(&mut buffer).now_or_never().is_none());
 }
+
+// Test: Keep TX backpressured while clearing cached RX and reading fresh binary input through the real ring.
+// Expected: RX continues independently, its purge leaves pending TX intact, and releasing TX delivers its exact bytes with one completion.
+#[test]
+fn rx_purge_and_delivery_continue_while_tx_is_backpressured() {
+    let (mut serial, mut channel, mut guest, backend) = fixture();
+    negotiate(&mut channel, &mut guest);
+    step(&mut channel, &mut serial);
+    receive(&mut guest);
+    {
+        let mut backend = backend.lock();
+        backend.write_pending = true;
+        backend.max_write = Some(2);
+    }
+    let transmitted = b"tx\0\x81\xff";
+    guest.try_send(tx_message(transmitted).as_bytes()).unwrap();
+    step(&mut channel, &mut serial);
+    backend.lock().input.extend(b"discarded");
+    step(&mut channel, &mut serial);
+    assert_eq!(
+        receive(&mut guest),
+        protocol::Header::new_guest_notification(protocol::GuestNotifications::RX_DATA_AVAILABLE)
+            .as_bytes()
+    );
+    guest
+        .try_send(
+            protocol::Header::new_host_notification(HostNotifications::RX_CLEAR_BUFFER).as_bytes(),
+        )
+        .unwrap();
+    step(&mut channel, &mut serial);
+    let received = [0xff, 0x81, 0, 9];
+    backend.lock().input.extend(received);
+    step(&mut channel, &mut serial);
+    assert_eq!(
+        receive(&mut guest),
+        protocol::Header::new_guest_notification(protocol::GuestNotifications::RX_DATA_AVAILABLE)
+            .as_bytes()
+    );
+    guest
+        .try_send(protocol::Header::new_host_request(HostRequests::GET_RX_DATA).as_bytes())
+        .unwrap();
+    step(&mut channel, &mut serial);
+    let response = protocol::RxDataResponse::read_from_bytes(&receive(&mut guest)).unwrap();
+    assert_eq!(
+        response.header,
+        protocol::Header::new_host_response(HostRequests::GET_RX_DATA)
+    );
+    assert_eq!(response.buffer_length as usize, received.len());
+    assert_eq!(response.more_data_available, 0);
+    assert_eq!(&response.buffer[..received.len()], &received);
+    assert!(
+        response.buffer[received.len()..]
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+    assert!(backend.lock().output.is_empty());
+    let mut buffer = [0; 512];
+    assert!(guest.recv(&mut buffer).now_or_never().is_none());
+    backend.lock().write_pending = false;
+    step(&mut channel, &mut serial);
+    assert_eq!(
+        receive(&mut guest),
+        protocol::Header::new_guest_notification(protocol::GuestNotifications::TX_COMPLETED)
+            .as_bytes()
+    );
+    assert_eq!(backend.lock().output, transmitted);
+    assert!(guest.recv(&mut buffer).now_or_never().is_none());
+}
