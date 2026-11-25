@@ -3375,4 +3375,6 @@ mod tests {
     }
 
     mod bus_master;
+    mod configuration;
+    mod drive_behavior;
 }
