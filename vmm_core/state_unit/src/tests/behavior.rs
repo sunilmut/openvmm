@@ -10,6 +10,7 @@ use crate::StateUnits;
 use crate::run_async_unit;
 use crate::run_unit;
 use futures::StreamExt;
+use futures::task::LocalSpawnExt;
 use mesh::payload::Protobuf;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
@@ -321,4 +322,72 @@ async fn removal_during_transition_does_not_strand_dependents(driver: DefaultDri
     assert_eq!(saved[0].name, "survivor");
     assert_eq!(saved[0].state.parse::<Value>().unwrap().0, 0);
     survivor.remove().await;
+}
+
+// Test: Start and stop a diamond dependency graph while withholding each arm's
+//       reply in turn, rather than treating dispatch as completed transition.
+// Expected: The middle units can run concurrently; the final unit waits for
+//       both replies in either order, with all edges reversed during stop.
+#[test]
+fn diamond_transitions_wait_for_both_completed_arms() {
+    let mut units = StateUnits::new();
+    let mut pool = futures::executor::LocalPool::new();
+    let (send, base_recv) = mesh::channel();
+    let base = units.add("base").build(send).unwrap();
+    let (send, left_recv) = mesh::channel();
+    let left = units.add("left").depends_on(&base).build(send).unwrap();
+    let (send, right_recv) = mesh::channel();
+    let right = units.add("right").depends_on(&base).build(send).unwrap();
+    let (send, leaf_recv) = mesh::channel();
+    let _leaf = units
+        .add("leaf")
+        .depends_on(&left)
+        .depends_on(&right)
+        .build(send)
+        .unwrap();
+    let mut receivers = [base_recv, left_recv, right_recv, leaf_recv];
+
+    for first_arm in [1, 2] {
+        for (operation, first, last) in [(Operation::Start, 0, 3), (Operation::Stop, 3, 0)] {
+            let accept = |request| match (operation, request) {
+                (Operation::Start, StateRequest::Start(rpc))
+                | (Operation::Stop, StateRequest::Stop(rpc)) => rpc,
+                (_, request) => panic!("unexpected transition request: {request:?}"),
+            };
+            let transition = pool
+                .spawner()
+                .spawn_local_with_handle(async move {
+                    match operation {
+                        Operation::Start => units.start().await,
+                        Operation::Stop => units.stop().await,
+                        _ => unreachable!(),
+                    }
+                    units
+                })
+                .unwrap();
+            pool.run_until_stalled();
+            let first = accept(receivers[first].try_recv().unwrap());
+            for index in [1, 2, last] {
+                assert!(receivers[index].try_recv().is_err());
+            }
+
+            first.complete(());
+            pool.run_until_stalled();
+            let first_arm_reply = accept(receivers[first_arm].try_recv().unwrap());
+            let other_arm_reply = accept(receivers[3 - first_arm].try_recv().unwrap());
+            assert!(receivers[last].try_recv().is_err());
+
+            first_arm_reply.complete(());
+            pool.run_until_stalled();
+            assert!(receivers[last].try_recv().is_err());
+            other_arm_reply.complete(());
+            pool.run_until_stalled();
+            accept(receivers[last].try_recv().unwrap()).complete(());
+            units = pool.run_until(transition);
+            for receiver in &mut receivers {
+                assert!(receiver.try_recv().is_err(), "duplicate transition");
+            }
+        }
+    }
+    assert!(!units.is_running());
 }
