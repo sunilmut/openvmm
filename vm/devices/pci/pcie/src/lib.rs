@@ -154,3 +154,6 @@ pub(crate) fn assign_port_devfns(
 
     Ok(placements)
 }
+
+#[cfg(test)]
+mod tests;
