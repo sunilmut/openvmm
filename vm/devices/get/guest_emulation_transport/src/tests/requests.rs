@@ -208,3 +208,26 @@ async fn vmgs_limits_and_host_io_failures_are_observable(driver: DefaultDriver) 
         .is_err()
     );
 }
+
+// Test: Drop a time-query future after its request reaches the host, then query again.
+// Expected: The canceled response is drained without completing the next caller,
+//       which receives only the response to its own request.
+#[async_test]
+async fn canceling_an_inflight_query_does_not_shift_later_responses(driver: DefaultDriver) {
+    let (client, mut host, _task) = setup(&driver).await;
+    {
+        let mut canceled = std::pin::pin!(client.host_time());
+        assert!(futures::poll!(canceled.as_mut()).is_pending());
+        host.expect(p::TimeRequest::new().as_bytes()).await;
+    }
+
+    let peer = async {
+        host.send(p::TimeResponse::new(0, 101, 0, false).as_bytes())
+            .await;
+        host.expect(p::TimeRequest::new().as_bytes()).await;
+        host.send(p::TimeResponse::new(0, 202, 0, false).as_bytes())
+            .await;
+    };
+    let (time, ()) = futures::join!(client.host_time(), peer);
+    assert_eq!(time.utc, 202);
+}
