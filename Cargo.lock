@@ -2209,6 +2209,7 @@ name = "firmware_pcat"
 version = "0.0.0"
 dependencies = [
  "chipset_device",
+ "futures",
  "generation_id",
  "getrandom 0.4.2",
  "guestmem",
@@ -2217,6 +2218,8 @@ dependencies = [
  "memory_range",
  "mesh",
  "open_enum",
+ "pal_async",
+ "parking_lot",
  "static_assertions",
  "thiserror 2.0.16",
  "tracelimit",

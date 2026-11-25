@@ -27,5 +27,10 @@ tracelimit.workspace = true
 tracing.workspace = true
 zerocopy.workspace = true
 
+[dev-dependencies]
+futures.workspace = true
+pal_async.workspace = true
+parking_lot.workspace = true
+
 [lints]
 workspace = true
