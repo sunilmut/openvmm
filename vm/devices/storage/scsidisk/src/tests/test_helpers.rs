@@ -31,6 +31,8 @@ pub struct TestDiskStorageState {
     pub storage: Vec<u8>,
     pub is_fua_set: bool,
     pub sector_count: u64,
+    pub unmap_calls: Vec<(u64, u64, bool)>,
+    pub sync_cache_calls: usize,
 }
 
 #[derive(Debug)]
@@ -38,6 +40,9 @@ pub struct TestDisk {
     pub sector_size: u32,
     pub physical_sector_size: u32,
     pub read_only: bool,
+    pub unmap_behavior: disk_backend::UnmapBehavior,
+    pub fail_unmap: bool,
+    pub fail_sync: bool,
     pub state: Arc<Mutex<TestDiskStorageState>>,
 }
 
@@ -63,6 +68,8 @@ impl TestDisk {
             storage: buffer,
             is_fua_set: false,
             sector_count,
+            unmap_calls: Vec::new(),
+            sync_cache_calls: 0,
         }));
         (
             TestDisk {
@@ -70,6 +77,9 @@ impl TestDisk {
                 read_only,
                 state: state.clone(),
                 physical_sector_size,
+                unmap_behavior: disk_backend::UnmapBehavior::Ignored,
+                fail_unmap: false,
+                fail_sync: false,
             },
             state,
         )
@@ -141,20 +151,33 @@ impl DiskIo for TestDisk {
     }
 
     async fn sync_cache(&self) -> Result<(), DiskError> {
-        Ok(())
+        self.state.lock().sync_cache_calls += 1;
+        if self.fail_sync {
+            Err(DiskError::IllegalBlock)
+        } else {
+            Ok(())
+        }
     }
 
     async fn unmap(
         &self,
-        _sector: u64,
-        _count: u64,
-        _block_level_only: bool,
+        sector: u64,
+        count: u64,
+        block_level_only: bool,
     ) -> Result<(), DiskError> {
-        Ok(())
+        self.state
+            .lock()
+            .unmap_calls
+            .push((sector, count, block_level_only));
+        if self.fail_unmap {
+            Err(DiskError::IllegalBlock)
+        } else {
+            Ok(())
+        }
     }
 
     fn unmap_behavior(&self) -> disk_backend::UnmapBehavior {
-        disk_backend::UnmapBehavior::Ignored
+        self.unmap_behavior
     }
 }
 
@@ -237,6 +260,28 @@ pub fn make_repeat_data_buffer(len: usize, sector_size: usize) -> Vec<u8> {
     }
 
     buf
+}
+
+pub async fn check_response(
+    disk: &dyn AsyncScsiDisk,
+    cdb: [u8; 16],
+    buffer_len: usize,
+    expected: &[u8],
+) {
+    let memory = GuestMemory::allocate(4096);
+    memory.write_at(0, &[0xa5; 256]).unwrap();
+    let buffers = scsi_buffers::OwnedRequestBuffers::new_unaligned(&[0], 16, buffer_len);
+    let result = disk
+        .execute_scsi(&buffers.buffer(&memory), &Request { cdb, srb_flags: 0 })
+        .await;
+    assert_eq!(result.scsi_status, ScsiStatus::GOOD, "{cdb:?}");
+    assert_eq!(result.srb_status, scsi::srb::SrbStatus::SUCCESS);
+    assert_eq!(result.tx, expected.len());
+    let mut actual = [0; 256];
+    memory.read_at(0, &mut actual).unwrap();
+    let mut guarded_expected = [0xa5; 256];
+    guarded_expected[16..16 + expected.len()].copy_from_slice(expected);
+    assert_eq!(actual, guarded_expected, "{cdb:?}");
 }
 
 pub async fn check_execute_scsi_pass(
