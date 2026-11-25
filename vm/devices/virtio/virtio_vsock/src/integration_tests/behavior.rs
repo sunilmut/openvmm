@@ -9,8 +9,11 @@ use super::RX_DESC_ADDR;
 use super::RX_USED_ADDR;
 use super::TestHarness;
 use crate::spec::*;
+use futures::AsyncReadExt;
+use futures::AsyncWriteExt;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
+use pal_async::socket::PolledSocket;
 use test_with_tracing::test;
 use virtio::QueueResources;
 use virtio::VirtioDevice;
@@ -206,4 +209,67 @@ async fn queue_validation_and_restart_preserve_ring_progress(driver: DefaultDriv
         assert!(harness.device.stop_queue(index).await.is_some());
         assert!(harness.device.stop_queue(index).await.is_none());
     }
+}
+
+// Test: Queue binary data followed by guest send-only shutdown, drain the host
+//       through EOF, then return a reply through small guest receive buffers.
+// Expected: All queued bytes precede EOF and the opposite direction remains
+//       usable with exact reply bytes, addressing and descriptor lengths.
+#[async_test]
+async fn send_half_close_drains_data_and_keeps_reply_direction_alive(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver, tempfile::tempdir().unwrap());
+    let mut listener = harness.create_port_listener(1234);
+    harness.enable().await;
+    let stream = harness
+        .connect_guest_to_host(&mut listener, 1024, 1234)
+        .await;
+    let mut stream = PolledSocket::new(&driver, stream).unwrap();
+    let payload: Vec<u8> = (0..4097).map(|i| i as u8).collect();
+    let data = harness.guest_header(1024, 1234, Operation::RW, payload.len() as u32, 0);
+    harness.post_tx_packet(&data, &payload);
+    let shutdown = harness.guest_header(
+        1024,
+        1234,
+        Operation::SHUTDOWN,
+        0,
+        ShutdownFlags::new().with_send(true).into_bits(),
+    );
+    harness.post_tx_packet(&shutdown, &[]);
+    harness.wait_for_tx_used().await;
+    harness.wait_for_tx_used().await;
+    let mut received = Vec::new();
+    stream.read_to_end(&mut received).await.unwrap();
+    assert_eq!(received, payload);
+
+    let reply = b"ok\0\xff";
+    stream.write_all(reply).await.unwrap();
+    let mut received = Vec::new();
+    while received.len() < reply.len() {
+        let (_, address) = harness.post_rx_buffer(HDR_SIZE + 2);
+        let (_, used_length) = harness.wait_for_rx_used().await;
+        let header = harness.read_header(address);
+        let (length, forwarded) = (header.len, header.fwd_cnt);
+        assert_eq!(
+            (
+                header.src_cid,
+                header.dst_cid,
+                header.src_port,
+                header.dst_port
+            ),
+            (VSOCK_CID_HOST, GUEST_CID, 1234, 1024)
+        );
+        assert_eq!(used_length, HDR_SIZE + length);
+        match header.operation() {
+            Operation::CREDIT_UPDATE => {
+                assert_eq!(length, 0);
+                assert_eq!(forwarded, payload.len() as u32);
+            }
+            Operation::RW => {
+                assert!((1..=2).contains(&length));
+                received.extend(harness.read_rx_data(address, length));
+            }
+            op => panic!("unexpected packet after guest send-only shutdown: {op:?}"),
+        }
+    }
+    assert_eq!(received, reply);
 }
