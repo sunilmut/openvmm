@@ -199,3 +199,46 @@ fn empty_x509_list_is_rejected_without_panicking() {
             .is_err()
     );
 }
+
+// Test: Append a short header, truncated list or partial digest after valid signatures.
+// Expected: Both collectors and dbx dispatch reject the whole input, even when a
+//       filter drops every entry; valid earlier signatures cannot hide the error.
+#[test]
+fn malformed_tail_cannot_be_hidden_by_valid_signatures_or_filters() {
+    let mut payload = OWNER.as_bytes().to_vec();
+    payload.extend([0x5a; 32]);
+    let prefix = wire(EFI_CERT_SHA256_GUID, 48, &payload);
+    assert_eq!(
+        ParseSignatureLists::new(&prefix)
+            .collect_signature_lists(|_, _| true)
+            .unwrap(),
+        [SignatureList::Sha256(vec![SignatureData::new_sha256(
+            OWNER,
+            Cow::Borrowed(&[0x5a; 32])
+        )])]
+    );
+    let mut truncated = prefix.clone();
+    truncated.pop();
+    let partial_digest = wire(EFI_CERT_SHA256_GUID, 48, &payload[..47]);
+
+    for tail in [vec![0xaa], truncated, partial_digest] {
+        let mut bytes = prefix.clone();
+        bytes.extend(tail);
+        for keep in [false, true] {
+            assert!(
+                ParseSignatureLists::new(&bytes)
+                    .collect_signature_lists(|_, _| keep)
+                    .is_err()
+            );
+        }
+        assert!(
+            ParseSignatureLists::new(&bytes)
+                .collect_signature_set()
+                .is_err()
+        );
+        assert!(matches!(
+            parse_nvram_entry("dbx", &bytes),
+            Err(crate::ParseError::SignatureList(_))
+        ));
+    }
+}
