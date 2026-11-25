@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 use super::*;
+
+mod behavior_tests;
 use futures::FutureExt;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
