@@ -124,3 +124,46 @@ fn unix_tpm_engine_helper_preserves_nv_handle_and_tpm_failure() {
         ));
     });
 }
+
+// Test: Run concurrent callers on one Unix TPM handle while the peer returns byte-fragmented responses carrying each command's caller/iteration bytes.
+// Expected: Every caller receives only its own complete response, all commands reach the peer intact exactly once, and no caller consumes another command's reply.
+#[test]
+fn shared_unix_transport_serializes_complete_command_response_exchanges() {
+    let (device, mut peer) = pair();
+    let barrier = std::sync::Barrier::new(4);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            let mut seen = [[false; 4]; 4];
+            for _ in 0..16 {
+                let mut received = [0; 12];
+                peer.read_exact(&mut received).unwrap();
+                assert_eq!(&received[..10], &command()[..10]);
+                let caller = received[10] as usize;
+                let iteration = received[11] as usize;
+                assert!(caller < 4 && iteration < 4);
+                assert!(!seen[caller][iteration]);
+                seen[caller][iteration] = true;
+                let response = [0x80, 1, 0, 0, 0, 12, 0, 0, 0, 0, received[10], received[11]];
+                for byte in response {
+                    peer.write_all(&[byte]).unwrap();
+                }
+            }
+            assert!(seen.iter().flatten().all(|seen| *seen));
+        });
+        for caller in 0..4u8 {
+            let device = &device;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                for iteration in 0..4u8 {
+                    let mut request = command();
+                    request[10..].copy_from_slice(&[caller, iteration]);
+                    assert_eq!(
+                        device.transmit_raw(&request).unwrap(),
+                        [0x80, 1, 0, 0, 0, 12, 0, 0, 0, 0, caller, iteration]
+                    );
+                }
+            });
+        }
+    });
+}
