@@ -133,6 +133,9 @@ impl<'a> AtomicBitmap<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use guestmem::AccessType;
+    use guestmem::GuestMemory;
+    use parking_lot::Mutex;
     use test_with_tracing::test;
 
     #[test]
@@ -175,5 +178,62 @@ mod tests {
         bits.iter().zip(expected_bits).for_each(|(left, right)| {
             assert_eq!(left.load(Ordering::Acquire), *right);
         })
+    }
+
+    // Test: Signal registered, unregistered, and unknown channels in shared memory.
+    // Expected: Only the registered channel fires; cleared flags never replay.
+    #[test]
+    fn shared_interrupt_discards_unregistered_channels() {
+        let gm = GuestMemory::allocate(4096);
+        let bitmap = ChannelBitmap::new(gm.lock_user_gpns(AccessType::Write, &[0]).unwrap());
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        for flag in [63, 64] {
+            let delivered = delivered.clone();
+            bitmap.register_channel(
+                flag,
+                Interrupt::from_fn(move || delivered.lock().push(flag)),
+            );
+        }
+        bitmap.unregister_channel(63);
+        gm.write_plain(2048, &(1u64 << 63)).unwrap();
+        gm.write_plain(2056, &1u64).unwrap();
+        gm.write_plain(4088, &(1u64 << 63)).unwrap();
+        bitmap.handle_shared_interrupt();
+        assert_eq!(*delivered.lock(), [64]);
+        let mut received = [0xff; 2048];
+        gm.read_at(2048, &mut received).unwrap();
+        assert_eq!(received, [0; 2048]);
+
+        let notifications = delivered.clone();
+        bitmap.register_channel(
+            63,
+            Interrupt::from_fn(move || notifications.lock().push(63)),
+        );
+        bitmap.handle_shared_interrupt();
+        assert_eq!(*delivered.lock(), [64]);
+    }
+
+    // Test: Notify the guest twice while another event flag is already pending.
+    // Expected: Each notification observes the new flag without losing the old one.
+    #[test]
+    fn guest_interrupt_publishes_flag_before_delivery() {
+        let gm = GuestMemory::allocate(4096);
+        let bitmap = Arc::new(ChannelBitmap::new(
+            gm.lock_user_gpns(AccessType::Write, &[0]).unwrap(),
+        ));
+        gm.write_plain(8, &1u64).unwrap();
+        let deliveries = Arc::new(Mutex::new(0));
+        let delivered = deliveries.clone();
+        let interrupt = ChannelBitmap::create_interrupt(
+            &Some(bitmap),
+            Interrupt::from_fn(move || {
+                assert_eq!(gm.read_plain::<u64>(8).unwrap(), 3);
+                *delivered.lock() += 1;
+            }),
+            65,
+        );
+        interrupt.deliver();
+        interrupt.deliver();
+        assert_eq!(*deliveries.lock(), 2);
     }
 }
