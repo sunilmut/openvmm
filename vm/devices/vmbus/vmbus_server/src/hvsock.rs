@@ -1015,4 +1015,6 @@ mod tests {
         guest.close().await.unwrap();
         assert_eq!(client.read(&mut payload).await.unwrap(), 0);
     }
+
+    mod connections;
 }

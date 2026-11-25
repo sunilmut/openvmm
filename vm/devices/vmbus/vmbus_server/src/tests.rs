@@ -11,6 +11,9 @@ use pal_async::timer::Instant;
 use pal_async::timer::PolledTimer;
 use parking_lot::Mutex;
 use protocol::UserDefinedData;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use test_with_tracing::test;
 use vmbus_channel::bus::OfferParams;
@@ -32,8 +35,10 @@ use zerocopy::KnownLayout;
 
 struct MockSynicInner {
     message_port: Option<Arc<dyn MessagePort>>,
+    event_ports: Vec<(u32, Arc<dyn EventPort>)>,
     monitor_page: Option<MonitorPageGpas>,
     fail_message_port_target: Option<(u32, u8)>,
+    delay_messages: bool,
 }
 
 struct MockSynic {
@@ -41,6 +46,10 @@ struct MockSynic {
     message_send: mesh::Sender<Vec<u8>>,
     spawner: DefaultDriver,
     allow_allocated_monitor_pages: bool,
+    guest_interrupts: Arc<AtomicUsize>,
+    message_targets: Arc<Mutex<Vec<(Vtl, u32, u8)>>>,
+    guest_target_vps: Arc<Mutex<Vec<u32>>>,
+    fail_next_event_retarget: Arc<AtomicBool>,
 }
 
 impl MockSynic {
@@ -52,12 +61,18 @@ impl MockSynic {
         Self {
             inner: Mutex::new(MockSynicInner {
                 message_port: None,
+                event_ports: Vec::new(),
                 monitor_page: None,
                 fail_message_port_target: None,
+                delay_messages: true,
             }),
             message_send,
             spawner,
             allow_allocated_monitor_pages,
+            guest_interrupts: Arc::new(AtomicUsize::new(0)),
+            message_targets: Default::default(),
+            guest_target_vps: Default::default(),
+            fail_next_event_retarget: Default::default(),
         }
     }
 
@@ -91,14 +106,24 @@ impl MockSynic {
 }
 
 #[derive(Debug)]
-struct MockGuestPort {}
+struct MockGuestPort {
+    interrupt: Interrupt,
+    target_vps: Arc<Mutex<Vec<u32>>>,
+    fail_next_retarget: Arc<AtomicBool>,
+}
 
 impl GuestEventPort for MockGuestPort {
     fn interrupt(&self) -> Interrupt {
-        Interrupt::null()
+        self.interrupt.clone()
     }
 
-    fn set_target_vp(&mut self, _vp: u32) -> Result<(), vmcore::synic::HypervisorError> {
+    fn set_target_vp(&mut self, vp: u32) -> Result<(), vmcore::synic::HypervisorError> {
+        if self.fail_next_retarget.swap(false, Ordering::SeqCst) {
+            return Err(vmcore::synic::HypervisorError(Box::new(
+                std::io::Error::other("injected event retarget failure"),
+            )));
+        }
+        self.target_vps.lock().push(vp);
         Ok(())
     }
 }
@@ -107,6 +132,10 @@ struct MockGuestMessagePort {
     send: mesh::Sender<Vec<u8>>,
     spawner: DefaultDriver,
     timer: Option<(PolledTimer, Instant)>,
+    delay_messages: bool,
+    vtl: Vtl,
+    target: ConnectionTarget,
+    targets: Arc<Mutex<Vec<(Vtl, u32, u8)>>>,
 }
 
 impl GuestMessagePort for MockGuestMessagePort {
@@ -124,7 +153,7 @@ impl GuestMessagePort for MockGuestMessagePort {
         // Return pending 25% of the time.
         let mut pending_chance = [0; 1];
         getrandom::fill(&mut pending_chance).unwrap();
-        if pending_chance[0] % 4 == 0 {
+        if self.delay_messages && pending_chance[0] % 4 == 0 {
             let mut timer = PolledTimer::new(&self.spawner);
             let deadline = Instant::now() + Duration::from_millis(10);
             match timer.sleep_until(deadline).poll_unpin(cx) {
@@ -136,11 +165,15 @@ impl GuestMessagePort for MockGuestMessagePort {
             }
         }
 
+        self.targets
+            .lock()
+            .push((self.vtl, self.target.vp, self.target.sint));
         self.send.send(payload.into());
         Poll::Ready(())
     }
 
-    fn set_target_vp(&mut self, _vp: u32) -> Result<(), vmcore::synic::HypervisorError> {
+    fn set_target_vp(&mut self, vp: u32) -> Result<(), vmcore::synic::HypervisorError> {
+        self.target.vp = vp;
         Ok(())
     }
 }
@@ -164,15 +197,16 @@ impl SynicPortAccess for MockSynic {
         &self,
         connection_id: u32,
         _minimum_vtl: Vtl,
-        _port: Arc<dyn EventPort>,
+        port: Arc<dyn EventPort>,
         _monitor_info: Option<MonitorInfo>,
     ) -> Result<Box<dyn Sync + Send>, vmcore::synic::Error> {
+        self.inner.lock().event_ports.push((connection_id, port));
         Ok(Box::new(connection_id))
     }
 
     fn new_guest_message_port(
         &self,
-        _vtl: Vtl,
+        vtl: Vtl,
         vp: u32,
         sint: u8,
     ) -> Result<Box<dyn GuestMessagePort>, vmcore::synic::HypervisorError> {
@@ -183,12 +217,17 @@ impl SynicPortAccess for MockSynic {
                 std::io::Error::other("injected message port failure"),
             )));
         }
+        let delay_messages = inner.delay_messages;
         drop(inner);
 
         Ok(Box::new(MockGuestMessagePort {
             send: self.message_send.clone(),
             spawner: self.spawner.clone(),
             timer: None,
+            delay_messages,
+            vtl,
+            target: ConnectionTarget { vp, sint },
+            targets: self.message_targets.clone(),
         }))
     }
 
@@ -196,12 +235,20 @@ impl SynicPortAccess for MockSynic {
         &self,
         _port_id: u32,
         _vtl: Vtl,
-        _vp: u32,
+        vp: u32,
         _sint: u8,
         _flag: u16,
         _monitor_info: Option<MonitorInfo>,
     ) -> Result<Box<dyn GuestEventPort>, vmcore::synic::HypervisorError> {
-        Ok(Box::new(MockGuestPort {}))
+        let count = self.guest_interrupts.clone();
+        self.guest_target_vps.lock().push(vp);
+        Ok(Box::new(MockGuestPort {
+            interrupt: Interrupt::from_fn(move || {
+                count.fetch_add(1, Ordering::SeqCst);
+            }),
+            target_vps: self.guest_target_vps.clone(),
+            fail_next_retarget: self.fail_next_event_retarget.clone(),
+        }))
     }
 
     fn prefer_os_events(&self) -> bool {
@@ -290,6 +337,7 @@ impl TestChannel {
 struct TestEnvBuilder {
     spawner: DefaultDriver,
     allow_allocated_monitor_pages: bool,
+    delay_messages: bool,
 }
 
 impl TestEnvBuilder {
@@ -297,6 +345,7 @@ impl TestEnvBuilder {
         Self {
             spawner,
             allow_allocated_monitor_pages: false,
+            delay_messages: true,
         }
     }
 
@@ -305,18 +354,31 @@ impl TestEnvBuilder {
         self
     }
 
+    fn without_message_delays(mut self) -> Self {
+        self.delay_messages = false;
+        self
+    }
+
     fn build(self) -> TestEnv {
+        self.build_with(GuestMemory::empty(), std::convert::identity)
+    }
+
+    fn build_with(
+        self,
+        gm: GuestMemory,
+        configure: impl FnOnce(VmbusServerBuilder<DefaultDriver>) -> VmbusServerBuilder<DefaultDriver>,
+    ) -> TestEnv {
         let (message_send, message_recv) = mesh::channel();
         let synic = Arc::new(MockSynic::new(
             message_send,
             self.spawner.clone(),
             self.allow_allocated_monitor_pages,
         ));
-        let gm = GuestMemory::empty();
-        let vmbus = VmbusServerBuilder::new(self.spawner, synic.clone(), gm)
-            .enable_mnf(true)
-            .build()
-            .unwrap();
+        synic.inner.lock().delay_messages = self.delay_messages;
+        let vmbus =
+            configure(VmbusServer::builder(self.spawner, synic.clone(), gm).enable_mnf(true))
+                .build()
+                .unwrap();
 
         TestEnv {
             vmbus,
@@ -340,17 +402,26 @@ impl TestEnv {
     }
 
     async fn offer(&self, id: u32, allow_confidential_external_memory: bool) -> TestChannel {
+        self.offer_with_event(
+            id,
+            allow_confidential_external_memory,
+            Interrupt::from_fn(|| {}),
+        )
+        .await
+    }
+
+    async fn offer_with_event(
+        &self,
+        id: u32,
+        allow_confidential_external_memory: bool,
+        event: Interrupt,
+    ) -> TestChannel {
         let guid = Guid {
             data1: id,
             ..Guid::ZERO
         };
-        let (request_send, request_recv) = mesh::channel();
-        let (server_request_send, server_request_recv) = mesh::channel();
-        let offer = OfferInput {
-            event: Interrupt::from_fn(|| {}),
-            request_send,
-            server_request_recv,
-            params: OfferParams {
+        self.offer_params(
+            OfferParams {
                 interface_name: "test".into(),
                 instance_id: guid,
                 interface_id: guid,
@@ -364,6 +435,19 @@ impl TestEnv {
                 offer_order: None,
                 allow_confidential_external_memory,
             },
+            event,
+        )
+        .await
+    }
+
+    async fn offer_params(&self, params: OfferParams, event: Interrupt) -> TestChannel {
+        let (request_send, request_recv) = mesh::channel();
+        let (server_request_send, server_request_recv) = mesh::channel();
+        let offer = OfferInput {
+            event,
+            request_send,
+            server_request_recv,
+            params,
         };
 
         let control = self.vmbus.control();
@@ -1235,3 +1319,5 @@ async fn test_revoke_subchannels_before_primary(spawner: DefaultDriver) {
     }
     assert!(seen_primary, "primary rescind not observed");
 }
+
+mod control;

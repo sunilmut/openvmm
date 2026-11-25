@@ -3210,3 +3210,6 @@ fn guid_from_id(id: u32) -> Guid {
         ..Guid::ZERO
     }
 }
+
+mod lifecycle;
+mod restoration;
