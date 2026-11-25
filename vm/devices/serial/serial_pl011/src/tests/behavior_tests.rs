@@ -261,3 +261,43 @@ fn snapshot_preserves_registers_pending_baud_and_both_fifo_contents() {
     }
     assert_ne!(read(&mut restored, Register::UARTFR) & 0x10, 0);
 }
+
+// Test: Mask and unmask pending receive sources, selectively acknowledge RX, then consume the queued byte.
+// Expected: Masking preserves raw status/data, another pending source holds IRQ high after acknowledgement, and draining data lowers IRQ.
+#[test]
+fn interrupt_masking_and_selective_acknowledgment_preserve_pending_receive_data() {
+    let target = vmcore::line_interrupt::test_helpers::TestLineInterruptTarget::new_arc();
+    let mut serial = SerialPl011::new(
+        "interrupt-lifecycle".into(),
+        PL011_SERIAL0_BASE,
+        LineInterrupt::new_with_target("uart", target.clone(), 42),
+        Box::new(SerialIoMock::new()),
+        None,
+    )
+    .unwrap();
+    write(&mut serial, Register::UARTCR, 0x300);
+    write(&mut serial, Register::UARTLCR_H, 0x60);
+    write(&mut serial, Register::UARTIMSC, 0);
+    write(&mut serial, Register::UARTICR, 0x7ff);
+    write(&mut serial, Register::UARTCR, 0x381);
+    write(&mut serial, Register::UARTDR, 0x81);
+    assert_eq!(read(&mut serial, Register::UARTRIS) & 0x50, 0x50);
+    assert_eq!(read(&mut serial, Register::UARTMIS), 0);
+    assert!(!target.is_high(42));
+    write(&mut serial, Register::UARTIMSC, 0x50);
+    assert_eq!(read(&mut serial, Register::UARTMIS), 0x50);
+    assert!(target.is_high(42));
+    write(&mut serial, Register::UARTICR, 0x10);
+    assert_eq!(read(&mut serial, Register::UARTMIS), 0x40);
+    assert!(target.is_high(42));
+    write(&mut serial, Register::UARTIMSC, 0);
+    assert!(!target.is_high(42));
+    assert_eq!(read(&mut serial, Register::UARTRIS) & 0x50, 0x40);
+    write(&mut serial, Register::UARTIMSC, 0x40);
+    assert!(target.is_high(42));
+    assert_eq!(read(&mut serial, Register::UARTDR), 0x81);
+    assert_eq!(read(&mut serial, Register::UARTMIS), 0);
+    assert_eq!(read(&mut serial, Register::UARTRIS) & 0x50, 0);
+    assert!(!target.is_high(42));
+    assert_ne!(read(&mut serial, Register::UARTFR) & 0x10, 0);
+}
