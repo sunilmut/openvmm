@@ -174,3 +174,52 @@ fn invalid_dma_lengths_do_not_consume_capacity() {
         .unwrap();
     assert_eq!(entire_pool.pfns(), &[1, 2]);
 }
+
+// Test: Request DMA memory larger than either of two disjoint ranges, then allocate both ranges and write independent cross-page data.
+// Expected: Aggregate free capacity cannot bridge a physical hole; failed allocation preserves capacity, buffers do not alias, and hole bytes remain untouched.
+#[test]
+fn disjoint_dma_ranges_reject_cross_hole_allocations_without_consuming_capacity() {
+    let mapper = TestMapper::new(8).unwrap();
+    let alias = mapper.sparse_mapping();
+    alias
+        .atomic_slice(0, 8 * PAGE_SIZE as usize)
+        .atomic_fill(0xcc);
+    let pool = PagePool::new(
+        &[
+            MemoryRange::from_4k_gpn_range(1..3),
+            MemoryRange::from_4k_gpn_range(5..7),
+        ],
+        mapper,
+    )
+    .unwrap();
+    let allocator = pool.allocator("disjoint-device".into()).unwrap();
+    let error = allocator
+        .allocate_dma_buffer(3 * PAGE_SIZE as usize)
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<crate::Error>(),
+        Some(crate::Error::PagePoolOutOfMemory { size: 3, .. })
+    ));
+    let first = allocator
+        .allocate_dma_buffer(2 * PAGE_SIZE as usize)
+        .unwrap();
+    let second = allocator
+        .allocate_dma_buffer(2 * PAGE_SIZE as usize)
+        .unwrap();
+    let mut ranges = [first.pfns().to_vec(), second.pfns().to_vec()];
+    ranges.sort();
+    assert_eq!(ranges, [vec![1, 2], vec![5, 6]]);
+    let offset = PAGE_SIZE as usize - 2;
+    first.write_at(offset, &[1, 0x81, 0xfe, 0xff]);
+    second.write_at(offset, &[7, 0x82, 0xfd, 0xfc]);
+    let mut bytes = [0; 4];
+    first.read_at(offset, &mut bytes);
+    assert_eq!(bytes, [1, 0x81, 0xfe, 0xff]);
+    second.read_at(offset, &mut bytes);
+    assert_eq!(bytes, [7, 0x82, 0xfd, 0xfc]);
+    let mut hole = vec![0; 2 * PAGE_SIZE as usize];
+    alias
+        .atomic_slice(3 * PAGE_SIZE as usize, hole.len())
+        .atomic_read(&mut hole);
+    assert!(hole.iter().all(|byte| *byte == 0xcc));
+}
