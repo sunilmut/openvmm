@@ -94,17 +94,27 @@ async fn syndrome_stores_preserve_neighbors_and_zero_register_semantics() {
     }
 }
 
-// Test: Load the zero register through a valid data-abort syndrome.
-// Expected: The access is discarded without reading memory or fetching code,
-//       while the instruction still retires.
+// IGNORED: Syndrome loads to XZR skip the memory access, hiding access failures
+//       and any device read side effects.
+//
+// Test: Load XZR through a valid syndrome when the memory access fails.
+// Expected: Discarding the register result does not suppress the access error,
+//       and the faulting instruction does not retire.
 #[async_test]
-async fn syndrome_zero_register_load_has_no_memory_side_effects() {
+#[ignore = "syndrome loads to XZR incorrectly skip the memory access"]
+async fn syndrome_zero_register_load_preserves_memory_faults() {
     let (mut state, mut cpu) = cpu();
     cpu.valid_gva = 0;
     cpu.fail_instruction = true;
-    let intercept = syndrome(IssDataAbort::new().with_srt(31).with_sas(3), true);
-    Emulator::new(&mut cpu, &intercept).run().await.unwrap();
-    assert_eq!(state.pc(), 0x1004);
+    let mut intercept = syndrome(IssDataAbort::new().with_srt(31).with_sas(3), true);
+    intercept.instruction_bytes = 0xf940_003fu32.to_le_bytes(); // LDR XZR, [X1].
+    intercept.instruction_byte_count = 4;
+    let error = Emulator::new(&mut cpu, &intercept).run().await.unwrap_err();
+    assert!(matches!(
+        *error,
+        Error::MemoryAccess(0x8000, _, TestCpuError::BadAddress)
+    ));
+    assert_eq!(state.pc(), 0x1000);
 }
 
 // Test: Fall back to instruction decoding when syndrome metadata cannot be used.
@@ -408,4 +418,23 @@ async fn paired_store_writes_distinct_adjacent_addresses() {
         *cpu.mem_val.lock().await,
         0x5555_6666_7777_8888_1111_2222_3333_4444
     );
+}
+
+// Test: Decode LDR XZR, [X1] when the memory access fails.
+// Expected: The discarded destination does not hide the read failure or
+//       advance the faulting instruction's PC.
+#[async_test]
+async fn decoded_zero_register_load_preserves_memory_faults() {
+    let (mut state, mut cpu) = cpu();
+    cpu.valid_gva = 0;
+    state.update_instruction(0xf940_003f);
+    let error = Emulator::new(&mut cpu, &InterceptState::default())
+        .run()
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        *error,
+        Error::MemoryAccess(0x8000, _, TestCpuError::BadAddress)
+    ));
+    assert_eq!(state.pc(), 0x1000);
 }
