@@ -165,8 +165,8 @@ fn shutdown_response(status: Status) -> Vec<u8> {
     .to_vec()
 }
 
-// Test: Forward power-off/reboot/hibernate and force flags to the real notifier RPC, return every listener result, then close the listener.
-// Expected: Restart takes precedence over hibernate; one exact request is delivered per packet, and SUCCESS/custom failure/FAIL replies preserve the negotiated versions, transaction fields and header-only response size. A disconnected listener yields FAIL without hanging.
+// Test: Forward shutdown flags/results, drop an individual notifier RPC and recover on the same connection, then close the listener.
+// Expected: Flags, statuses and negotiated response headers remain exact; no reply precedes RPC resolution, dropping a request yields FAIL without hanging, and a live listener can subsequently return SUCCESS.
 #[async_test]
 async fn shutdown_rpc_flags_results_and_disconnection_map_to_exact_replies(driver: DefaultDriver) {
     let (mut channel, mut host) = pair();
@@ -233,6 +233,30 @@ async fn shutdown_rpc_flags_results_and_disconnection_map_to_exact_replies(drive
         .await;
         assert_eq!(receive(&driver, &mut host).await, shutdown_response(status));
         assert!(notifier.recv().now_or_never().is_none());
+    }
+    for cancel in [true, false] {
+        let packet = shutdown_packet(false, false, false);
+        with_timeout(&driver, async {
+            futures::join!(channel.handle_host_message(&packet, &ic), async {
+                let request = notifier.recv().await.unwrap();
+                assert!(host.recv(&mut [0; 4096]).now_or_never().is_none());
+                if cancel {
+                    drop(request);
+                } else {
+                    request.handle_sync(|_| ShutdownResult::Ok);
+                }
+            });
+        })
+        .await;
+        assert_eq!(
+            receive(&driver, &mut host).await,
+            shutdown_response(if cancel {
+                Status::FAIL
+            } else {
+                Status::SUCCESS
+            })
+        );
+        assert_no_output(&mut host, &mut notifier);
     }
     drop(notifier);
     with_timeout(
