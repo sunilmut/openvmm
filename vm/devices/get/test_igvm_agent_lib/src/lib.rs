@@ -772,3 +772,6 @@ impl TestIgvmAgent {
         Ok(format!("{}.{}.{}", header_b64, body_b64, signature_b64))
     }
 }
+
+#[cfg(test)]
+mod tests;
