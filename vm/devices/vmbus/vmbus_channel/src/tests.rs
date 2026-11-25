@@ -297,6 +297,7 @@ fn tagged_stream_emits_one_terminal_sentinel_after_pending_and_items() {
 }
 
 mod cancellation;
+mod consumers;
 mod lifecycle;
 mod offer;
 mod simple;
