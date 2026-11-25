@@ -2190,6 +2190,7 @@ dependencies = [
 name = "fdt"
 version = "0.0.0"
 dependencies = [
+ "test_with_tracing",
  "thiserror 2.0.16",
  "zerocopy",
 ]

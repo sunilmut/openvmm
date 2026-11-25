@@ -12,3 +12,6 @@ pub mod parser;
 mod spec;
 
 pub use spec::ReserveEntry;
+
+#[cfg(test)]
+mod tests;
