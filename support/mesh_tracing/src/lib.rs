@@ -370,3 +370,6 @@ impl TracingBackend {
         self.state.task.await;
     }
 }
+
+#[cfg(test)]
+mod tests;

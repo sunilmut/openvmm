@@ -4938,6 +4938,9 @@ dependencies = [
  "inspect",
  "mesh",
  "pal_async",
+ "parking_lot",
+ "tempfile",
+ "test_with_tracing",
  "tracing",
  "tracing-subscriber",
 ]
