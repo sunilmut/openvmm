@@ -106,3 +106,96 @@ async fn real_queue_flush_errors_and_stop_resume_preserve_protocol_and_data(driv
         assert_eq!(bytes, [0x91; 64]);
     }
 }
+
+// Test: Queue mixed flush/unsupported requests in four-request batches and reuse descriptor IDs through multiple ring wraps.
+// Expected: Every completion retains its descriptor identity and four-byte status, unsupported requests do not stop later flushes, and response guards remain unchanged without duplicate completions.
+#[async_test]
+async fn batched_flush_statuses_keep_descriptor_identity_across_ring_wrap(driver: DefaultDriver) {
+    let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
+    let file = tempfile::tempfile().unwrap();
+    file.set_len(0x20_0000).unwrap();
+    let mut device = Device::new(&driver_source, file, true).unwrap();
+    let mem = GuestMemory::allocate(0x5000);
+    init_avail_ring(&mem, AVAIL);
+    init_used_ring(&mem, USED);
+    let event = Event::new();
+    let interrupt = Event::new();
+    device
+        .start_queue(
+            0,
+            QueueResources {
+                params: QueueParams {
+                    size: QUEUE_SIZE,
+                    enable: true,
+                    desc_addr: DESC,
+                    avail_addr: AVAIL,
+                    used_addr: USED,
+                },
+                notify: Interrupt::from_event(interrupt.clone()),
+                event: event.clone(),
+                guest_memory: mem.clone(),
+            },
+            &VirtioDeviceFeatures::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    let mut avail_index = 0;
+    let mut used_index = 0;
+    for batch in 0..5 {
+        let requests = if batch % 2 == 0 {
+            [0u32, 1, 0, u32::MAX]
+        } else {
+            [1u32, 0, u32::MAX, 0]
+        };
+        for (index, request) in requests.iter().enumerate() {
+            let offset = index as u64 * 16;
+            let descriptor = index as u16 * 2;
+            mem.write_at(REQUEST + offset, &request.to_le_bytes())
+                .unwrap();
+            mem.write_at(RESPONSE + offset, &[0xcc; 16]).unwrap();
+            write_descriptor(
+                &mem,
+                DESC,
+                descriptor,
+                REQUEST + offset,
+                4,
+                DescriptorFlags::new().with_next(true),
+                descriptor + 1,
+            );
+            write_descriptor(
+                &mem,
+                DESC,
+                descriptor + 1,
+                RESPONSE + offset,
+                8,
+                DescriptorFlags::new().with_write(true),
+                0,
+            );
+            make_available(&mem, AVAIL, QUEUE_SIZE, descriptor, &mut avail_index);
+        }
+        event.signal();
+        let mut completed = [false; 4];
+        for _ in 0..4 {
+            let (descriptor, len) =
+                wait_for_used(&driver, &interrupt, &mem, USED, QUEUE_SIZE, &mut used_index).await;
+            assert_eq!(len, 4);
+            assert!(descriptor < QUEUE_SIZE && descriptor % 2 == 0);
+            let index = descriptor as usize / 2;
+            assert!(!std::mem::replace(&mut completed[index], true));
+            let mut response = [0; 16];
+            mem.read_at(RESPONSE + index as u64 * 16, &mut response)
+                .unwrap();
+            let expected = if requests[index] == 0 { 0u32 } else { u32::MAX };
+            assert_eq!(&response[..4], expected.to_le_bytes());
+            assert_eq!(&response[4..], &[0xcc; 12]);
+        }
+        assert_eq!(completed, [true; 4]);
+        assert_eq!(used_index, avail_index);
+        assert!(read_used(&mem, USED, QUEUE_SIZE, &mut used_index).is_none());
+    }
+    let state = device.stop_queue(0).await.unwrap();
+    assert_eq!(state.avail_index, 20);
+    assert_eq!(state.used_index, 20);
+    assert!(read_used(&mem, USED, QUEUE_SIZE, &mut used_index).is_none());
+}
