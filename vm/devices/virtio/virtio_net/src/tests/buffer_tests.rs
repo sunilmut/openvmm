@@ -185,3 +185,68 @@ async fn incomplete_rx_is_dropped_and_descriptor_can_be_reused(driver: DefaultDr
     }
     harness.disable().await;
 }
+
+// Test: Receive into three guarded, discontiguous guest descriptors with the virtio header and payload crossing different descriptor boundaries.
+// Expected: Contiguous and segmented backend writes produce one exact logical packet, correct used length, unchanged unused capacity, and intact guards around every guest region.
+#[async_test]
+async fn rx_scattered_descriptors_preserve_split_header_payload_and_guards(driver: DefaultDriver) {
+    use zerocopy::FromZeros;
+
+    let mut harness = TestHarness::new(&driver);
+    let mut backend = harness.enable_and_get_handle().await;
+    let data: Vec<u8> = (0..64).map(|index| (index * 37) as u8).collect();
+    let mut expected = VirtioNetHeader {
+        num_buffers: 1,
+        ..FromZeros::new_zeroed()
+    }
+    .as_bytes()[..header_size()]
+        .to_vec();
+    expected.extend_from_slice(&data);
+    for mode in [RxWriteMode::Packet, RxWriteMode::Segments] {
+        *backend.rx_write_mode.lock() = mode;
+        let regions = [5usize, 20, 128].map(|len| {
+            let base = harness.alloc_data((len + 32) as u32);
+            harness.mem.write_at(base, &vec![0xcc; len + 32]).unwrap();
+            (base, len)
+        });
+        for (index, &(base, len)) in regions.iter().enumerate() {
+            write_descriptor(
+                &harness.mem,
+                RX_DESC_ADDR,
+                index as u16,
+                base + 16,
+                len as u32,
+                DescriptorFlags::new()
+                    .with_write(true)
+                    .with_next(index + 1 < regions.len()),
+                if index + 1 < regions.len() {
+                    index as u16 + 1
+                } else {
+                    0
+                },
+            );
+        }
+        make_available(
+            &harness.mem,
+            RX_AVAIL_ADDR,
+            QUEUE_SIZE,
+            0,
+            &mut harness.rx_avail_idx,
+        );
+        harness.rx_event.signal();
+        backend.wait_for_rx_pending().await;
+        backend.inject_rx_packet(&data);
+        assert_eq!(harness.wait_for_rx_used().await, (0, expected.len() as u32));
+        let mut gathered = Vec::new();
+        for (base, len) in regions {
+            let mut bytes = vec![0; len + 32];
+            harness.mem.read_at(base, &mut bytes).unwrap();
+            assert_eq!(&bytes[..16], &[0xcc; 16]);
+            assert_eq!(&bytes[16 + len..], &[0xcc; 16]);
+            gathered.extend_from_slice(&bytes[16..16 + len]);
+        }
+        assert_eq!(&gathered[..expected.len()], &expected);
+        assert!(gathered[expected.len()..].iter().all(|byte| *byte == 0xcc));
+    }
+    harness.disable().await;
+}
