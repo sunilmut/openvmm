@@ -767,6 +767,8 @@ mod tests {
     use zerocopy::FromZeros;
     use zerocopy::IntoBytes;
 
+    mod behavior_tests;
+
     // This function assumes the sector size is 512.
     fn generate_write_packet(
         target_id: u8,
