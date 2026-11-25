@@ -914,3 +914,66 @@ async fn attestation_rejects_invalid_lengths_and_reports(driver: DefaultDriver) 
         assert!(futures::poll!(h.pipe.recv(&mut [0; 16])).is_pending());
     }
 }
+
+// Test: Fail a chunked save after a partial payload, then retry and restore.
+// Expected: The retry succeeds and restores only its bytes, not the failed prefix.
+#[async_test]
+async fn failed_chunked_save_does_not_contaminate_the_next_save(driver: DefaultDriver) {
+    let mut h = Harness::new(&driver, config(), None);
+    h.connect().await;
+    let failed = h.requests.call(
+        GuestEmulationRequest::SaveGuestVtl2State,
+        GuestServicingFlags::default(),
+    );
+    let _: wire::SaveGuestVtl2StateNotification = h.response().await;
+    let mut partial =
+        wire::SaveGuestVtl2StateRequest::new(wire::GuestVtl2SaveRestoreStatus::MORE_DATA)
+            .as_bytes()
+            .to_vec();
+    partial.extend_from_slice(b"discarded-prefix");
+    h.pipe.send(&partial).await.unwrap();
+    h.pipe
+        .send(
+            wire::SaveGuestVtl2StateRequest::new(wire::GuestVtl2SaveRestoreStatus::FAILURE)
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        failed.await.unwrap(),
+        Err(get_resources::ged::SaveRestoreError::GuestError)
+    ));
+
+    let retry = h.requests.call(
+        GuestEmulationRequest::SaveGuestVtl2State,
+        GuestServicingFlags::default(),
+    );
+    let _: wire::SaveGuestVtl2StateNotification = h.response().await;
+    let mut fresh = wire::SaveGuestVtl2StateRequest::new(wire::GuestVtl2SaveRestoreStatus::SUCCESS)
+        .as_bytes()
+        .to_vec();
+    fresh.extend_from_slice(b"fresh-state");
+    h.pipe.send(&fresh).await.unwrap();
+    let response: wire::SaveGuestVtl2StateResponse = h.response().await;
+    assert_eq!(
+        response.save_status,
+        wire::GuestVtl2SaveRestoreStatus::SUCCESS
+    );
+    retry.await.unwrap().unwrap();
+    h.pipe
+        .send(
+            wire::RestoreGuestVtl2StateRequest::new(wire::GuestVtl2SaveRestoreStatus::SUCCESS)
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let packet = h.receive().await;
+    let (header, bytes) = wire::RestoreGuestVtl2StateResponse::read_from_prefix(&packet).unwrap();
+    assert_eq!(
+        { header.restore_status },
+        wire::GuestVtl2SaveRestoreStatus::SUCCESS
+    );
+    assert_eq!(header.data_length as usize, b"fresh-state".len());
+    assert_eq!(bytes, b"fresh-state");
+    h.barrier().await;
+}
