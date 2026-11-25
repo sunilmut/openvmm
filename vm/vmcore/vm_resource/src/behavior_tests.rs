@@ -324,3 +324,40 @@ fn resource_debug_output_reports_identity_without_payload() {
     assert!(text.contains("value"));
     assert!(!text.contains("private-payload"));
 }
+
+// Test: Resolve serialized resource envelopes after malformed sync/async payloads.
+// Expected: Parse failures stay request-local; subsequent dynamic and static
+//       resources retain their identity, payload and borrowed resolution input.
+#[async_test]
+async fn serialized_resource_failures_do_not_poison_later_resolution() {
+    let resolver = resolver();
+    for resource in [
+        Resource::new(InvalidValue {
+            value: "invalid integer".into(),
+        }),
+        Resource::new(InvalidAsyncValue {
+            value: "invalid integer".into(),
+        }),
+    ] {
+        let resource = OwnedMessage::serialized(OwnedMessage::new(resource).serialize())
+            .parse::<Resource<ValueKind>>()
+            .unwrap();
+        assert!(matches!(
+            resolver.resolve(resource, "").await,
+            Err(ResolveError::ParseError { .. })
+        ));
+    }
+
+    let prefix = String::from("wire=");
+    for (resource, expected) in [
+        (Resource::new(Value { value: 7 }), "wire=21"),
+        (Resource::new(AsyncValue { value: 11 }), "wire=33"),
+        (Resource::new(StaticValue { value: 13 }), "wire=113"),
+        (Resource::new(StaticAsyncValue { value: 17 }), "wire=117"),
+    ] {
+        let resource = OwnedMessage::serialized(OwnedMessage::new(resource).serialize())
+            .parse::<Resource<ValueKind>>()
+            .unwrap();
+        assert_eq!(resolver.resolve(resource, &prefix).await.unwrap(), expected);
+    }
+}
