@@ -22,3 +22,6 @@ mod sync_unsafe_cell;
 pub use error::*;
 pub use mpsc::*;
 pub use oneshot::*;
+
+#[cfg(test)]
+mod tests;
