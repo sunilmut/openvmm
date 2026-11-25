@@ -988,19 +988,22 @@ mod tests {
         output.contains("5.13")
     }
 
-    fn new_block_device_from(file: fs::File) -> Result<BlockDevice, NewDeviceError> {
+    fn test_pool() -> Result<PoolClient, NewDeviceError> {
         // TODO: switch to std::sync::OnceLock once `get_or_try_init` is stable
         static POOL: OnceCell<PoolClient> = OnceCell::new();
 
-        let client = POOL
-            .get_or_try_init(|| {
-                let pool = IoUringPool::new("test", 16)?;
-                let client = pool.client().clone();
-                std::thread::spawn(|| pool.run());
-                Ok(client)
-            })
-            .map_err(|err| NewDeviceError::IoctlError(DiskError::Io(err)))?;
+        POOL.get_or_try_init(|| {
+            let pool = IoUringPool::new("test", 16)?;
+            let client = pool.client().clone();
+            std::thread::spawn(|| pool.run());
+            Ok(client)
+        })
+        .cloned()
+        .map_err(|err| NewDeviceError::IoctlError(DiskError::Io(err)))
+    }
 
+    fn new_block_device_from(file: fs::File) -> Result<BlockDevice, NewDeviceError> {
+        let client = test_pool()?;
         block_on(BlockDevice::new(
             file,
             false,
@@ -1267,4 +1270,6 @@ mod tests {
             "second page corrupted"
         );
     }
+
+    mod behavior;
 }
