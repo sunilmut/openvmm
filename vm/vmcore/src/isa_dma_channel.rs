@@ -59,3 +59,23 @@ impl IsaDmaChannel for FloatingDmaChannel {
         tracing::warn!("called `complete` on floating DMA channel");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Request both DMA directions through a floating channel before and after transfer completion.
+    // Expected: An unconnected channel always reports zero transfer size and never grants guest-memory access.
+    #[test]
+    fn floating_channel_never_grants_a_dma_buffer() {
+        let mut channel: Box<dyn IsaDmaChannel> = Box::new(FloatingDmaChannel);
+        for direction in [IsaDmaDirection::Read, IsaDmaDirection::Write] {
+            assert_eq!(channel.check_transfer_size(), 0);
+            assert_eq!(channel.request(direction), None);
+            channel.complete();
+            assert_eq!(channel.request(direction), None);
+            assert_eq!(channel.check_transfer_size(), 0);
+        }
+    }
+}

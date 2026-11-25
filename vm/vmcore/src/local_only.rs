@@ -66,3 +66,6 @@ impl<T, R> FieldDecode<'_, T, R> for LocalOnlyField {
         Err(Error::new(LocalOnlyError))
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -489,6 +489,9 @@ pub mod test_helpers {
 }
 
 #[cfg(test)]
+mod behavior_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::line_interrupt::test_helpers::TestLineInterruptTarget;

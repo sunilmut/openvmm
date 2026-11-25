@@ -116,3 +116,6 @@ impl PolledNotify {
         })
     }
 }
+
+#[cfg(test)]
+mod tests;

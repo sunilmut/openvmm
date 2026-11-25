@@ -89,3 +89,43 @@ impl ResolveResource<ReferenceTimeSourceKind, PlatformResource> for ReferenceTim
         Ok(self.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use test_with_tracing::test;
+
+    struct Clock(Arc<AtomicU64>);
+
+    impl GetReferenceTime for Clock {
+        fn now(&self) -> ReferenceTimeResult {
+            ReferenceTimeResult {
+                ref_time: self.0.load(Ordering::SeqCst),
+                system_time: Some(jiff::Timestamp::from_second(123).unwrap()),
+            }
+        }
+    }
+
+    // Test: Update a backend clock after wrapping, cloning, converting from an Arc, and resolving it as the platform resource.
+    // Expected: Every handle observes the newest complete time result, including optional wall-clock time, rather than a construction-time snapshot.
+    #[test]
+    fn wrapped_and_resolved_reference_time_sources_observe_live_backend_updates() {
+        let value = Arc::new(AtomicU64::new(0));
+        let first = ReferenceTimeSource::new(Clock(value.clone()));
+        let second =
+            ReferenceTimeSource::from(Arc::new(Clock(value.clone())) as Arc<dyn GetReferenceTime>);
+        let resolved = first.resolve(PlatformResource, ()).unwrap();
+        for time in [17, 0x8123_4567_89ab_cdef, u64::MAX] {
+            value.store(time, Ordering::SeqCst);
+            for source in [&first, &second, &resolved] {
+                let result = source.now();
+                assert_eq!(result.ref_time, time);
+                assert_eq!(
+                    result.system_time,
+                    Some(jiff::Timestamp::from_second(123).unwrap())
+                );
+            }
+        }
+    }
+}

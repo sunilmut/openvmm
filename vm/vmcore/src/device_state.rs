@@ -86,3 +86,42 @@ pub trait ChangeDeviceState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use test_with_tracing::test;
+
+    struct Device(Arc<AtomicUsize>);
+
+    impl ChangeDeviceState for Device {
+        fn start(&mut self) {
+            panic!("teardown must not restart the device");
+        }
+        async fn stop(&mut self) {
+            panic!("teardown requires an already stopped device");
+        }
+        async fn reset(&mut self) {
+            panic!("teardown must not reset the device");
+        }
+    }
+
+    impl Drop for Device {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // Test: Create a default teardown future for a stopped device and then drive it to completion.
+    // Expected: Construction retains ownership without releasing the device; completing teardown releases it exactly once without restarting/resetting it.
+    #[test]
+    fn default_teardown_releases_the_device_only_when_driven_to_completion() {
+        let released = Arc::new(AtomicUsize::new(0));
+        let teardown = Device(released.clone()).teardown();
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        futures::executor::block_on(teardown);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+}

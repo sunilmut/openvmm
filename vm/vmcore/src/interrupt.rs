@@ -279,6 +279,9 @@ impl EventProxy {
 }
 
 #[cfg(test)]
+mod behavior_tests;
+
+#[cfg(test)]
 mod tests {
     use super::Interrupt;
     use super::InterruptTarget;

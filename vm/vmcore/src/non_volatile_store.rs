@@ -147,3 +147,6 @@ pub mod resources {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

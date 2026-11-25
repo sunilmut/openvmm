@@ -963,6 +963,9 @@ impl VmTimerPeriodic {
 }
 
 #[cfg(test)]
+mod behavior_tests;
+
+#[cfg(test)]
 mod tests {
     use super::VmTime;
     use super::VmTimeKeeper;

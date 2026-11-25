@@ -104,3 +104,6 @@ impl RegisterInterruptError {
         Self(err.into())
     }
 }
+
+#[cfg(test)]
+mod tests;

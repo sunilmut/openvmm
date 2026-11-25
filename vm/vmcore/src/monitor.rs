@@ -217,6 +217,9 @@ impl Drop for RegisteredMonitor {
 }
 
 #[cfg(test)]
+mod behavior_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::mem::offset_of;

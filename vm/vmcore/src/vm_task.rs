@@ -888,3 +888,6 @@ pub mod thread {
         }
     }
 }
+
+#[cfg(test)]
+mod behavior_tests;
