@@ -560,3 +560,6 @@ fn test_modify_mmio_range_rejects_invalid_action() {
     assert_eq!(resp.tdi_state_after, TdispTdiState::Locked as i32);
     assert_eq!(*mock.last_call.lock(), Some(LastCall::BindDevice));
 }
+
+#[path = "failure_behavior.rs"]
+mod failure_behavior;
