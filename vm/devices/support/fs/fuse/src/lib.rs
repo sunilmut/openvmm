@@ -519,3 +519,6 @@ impl fuse_kstatfs {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests;

@@ -126,3 +126,6 @@ fn check_lx_errno<T: PartialOrd<T> + Default>(result: T) -> lx::Result<T> {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests;
