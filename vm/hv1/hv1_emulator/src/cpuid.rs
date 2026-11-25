@@ -143,3 +143,6 @@ pub fn process_hv_cpuid_leaves(
         );
     }
 }
+
+#[cfg(test)]
+mod tests;

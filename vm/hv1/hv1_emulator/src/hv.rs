@@ -561,3 +561,6 @@ impl ReadOnlyLockedPage {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

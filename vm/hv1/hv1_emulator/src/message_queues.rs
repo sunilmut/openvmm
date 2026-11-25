@@ -145,6 +145,96 @@ mod tests {
     use hvdef::HvError;
     use hvdef::HvMessage;
     use hvdef::HvMessageType;
+    use test_with_tracing::test;
+
+    // Test: Clear several nonempty SINT queues, then enqueue a fresh message.
+    // Expected: Pending bits and all stale payloads disappear; fresh enqueue transitions to pending and delivers only the new payload.
+    #[test]
+    fn clearing_queues_prevents_stale_payload_delivery_and_allows_reuse() {
+        let queues = MessageQueues::new();
+        let stale = HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 1, b"stale");
+        for sint in [0, 7, 15] {
+            assert!(queues.enqueue_message(sint, &stale));
+            assert!(!queues.enqueue_message(sint, &stale));
+        }
+        queues.clear();
+        assert_eq!(queues.pending_sints(), 0);
+        assert_eq!(
+            queues.post_pending_messages(u16::MAX, |_, _| panic!("cleared message was delivered")),
+            0
+        );
+        let fresh = HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 2, b"fresh");
+        assert!(queues.enqueue_message(7, &fresh));
+        let mut delivered = Vec::new();
+        assert_eq!(
+            queues.post_pending_messages(u16::MAX, |sint, message| {
+                delivered.push((sint, zerocopy::IntoBytes::as_bytes(message).to_vec()));
+                Ok(())
+            }),
+            0
+        );
+        assert_eq!(
+            delivered,
+            [(7, zerocopy::IntoBytes::as_bytes(&fresh).to_vec())]
+        );
+    }
+
+    // Test: Fail one queued delivery terminally, succeed the next, and leave an unrelated busy SINT for retry.
+    // Expected: Only the terminally failed message is dropped, FIFO payload order is preserved, and busy messages remain pending until a successful retry.
+    #[test]
+    fn terminal_errors_drop_only_the_failed_message_and_busy_slots_retry() {
+        let queues = MessageQueues::new();
+        let first = HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 1, b"first");
+        let second = HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 2, b"second");
+        queues.enqueue_message(2, &first);
+        queues.enqueue_message(2, &second);
+        queues.enqueue_message(5, &first);
+        let mut attempted = Vec::new();
+        assert_eq!(
+            queues.post_pending_messages(1 << 2, |sint, message| {
+                assert_eq!(sint, 2);
+                attempted.push(zerocopy::IntoBytes::as_bytes(message).to_vec());
+                if attempted.len() == 1 {
+                    Err(HvError::InvalidSynicState)
+                } else {
+                    Ok(())
+                }
+            }),
+            1 << 5
+        );
+        assert_eq!(
+            attempted,
+            [
+                zerocopy::IntoBytes::as_bytes(&first).to_vec(),
+                zerocopy::IntoBytes::as_bytes(&second).to_vec()
+            ]
+        );
+        assert_eq!(
+            queues.post_pending_messages(1 << 5, |sint, message| {
+                assert_eq!(sint, 5);
+                assert_eq!(
+                    zerocopy::IntoBytes::as_bytes(message),
+                    zerocopy::IntoBytes::as_bytes(&first)
+                );
+                Err(HvError::ObjectInUse)
+            }),
+            1 << 5
+        );
+        let mut delivered = 0;
+        assert_eq!(
+            queues.post_pending_messages(1 << 5, |sint, message| {
+                assert_eq!(sint, 5);
+                assert_eq!(
+                    zerocopy::IntoBytes::as_bytes(message),
+                    zerocopy::IntoBytes::as_bytes(&first)
+                );
+                delivered += 1;
+                Ok(())
+            }),
+            0
+        );
+        assert_eq!(delivered, 1);
+    }
 
     #[test]
     fn test_message_queues() {

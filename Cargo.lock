@@ -3608,6 +3608,7 @@ dependencies = [
  "inspect",
  "parking_lot",
  "safeatomic",
+ "test_with_tracing",
  "tracelimit",
  "tracing",
  "virt",

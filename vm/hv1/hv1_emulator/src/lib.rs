@@ -22,6 +22,9 @@ pub mod pages;
 pub mod synic;
 pub mod x86;
 
+#[cfg(test)]
+mod test_support;
+
 /// Trait for requesting an interrupt.
 pub trait RequestInterrupt {
     /// Requests an interrupt with the specified vector.

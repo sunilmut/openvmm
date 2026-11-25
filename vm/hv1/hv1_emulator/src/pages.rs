@@ -156,3 +156,6 @@ impl Default for OverlayPage {
         OverlayPage::Local(Box::new(std::array::from_fn(|_| AtomicU8::new(0))))
     }
 }
+
+#[cfg(test)]
+mod tests;
