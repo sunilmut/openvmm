@@ -160,6 +160,7 @@ impl EmulatorSupport for Support {
 
 #[derive(Default)]
 struct Devices {
+    read_byte: Option<u8>,
     reads: RefCell<Vec<(u64, usize)>>,
     writes: RefCell<Vec<(u64, Vec<u8>)>>,
     fatals: RefCell<Vec<String>>,
@@ -177,7 +178,7 @@ impl CpuIo for Devices {
     }
     async fn read_mmio(&self, _vp: VpIndex, address: u64, bytes: &mut [u8]) {
         self.reads.borrow_mut().push((address, bytes.len()));
-        bytes.fill(0x44);
+        bytes.fill(self.read_byte.unwrap_or(0x44));
     }
     async fn write_mmio(&self, _vp: VpIndex, address: u64, bytes: &[u8]) {
         self.writes.borrow_mut().push((address, bytes.to_vec()));
@@ -918,5 +919,73 @@ fn page_walks_validate_the_configured_physical_address_size() {
             crate::translate::translate_gva_to_gpa(&gm, 3, &registers, read_flags()).unwrap(),
             0x2003
         );
+    }
+}
+
+// Test: Load negative subword MMIO values into both W and X registers.
+// Expected: Signedness and destination width determine extension, not old bits.
+#[test]
+fn mmio_loads_extend_to_the_architectural_destination_width() {
+    let gm = GuestMemory::allocate(0);
+    for (opcode, width, expected) in [
+        (0x39400020, 1, 0x80),               // LDRB W0, [X1]
+        (0x39800020, 1, 0xffffffffffffff80), // LDRSB X0, [X1]
+        (0x39c00020, 1, 0xffffff80),         // LDRSB W0, [X1]
+        (0x79400020, 2, 0x8080),             // LDRH W0, [X1]
+        (0x79800020, 2, 0xffffffffffff8080), // LDRSH X0, [X1]
+        (0x79c00020, 2, 0xffff8080),         // LDRSH W0, [X1]
+        (0xb9400020, 4, 0x80808080),         // LDR W0, [X1]
+        (0xb9800020, 4, 0xffffffff80808080), // LDRSW X0, [X1]
+    ] {
+        let devices = Devices {
+            read_byte: Some(0x80),
+            ..Default::default()
+        };
+        let mut support = Support {
+            pc: 0x1000,
+            ..Default::default()
+        };
+        support.xs[0] = u64::MAX;
+        support.xs[1] = 0x2000;
+
+        run(opcode, &mut support, &gm, &devices).unwrap();
+
+        assert_eq!(support.xs[0], expected, "opcode {opcode:#x}");
+        assert_eq!(support.xs[1], 0x2000);
+        assert_eq!(support.pc, 0x1004);
+        assert_eq!(*devices.reads.borrow(), [(0x2000, width)]);
+        assert!(devices.writes.borrow().is_empty());
+        assert!(devices.fatals.borrow().is_empty());
+        assert!(support.events.is_empty());
+    }
+}
+
+// Test: Store a register with nonzero high bits through narrow MMIO accesses.
+// Expected: Each callback receives only the low bytes, with no register changes.
+#[test]
+fn mmio_stores_send_only_the_requested_low_bytes() {
+    let gm = GuestMemory::allocate(0);
+    for (opcode, expected) in [
+        (0x39000020, vec![0x80]),                   // STRB W0, [X1]
+        (0x79000020, vec![0x80, 0x32]),             // STRH W0, [X1]
+        (0xb9000020, vec![0x80, 0x32, 0x54, 0x76]), // STR W0, [X1]
+    ] {
+        let devices = Devices::default();
+        let mut support = Support {
+            pc: 0x1000,
+            ..Default::default()
+        };
+        support.xs[0] = 0xfedcba9876543280;
+        support.xs[1] = 0x2000;
+
+        run(opcode, &mut support, &gm, &devices).unwrap();
+
+        assert_eq!(*devices.writes.borrow(), [(0x2000, expected)]);
+        assert!(devices.reads.borrow().is_empty());
+        assert_eq!(support.xs[0], 0xfedcba9876543280);
+        assert_eq!(support.xs[1], 0x2000);
+        assert_eq!(support.pc, 0x1004);
+        assert!(devices.fatals.borrow().is_empty());
+        assert!(support.events.is_empty());
     }
 }
