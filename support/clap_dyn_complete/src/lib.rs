@@ -549,3 +549,6 @@ pub fn emit_completion_stub(
 
     buf.write_all(stub.as_bytes())
 }
+
+#[cfg(test)]
+mod tests;

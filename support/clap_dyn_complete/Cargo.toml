@@ -12,5 +12,8 @@ clap = { workspace = true, features = ["derive", "env"] }
 futures.workspace = true
 log.workspace = true
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
