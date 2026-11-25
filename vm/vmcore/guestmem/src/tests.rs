@@ -1347,3 +1347,5 @@ fn known_bug_unaligned_bitmap_view_must_not_allow_denied_parent_byte() {
         .unwrap();
     assert!(view.read_plain::<u8>(PAGE_SIZE64 * 2 - 1).is_err());
 }
+
+mod reference_tests;
