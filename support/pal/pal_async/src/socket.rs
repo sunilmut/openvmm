@@ -674,6 +674,7 @@ mod tests {
     use crate::DefaultDriver;
     use futures::AsyncReadExt;
     use futures::AsyncWriteExt;
+    use futures::FutureExt;
     use pal_async_test::async_test;
     use unix_socket::UnixStream;
 
@@ -730,5 +731,35 @@ mod tests {
         let mut buf = [0; 1];
         let n = a.peek(&mut buf).await.unwrap();
         assert_eq!(n, 0);
+    }
+
+    // Test: Peek into an empty buffer while the connected peer has sent no data.
+    // Expected: The operation completes immediately without consuming later data.
+    #[async_test]
+    async fn empty_peek_does_not_wait_for_readiness(driver: DefaultDriver) {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut a = PolledSocket::new(&driver, a).unwrap();
+        let mut b = PolledSocket::new(&driver, b).unwrap();
+        assert_eq!(a.peek(&mut []).now_or_never().unwrap().unwrap(), 0);
+        b.write_all(b"x").await.unwrap();
+        let mut byte = [0];
+        a.read_exact(&mut byte).await.unwrap();
+        assert_eq!(&byte, b"x");
+    }
+
+    // Test: Cancel a pending peek, then receive bytes and peer closure normally.
+    // Expected: Cancellation neither loses data nor prevents subsequent I/O.
+    #[async_test]
+    async fn canceled_peek_preserves_read_progress(driver: DefaultDriver) {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut a = PolledSocket::new(&driver, a).unwrap();
+        let mut b = PolledSocket::new(&driver, b).unwrap();
+        let mut peeked = [0; 4];
+        assert!(a.peek(&mut peeked).now_or_never().is_none());
+        b.write_all(b"next").await.unwrap();
+        b.close().await.unwrap();
+        let mut received = Vec::new();
+        a.read_to_end(&mut received).await.unwrap();
+        assert_eq!(received, b"next");
     }
 }
