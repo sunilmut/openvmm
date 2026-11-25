@@ -588,3 +588,6 @@ mod disconnectable_endpoint_tests {
             .unwrap();
     }
 }
+
+#[cfg(test)]
+mod behavior_tests;
