@@ -293,3 +293,50 @@ fn specialized_values_keep_their_public_formats() {
     assert_eq!(read(&pointer).json().to_string(), r#""0x0""#);
     assert_eq!(read(&pointer.cast_mut()).json().to_string(), r#""0x0""#);
 }
+
+// Test: Update a bounded value under one of two identically named subtrees.
+// Expected: Overflow and negative input preserve both values; valid boundary
+//       updates affect only the selected subtree and remain readable.
+#[test]
+fn nested_numeric_updates_preserve_bounds_and_sibling_values() {
+    #[derive(crate::InspectMut)]
+    struct Settings {
+        #[inspect(mut)]
+        limit: u8,
+    }
+
+    let mut left = Settings { limit: 7 };
+    let mut right = Settings { limit: 17 };
+    let mut obj = adhoc_mut(|req| {
+        req.respond()
+            .field_mut("left", &mut left)
+            .field_mut("right", &mut right);
+    });
+
+    assert_eq!(
+        update("left/limit", "255", &mut obj)
+            .now_or_never()
+            .unwrap(),
+        Ok(Value::new(255u8))
+    );
+    for input in ["256", "-1", "18446744073709551616"] {
+        assert!(matches!(
+            update("left/limit", input, &mut obj)
+                .now_or_never()
+                .unwrap(),
+            Err(Error::Update(_))
+        ));
+        assert_eq!(
+            read(&mut obj).json().to_string(),
+            r#"{"left":{"limit":255},"right":{"limit":17}}"#
+        );
+    }
+    assert_eq!(
+        update("right/limit", "0", &mut obj).now_or_never().unwrap(),
+        Ok(Value::new(0u8))
+    );
+    assert_eq!(
+        read(&mut obj).json().to_string(),
+        r#"{"left":{"limit":255},"right":{"limit":0}}"#
+    );
+}
