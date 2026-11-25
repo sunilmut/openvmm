@@ -439,3 +439,49 @@ fn default_endpoint_routing_rejects_forwarded_and_other_function_accesses() {
     assert_eq!(backing.lock().reads, [(16, PciConfigByteEnable::FULL)]);
     assert_eq!(backing.lock().writes.len(), 1);
 }
+
+// Test: Change and disable the address latch while a partial read is deferred.
+// Expected: Completion retains its original device and byte lanes; accesses
+//       to the second device stay independent and the latch is not restored.
+#[test]
+fn deferred_read_keeps_its_target_when_the_address_latch_changes() {
+    let mut bus = GenericPciBus::new(&mut Bus, ADDR, DATA);
+    let (first, first_backing) = endpoint(0x1111_2222);
+    let (second, _) = endpoint(0x4433_2211);
+    bus.add_pci_device(0, 1, 0, "first", first).unwrap();
+    bus.add_pci_device(0, 2, 0, "second", second).unwrap();
+    select(&mut bus, address(0, 1, 0, 0x40));
+    first_backing.lock().mode = Mode::Deferred;
+    let mut bytes = [0xa5; 2];
+    let IoResult::Defer(mut token) = bus.io_read(DATA + 2, &mut bytes) else {
+        panic!("first device read was not deferred")
+    };
+
+    select(&mut bus, address(0, 2, 0, 0x24));
+    assert_eq!(read::<4>(&mut bus, DATA), 0x4433_2211u32.to_le_bytes());
+    write(&mut bus, DATA + 1, &[0xaa]);
+    select(&mut bus, 0);
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(token.poll_read(&mut context, &mut bytes).is_pending());
+    first_backing
+        .lock()
+        .read
+        .take()
+        .unwrap()
+        .complete(&0x8877_6655u32.to_le_bytes());
+    bus.supports_poll_device()
+        .unwrap()
+        .poll_device(&mut context);
+    assert!(matches!(
+        token.poll_read(&mut context, &mut bytes),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(bytes, [0x77, 0x88]);
+    assert_eq!(read::<4>(&mut bus, ADDR), [0; 4]);
+    assert_eq!(read::<4>(&mut bus, DATA), [0xff; 4]);
+    select(&mut bus, address(0, 2, 0, 0x24));
+    assert_eq!(read::<4>(&mut bus, DATA), [0x11, 0xaa, 0x33, 0x44]);
+    first_backing.lock().mode = Mode::Online;
+    select(&mut bus, address(0, 1, 0, 0x40));
+    assert_eq!(read::<4>(&mut bus, DATA), 0x1111_2222u32.to_le_bytes());
+}
