@@ -14,3 +14,6 @@ pub mod piix4_pci_isa_bridge;
 pub mod piix4_pm;
 pub mod piix4_uhci;
 pub mod winbond83977_sio;
+
+#[cfg(test)]
+mod tests;

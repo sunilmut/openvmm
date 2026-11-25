@@ -714,6 +714,7 @@ dependencies = [
  "mesh",
  "open_enum",
  "pal_async",
+ "parking_lot",
  "pci_bus",
  "pci_core",
  "power_resources",

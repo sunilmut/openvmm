@@ -341,4 +341,6 @@ mod tests {
             assert_eq!(get_ext_cmos_data_shadow(&mut rtc, i), 0);
         }
     }
+
+    mod compatibility;
 }
