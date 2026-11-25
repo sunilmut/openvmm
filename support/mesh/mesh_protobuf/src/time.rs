@@ -223,4 +223,55 @@ mod tests {
             assert!(crate::decode::<Duration>(&crate::encode((1u64, nanos))).is_err());
         }
     }
+
+    // Test: Serialize timestamps around the signed 32-bit Unix-second boundary.
+    // Expected: Wire decoding and system-time conversion preserve all seconds
+    //       and nanoseconds without wrapping at the 2038 boundary.
+    #[cfg(feature = "std")]
+    #[test]
+    fn timestamp_preserves_time64_boundaries_on_the_wire() {
+        use super::Timestamp;
+        use core::time::Duration;
+        use std::time::SystemTime;
+
+        for seconds in [2_147_483_647, 2_147_483_648, 4_294_967_296] {
+            for nanos in [0, 1, 999_999_999] {
+                let expected = SystemTime::UNIX_EPOCH + Duration::new(seconds, nanos);
+                let timestamp = Timestamp {
+                    seconds: seconds as i64,
+                    nanos: nanos as i32,
+                };
+                let decoded: Timestamp = crate::decode(&crate::encode(timestamp)).unwrap();
+                assert_eq!(decoded, timestamp);
+                assert_eq!(SystemTime::try_from(decoded).unwrap(), expected);
+                assert_eq!(Timestamp::from(expected), timestamp);
+            }
+        }
+    }
+
+    // Test: Convert negative instants on both sides of whole-second boundaries.
+    // Expected: Borrowed seconds produce a nonnegative fractional component,
+    //       retaining the exact instant through protobuf and system time.
+    #[cfg(feature = "std")]
+    #[test]
+    fn timestamp_preserves_negative_fractional_second_boundaries() {
+        use super::Timestamp;
+        use core::time::Duration;
+        use std::time::SystemTime;
+
+        for (before_epoch, seconds, nanos) in [
+            (1, -1, 999_999_999),
+            (999_999_999, -1, 1),
+            (1_000_000_000, -1, 0),
+            (1_000_000_001, -2, 999_999_999),
+            (2_000_000_001, -3, 999_999_999),
+        ] {
+            let instant = SystemTime::UNIX_EPOCH - Duration::from_nanos(before_epoch);
+            let timestamp = Timestamp { seconds, nanos };
+            assert_eq!(Timestamp::from(instant), timestamp);
+            let decoded: Timestamp = crate::decode(&crate::encode(timestamp)).unwrap();
+            assert_eq!(decoded, timestamp);
+            assert_eq!(SystemTime::try_from(decoded).unwrap(), instant);
+        }
+    }
 }
