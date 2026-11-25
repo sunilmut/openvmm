@@ -317,3 +317,34 @@ fn inaccessible_vp_context_memory_returns_a_zeroing_error() {
     let error = loader.set_vp_context_page(1).unwrap_err();
     assert!(error.to_string().contains("unable to zero VP context page"));
 }
+
+// Test: Import an empty-data image region next to a payload loaded earlier.
+// Expected: Every empty-data page is zeroed and retained in the accepted range,
+//       without changing the existing payload or either neighboring guard page.
+#[test]
+fn empty_data_import_zeroes_whole_pages_without_discarding_or_overwriting_ranges() {
+    let memory = GuestMemory::allocate(0x10000);
+    memory.fill_at(0, 0xa5, 0x10000).unwrap();
+    let layout = layout();
+    let mut loader = Loader::<X86Register>::new(memory.clone(), &layout, Vtl::Vtl0);
+    loader
+        .import_pages(3, 1, "image", BootPageAcceptance::Exclusive, &[0x73; 4096])
+        .unwrap();
+    loader
+        .import_pages(1, 2, "image", BootPageAcceptance::Exclusive, &[])
+        .unwrap();
+    let mut bytes = vec![0; 0x10000];
+    memory.read_at(0, &mut bytes).unwrap();
+    assert!(bytes[..0x1000].iter().all(|&b| b == 0xa5));
+    assert!(bytes[0x1000..0x3000].iter().all(|&b| b == 0));
+    assert!(bytes[0x3000..0x4000].iter().all(|&b| b == 0x73));
+    assert!(bytes[0x4000..].iter().all(|&b| b == 0xa5));
+    assert_eq!(
+        loader.initial_regs_and_page_imports().page_imports,
+        [InitialPageImport {
+            range: MemoryRange::new(0x1000..0x4000),
+            import_type: InitialPageImportType::Normal,
+            tag: "image"
+        }]
+    );
+}
