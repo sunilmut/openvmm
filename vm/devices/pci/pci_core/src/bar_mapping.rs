@@ -91,3 +91,35 @@ impl BarMappings {
         self.0.iter()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Enumerate mixed 32/64-bit BARs with attribute/alignment bits and absent slots.
+    // Expected: Only implemented BARs appear, with aligned full-width bases, lengths, and indices.
+    #[test]
+    fn mixed_bar_enumeration_preserves_width_alignment_and_register_indices() {
+        let mappings = BarMappings::parse(
+            &[0x80000007, 0x9000000f, 1, 0, 0xa0001230, 0],
+            &[0xfffff000, 0xffffe004, u32::MAX, 0, 0xffff0000, 0],
+        );
+        let actual: Vec<_> = mappings
+            .iter()
+            .map(|mapping| (mapping.index, mapping.base_address, mapping.len))
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                (0, 0x80000000, 0x1000),
+                (1, 0x190000000, 0x2000),
+                (4, 0xa0000000, 0x10000)
+            ]
+        );
+        assert_eq!(mappings.get(1), Some(0x190000000));
+        assert_eq!(mappings.get(2), None);
+        assert_eq!(mappings.find(0x190001fff), Some((1, 0x1fff)));
+        assert_eq!(mappings.find(0x190002000), None);
+    }
+}

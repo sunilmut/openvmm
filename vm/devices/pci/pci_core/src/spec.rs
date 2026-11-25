@@ -1369,3 +1369,49 @@ pub mod caps {
         pub const ARI_CAPABILITY_NEXT_FUNCTION_SHIFT: u32 = 8;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::hwid::{ClassCode, ProgrammingInterface, Subclass};
+    use test_with_tracing::test;
+
+    // Test: Convert every possible hardware-ID byte to and from the protocol enums.
+    // Expected: Unknown and named class, subclass, and interface values round-trip unchanged.
+    #[test]
+    fn hardware_id_conversions_preserve_every_wire_value() {
+        for value in u8::MIN..=u8::MAX {
+            assert_eq!(u8::from(ClassCode::from(value)), value);
+            assert_eq!(u8::from(Subclass::from(value)), value);
+            assert_eq!(u8::from(ProgrammingInterface::from(value)), value);
+        }
+    }
+
+    // Test: Classify both ends of each reserved class-code range and their neighbors.
+    // Expected: Only reserved codes are labeled RESERVED, with their original numeric value.
+    #[test]
+    fn reserved_class_boundaries_are_classified_and_formatted_correctly() {
+        for (value, reserved) in [
+            (0, false),
+            (0x13, false),
+            (0x14, true),
+            (0x3f, true),
+            (0x40, false),
+            (0x41, true),
+            (0xfe, true),
+            (0xff, false),
+        ] {
+            let code = ClassCode::from(value);
+            assert_eq!(code.is_reserved(), reserved, "class {value:#x}");
+            if reserved {
+                assert_eq!(code.to_string(), format!("RESERVED({value:#04x})"));
+            } else {
+                assert!(!code.to_string().contains("RESERVED"));
+            }
+        }
+        assert!(
+            ClassCode::NETWORK_CONTROLLER
+                .to_string()
+                .contains("NETWORK_CONTROLLER")
+        );
+    }
+}

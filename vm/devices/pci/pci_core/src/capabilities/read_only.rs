@@ -112,3 +112,46 @@ mod save_restore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_helpers::{read_cap_u32, write_cap_u32};
+    use test_with_tracing::test;
+    use vmcore::save_restore::SaveRestore;
+
+    // Test: Read vendor/custom-ID capabilities through writes, reset, and checkpoint restore.
+    // Expected: Payload words and identity stay intact; reads beyond the payload return all ones.
+    #[test]
+    fn payload_and_identity_remain_read_only_across_lifecycle_operations() {
+        let payload = [0x09u8, 0, 0x11, 0x22, 0xa1, 0xb2, 0xc3, 0xd4];
+        for (mut capability, expected_id) in [
+            (
+                ReadOnlyCapability::new("vendor", payload),
+                CapabilityId::VENDOR_SPECIFIC,
+            ),
+            (
+                ReadOnlyCapability::new_with_capability_id("custom", CapabilityId(0xab), payload),
+                CapabilityId(0xab),
+            ),
+        ] {
+            assert_eq!(capability.capability_id(), expected_id);
+            assert_eq!(capability.len(), 8);
+            assert_eq!(read_cap_u32(&capability, 0), 0x22110009);
+            assert_eq!(read_cap_u32(&capability, 4), 0xd4c3b2a1);
+            assert_eq!(read_cap_u32(&capability, 8), u32::MAX);
+            assert_eq!(read_cap_u32(&capability, 0xfffc), u32::MAX);
+            let saved = capability.save().unwrap();
+            for offset in [0, 4, 8] {
+                write_cap_u32(&mut capability, offset, u32::MAX);
+            }
+            assert_eq!(read_cap_u32(&capability, 0), 0x22110009);
+            assert_eq!(read_cap_u32(&capability, 4), 0xd4c3b2a1);
+            capability.reset();
+            capability.restore(saved).unwrap();
+            assert_eq!(read_cap_u32(&capability, 0), 0x22110009);
+            assert_eq!(read_cap_u32(&capability, 4), 0xd4c3b2a1);
+            assert_eq!(capability.capability_id(), expected_id);
+        }
+    }
+}
