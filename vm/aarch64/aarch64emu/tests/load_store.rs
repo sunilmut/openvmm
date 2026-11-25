@@ -70,6 +70,9 @@ pub struct SingleCellCpu {
     pub valid_gva: u64,
     pub mem_val: Arc<futures::lock::Mutex<u128>>,
     cpu_state: CpuState,
+    fail_instruction: bool,
+    compare_retries: usize,
+    fail_compare: bool,
 }
 
 impl SingleCellCpu {
@@ -85,7 +88,7 @@ impl Cpu for SingleCellCpu {
     type Error = TestCpuError;
 
     async fn read_instruction(&mut self, gva: u64, bytes: &mut [u8]) -> Result<(), Self::Error> {
-        if gva == self.cpu_state.pc() && bytes.len() == 4 {
+        if !self.fail_instruction && gva == self.cpu_state.pc() && bytes.len() == 4 {
             bytes.copy_from_slice(self.cpu_state.instruction().to_le_bytes().as_slice());
             Ok(())
         } else {
@@ -115,11 +118,15 @@ impl Cpu for SingleCellCpu {
 
     async fn read_physical_memory(
         &mut self,
-        _gpa: u64,
-        _bytes: &mut [u8],
-        _exec: bool,
+        gpa: u64,
+        bytes: &mut [u8],
+        exec: bool,
     ) -> Result<(), Self::Error> {
-        panic!("Not expected to be used during tests");
+        assert!(
+            !exec,
+            "data-abort emulation must not fetch physical instructions"
+        );
+        self.read_memory(gpa, bytes).await
     }
 
     async fn write_memory(&mut self, gva: u64, bytes: &[u8]) -> Result<(), Self::Error> {
@@ -144,8 +151,8 @@ impl Cpu for SingleCellCpu {
         }
     }
 
-    async fn write_physical_memory(&mut self, _gpa: u64, _bytes: &[u8]) -> Result<(), Self::Error> {
-        panic!("Not expected to be used during tests");
+    async fn write_physical_memory(&mut self, gpa: u64, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.write_memory(gpa, bytes).await
     }
 
     async fn compare_and_write_memory(
@@ -155,6 +162,14 @@ impl Cpu for SingleCellCpu {
         new: &[u8],
         success: &mut bool,
     ) -> Result<(), Self::Error> {
+        if self.fail_compare {
+            return Err(TestCpuError::BadAddress);
+        }
+        if self.compare_retries != 0 {
+            self.compare_retries -= 1;
+            *success = false;
+            return Ok(());
+        }
         let mut mem_val = self.mem_val.lock().await;
         if gva == self.valid_gva {
             if &(*mem_val).to_le_bytes().as_ref()[..current.len()] == current {
@@ -2945,3 +2960,6 @@ async fn verify_load_gp_register_pair_sign_extend() {
         }
     }
 }
+
+#[path = "load_store/behavior.rs"]
+mod behavior;
