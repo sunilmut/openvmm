@@ -410,3 +410,63 @@ fn blocking_disk_full_length_reads_honor_unaligned_positions() {
     disk.read_exact(&mut bytes).unwrap();
     assert_eq!(bytes[511], 1);
 }
+
+// Test: Transfer two disk sectors through offset, discontiguous guest pages.
+// Expected: Logical byte order survives both directions without changing neighbors.
+#[test]
+fn disk_transfers_preserve_scatter_gather_order_and_neighboring_bytes() {
+    let backend = Backend::new();
+    let state = backend.state.clone();
+    let disk = Disk::new(backend).unwrap();
+    let gm = GuestMemory::allocate(0x4000);
+    let payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+    let mut expected_guest = vec![0xa5; 0x4000];
+    expected_guest[0x3ffd..0x4000].copy_from_slice(&payload[..3]);
+    expected_guest[0x1000..0x13fd].copy_from_slice(&payload[3..]);
+    gm.write_at(0, &expected_guest).unwrap();
+
+    let source = OwnedRequestBuffers::new_unaligned(&[3, 1], 4093, 1024);
+    block_on(disk.write_vectored(&source.buffer(&gm), 1, false)).unwrap();
+    assert_eq!(*state.writes.lock(), [(1, false)]);
+
+    let destination = OwnedRequestBuffers::new_unaligned(&[2, 0], 4091, 1024);
+    block_on(disk.read_vectored(&destination.buffer(&gm), 1)).unwrap();
+    expected_guest[0x2ffb..0x3000].copy_from_slice(&payload[..5]);
+    expected_guest[..1019].copy_from_slice(&payload[5..]);
+    let mut actual_guest = vec![0; 0x4000];
+    gm.read_at(0, &mut actual_guest).unwrap();
+    assert_eq!(actual_guest, expected_guest);
+
+    let disk_contents = GuestMemory::allocate(2048);
+    let all_sectors = OwnedRequestBuffers::linear(0, 2048, true);
+    block_on(disk.read_vectored(&all_sectors.buffer(&disk_contents), 0)).unwrap();
+    let mut actual_disk = vec![0; 2048];
+    disk_contents.read_at(0, &mut actual_disk).unwrap();
+    let mut expected_disk = vec![0; 2048];
+    expected_disk[512..1536].copy_from_slice(&payload);
+    expected_disk[1536..].fill(3);
+    assert_eq!(actual_disk, expected_disk);
+}
+
+// IGNORED: A failed buffered flush clears the pending-write flag, so retrying
+//         reports success without sending the already accepted bytes again.
+//
+// Test: Retry a buffered flush after a transient backend write failure.
+// Expected: A successful retry preserves all bytes accepted by write_all.
+#[test]
+#[ignore = "product bug: failed buffered flush loses pending data on retry"]
+fn blocking_disk_retries_failed_flush_without_losing_accepted_bytes() {
+    let backend = Backend::new();
+    let state = backend.state.clone();
+    let mut disk = BlockingDisk::new(Disk::new(backend).unwrap());
+    disk.write_all(&[7; 3]).unwrap();
+    state.fail_writes.store(true, Ordering::SeqCst);
+    assert!(disk.flush().is_err());
+    state.fail_writes.store(false, Ordering::SeqCst);
+
+    disk.flush().unwrap();
+    disk.seek(SeekFrom::Start(0)).unwrap();
+    let mut bytes = [0; 3];
+    disk.read_exact(&mut bytes).unwrap();
+    assert_eq!(bytes, [7; 3]);
+}
