@@ -1145,3 +1145,6 @@ impl From<FaultStatusCode> for InstructionAbortReason {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
