@@ -41,6 +41,7 @@ vpci.workspace = true
 guid = { workspace = true, features = ["getrandom"] }
 mesh.workspace = true
 task_control.workspace = true
+vmbus_channel = { workspace = true, features = ["test_helpers"] }
 
 [lints]
 workspace = true
