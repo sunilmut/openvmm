@@ -2,6 +2,9 @@
 // Licensed under the MIT License.
 
 use async_trait::async_trait;
+
+mod buffer_tests;
+mod device_tests;
 use guestmem::GuestMemory;
 use inspect::InspectMut;
 use net_backend::ETHERNET_HEADER_LEN;
@@ -115,12 +118,30 @@ impl Default for TxAvailBehavior {
 
 // --- MockQueue ---
 
+#[derive(Clone, Copy, Default)]
+enum RxWriteMode {
+    #[default]
+    Packet,
+    Segments,
+    Incomplete,
+}
+
+#[derive(Debug)]
+struct RxBufferInfo {
+    id: RxId,
+    capacity: u32,
+    segments: Vec<(u64, u32)>,
+    prefix: Option<u8>,
+}
+
 struct MockQueue {
     tx_avail_behavior: Arc<Mutex<TxAvailBehavior>>,
     tx_avail_log: Arc<Mutex<Vec<Vec<TxSegmentInfo>>>>,
     tx_completions: Arc<Mutex<VecDeque<Vec<TxId>>>>,
     rx_pending: Arc<Mutex<VecDeque<RxId>>>,
     rx_ready: Arc<Mutex<VecDeque<(RxId, Vec<u8>, RxMetadata, bool)>>>,
+    rx_write_mode: Arc<Mutex<RxWriteMode>>,
+    rx_buffer_info: Arc<Mutex<Vec<RxBufferInfo>>>,
     ready_waker: Arc<Mutex<Option<Waker>>>,
     rx_avail_notify: mesh::Sender<()>,
     tx_avail_notify: mesh::Sender<()>,
@@ -153,7 +174,26 @@ impl net_backend::Queue for MockQueue {
         Poll::Pending
     }
 
-    fn rx_avail(&mut self, _pool: &mut dyn net_backend::BufferAccess, done: &[RxId]) {
+    fn rx_avail(&mut self, pool: &mut dyn net_backend::BufferAccess, done: &[RxId]) {
+        for &id in done {
+            let mut segments = Vec::new();
+            pool.push_guest_addresses(id, &mut segments);
+            let mut prefix = [0];
+            let prefix = pool
+                .guest_memory()
+                .read_at(segments[0].gpa, &mut prefix)
+                .ok()
+                .map(|_| prefix[0]);
+            self.rx_buffer_info.lock().push(RxBufferInfo {
+                id,
+                capacity: pool.capacity(id),
+                segments: segments
+                    .into_iter()
+                    .map(|segment| (segment.gpa, segment.len))
+                    .collect(),
+                prefix,
+            });
+        }
         self.rx_pending.lock().extend(done.iter().copied());
         for _ in done {
             self.rx_avail_notify.send(());
@@ -173,7 +213,18 @@ impl net_backend::Queue for MockQueue {
                 pool.write_header(rx_id, &metadata);
                 pool.write_data(rx_id, &data);
             } else {
-                pool.write_packet(rx_id, &metadata, &data);
+                match *self.rx_write_mode.lock() {
+                    RxWriteMode::Packet => pool.write_packet(rx_id, &metadata, &data),
+                    RxWriteMode::Segments => {
+                        let split = data.len() / 2;
+                        pool.write_packet_segments(
+                            rx_id,
+                            &metadata,
+                            &[&data[..split], &[], &data[split..]],
+                        );
+                    }
+                    RxWriteMode::Incomplete => {}
+                }
             }
             *packet = rx_id;
         }
@@ -240,6 +291,8 @@ struct MockQueueHandle {
     tx_completions: Arc<Mutex<VecDeque<Vec<TxId>>>>,
     rx_pending: Arc<Mutex<VecDeque<RxId>>>,
     rx_ready: Arc<Mutex<VecDeque<(RxId, Vec<u8>, RxMetadata, bool)>>>,
+    rx_write_mode: Arc<Mutex<RxWriteMode>>,
+    rx_buffer_info: Arc<Mutex<Vec<RxBufferInfo>>>,
     ready_waker: Arc<Mutex<Option<Waker>>>,
     rx_avail_notify: mesh::Receiver<()>,
     tx_avail_notify: mesh::Receiver<()>,
@@ -363,6 +416,8 @@ fn new_mock_queue() -> (MockQueue, MockQueueHandle) {
     let tx_completions = Arc::new(Mutex::new(VecDeque::new()));
     let rx_pending = Arc::new(Mutex::new(VecDeque::new()));
     let rx_ready = Arc::new(Mutex::new(VecDeque::new()));
+    let rx_write_mode = Arc::new(Mutex::new(RxWriteMode::default()));
+    let rx_buffer_info = Arc::new(Mutex::new(Vec::new()));
     let ready_waker = Arc::new(Mutex::new(None));
     let (rx_avail_tx, rx_avail_rx) = mesh::channel();
     let (tx_avail_tx, tx_avail_rx) = mesh::channel();
@@ -373,6 +428,8 @@ fn new_mock_queue() -> (MockQueue, MockQueueHandle) {
         tx_completions: tx_completions.clone(),
         rx_pending: rx_pending.clone(),
         rx_ready: rx_ready.clone(),
+        rx_write_mode: rx_write_mode.clone(),
+        rx_buffer_info: rx_buffer_info.clone(),
         ready_waker: ready_waker.clone(),
         rx_avail_notify: rx_avail_tx,
         tx_avail_notify: tx_avail_tx,
@@ -383,6 +440,8 @@ fn new_mock_queue() -> (MockQueue, MockQueueHandle) {
         tx_completions,
         rx_pending,
         rx_ready,
+        rx_write_mode,
+        rx_buffer_info,
         ready_waker,
         rx_avail_notify: rx_avail_rx,
         tx_avail_notify: tx_avail_rx,
