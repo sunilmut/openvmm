@@ -527,3 +527,89 @@ async fn reset_and_configuration_failures_are_reported_in_registers(driver: Defa
         .unwrap();
     assert_eq!(spec::Csts::from(register(&mut c.device, 0x1c)).shst(), 2);
 }
+
+// Test: Submit the same command ID on two submission queues sharing one
+//       completion queue, then reuse that ID for reads after both writes finish.
+// Expected: Completions identify both submission queues, and each read returns
+//       its own sector's data without cross-queue command or buffer confusion.
+#[async_test]
+async fn shared_completion_queue_preserves_submission_identity(driver: DefaultDriver) {
+    let mut c = Controller::new(driver.clone()).await;
+    c.device
+        .client()
+        .add_namespace(1, ram_disk(4096, false).unwrap())
+        .await
+        .unwrap();
+    c.send(create_cq(1, 7, true, 1), spec::Status::SUCCESS)
+        .await;
+    let queues = [
+        (1u16, 0x5000u64, 0x8000u64, 0x37),
+        (2, 0x6000, 0x9000, 0xb9),
+    ];
+    for (qid, address, _, _) in queues {
+        let mut cmd = create_sq(qid, 1, 7, true);
+        cmd.dptr[0] = address;
+        c.send(cmd, spec::Status::SUCCESS).await;
+    }
+
+    for (slot, opcode) in [spec::nvm::NvmOpcode::WRITE, spec::nvm::NvmOpcode::READ]
+        .into_iter()
+        .enumerate()
+    {
+        for (qid, address, buffer, value) in queues {
+            c.mem
+                .fill_at(
+                    buffer,
+                    if opcode == spec::nvm::NvmOpcode::WRITE {
+                        value
+                    } else {
+                        0xa5
+                    },
+                    512,
+                )
+                .unwrap();
+            let mut cmd = spec::Command::new_zeroed();
+            cmd.cdw0.set_opcode(opcode.0);
+            cmd.cdw0.set_cid(42);
+            cmd.nsid = 1;
+            cmd.dptr[0] = buffer;
+            cmd.cdw10 = u32::from(qid - 1);
+            c.mem
+                .write_plain(address + (slot * size_of::<spec::Command>()) as u64, &cmd)
+                .unwrap();
+            c.device
+                .write_bar0(0x1000 + u64::from(qid) * 8, (slot as u32 + 1).as_bytes())
+                .unwrap();
+        }
+
+        let mut completed = Vec::new();
+        for index in slot * 2..slot * 2 + 2 {
+            let mut backoff = user_driver::backoff::Backoff::new(&driver);
+            let mut completion = None;
+            for _ in 0..100 {
+                let entry: spec::Completion = c
+                    .mem
+                    .read_plain(0x4000 + (index * size_of::<spec::Completion>()) as u64)
+                    .unwrap();
+                if entry.status.phase() {
+                    completion = Some(entry);
+                    break;
+                }
+                backoff.back_off().await;
+            }
+            let entry = completion.expect("shared completion queue did not complete both commands");
+            assert_eq!(entry.cid, 42);
+            assert_eq!(entry.status.status(), spec::Status::SUCCESS.0);
+            assert_eq!(entry.sqhd, slot as u16 + 1);
+            completed.push(entry.sqid);
+        }
+        completed.sort_unstable();
+        assert_eq!(completed, [1, 2]);
+        c.device
+            .write_bar0(0x100c, (slot as u32 * 2 + 2).as_bytes())
+            .unwrap();
+    }
+    for (_, _, buffer, value) in queues {
+        assert_eq!(c.mem.read_plain::<[u8; 512]>(buffer).unwrap(), [value; 512]);
+    }
+}
