@@ -299,3 +299,6 @@ impl<T: 'static + Send> RpcSend for &mesh_channel_core::Sender<T> {
         self.send(message);
     }
 }
+
+#[cfg(test)]
+mod tests;

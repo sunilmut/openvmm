@@ -467,4 +467,41 @@ mod tests {
         read.read_to_end(&mut b).await.unwrap();
         assert_eq!(b.as_slice(), b"hello world!");
     }
+
+    // Test: Exhaust the byte quota, drain the pipe, and send another message.
+    // Expected: Full writes report WouldBlock; draining restores capacity and order.
+    #[async_test]
+    async fn nonblocking_byte_backpressure_recovers() {
+        let (mut reader, mut writer) = pipe();
+        let payload = vec![0x5a; 131072];
+        let written = writer.write_nonblocking(&payload).unwrap();
+        assert!(written > 0 && written < payload.len());
+        assert_eq!(
+            writer.write_nonblocking(b"tail").unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let mut received = vec![0; written];
+        reader.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, payload[..written]);
+        assert_eq!(writer.write_nonblocking(b"tail").unwrap(), 4);
+        writer.close().await.unwrap();
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(remaining, b"tail");
+    }
+
+    // Test: Drop the reader while retaining a pending write to a full pipe.
+    // Expected: That blocked write completes with BrokenPipe rather than hanging.
+    #[async_test]
+    async fn reader_drop_releases_blocked_writer() {
+        let (reader, mut writer) = pipe();
+        writer.write_nonblocking(&vec![0x5a; 131072]).unwrap();
+        let mut pending = std::pin::pin!(writer.write(b"tail"));
+        assert!(pending.as_mut().now_or_never().is_none());
+        drop(reader);
+        assert_eq!(
+            pending.await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
+    }
 }

@@ -384,4 +384,35 @@ mod tests {
             assert_eq!(c.get(), i);
         }
     }
+
+    // Test: Transfer cells and their updater, mutate one cell, then drop subscribers.
+    // Expected: Local edits stay local, remote updates reach both cells, and cleanup
+    //           leaves the updater usable for newly created cells.
+    #[async_test]
+    async fn serialized_cells_and_updater_preserve_update_behavior() {
+        use futures::FutureExt;
+        use mesh_node::resource::SerializedMessage;
+        let (updater, cell) = super::cell(5u32);
+        let clone = cell.clone();
+        cell.with_mut(|value| *value = 7);
+        assert_eq!(cell.get(), 7);
+        assert_eq!(clone.get(), 5);
+        assert_eq!(*updater.get(), 5);
+        let mut moved: super::Cell<u32> = SerializedMessage::from_message(clone)
+            .into_message()
+            .unwrap();
+        let mut updater: CellUpdater<u32> = SerializedMessage::from_message(updater)
+            .into_message()
+            .unwrap();
+        assert!(moved.wait_next().now_or_never().is_none());
+        updater.set(9).await;
+        moved.wait_next().await;
+        assert_eq!(moved.get(), 9);
+        assert_eq!(cell.get(), 9);
+        drop(cell);
+        drop(moved);
+        updater.set(11).await;
+        assert_eq!(*updater.get(), 11);
+        assert_eq!(updater.cell().get(), 11);
+    }
 }

@@ -586,4 +586,102 @@ mod tests {
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_nanos(1_500_000_000),
         ));
     }
+
+    // Test: Run successful and failing operations under a live cancellation context.
+    // Expected: Original values and errors survive without cancelling the context.
+    #[async_test]
+    async fn operation_results_survive_cancellation_wrappers() {
+        let mut context = CancelContext::default();
+        assert_eq!(context.until_cancelled(async { 42 }).await, Ok(42));
+        assert_eq!(
+            context
+                .until_cancelled_failable(async { Ok::<_, &str>(7) })
+                .await
+                .unwrap(),
+            7
+        );
+        assert!(matches!(
+            context
+                .until_cancelled_failable(async { Err::<u32, _>("operation failed") })
+                .await,
+            Err(super::ErrorOrCancelled::Error("operation failed"))
+        ));
+        assert!(!context.is_cancelled());
+    }
+
+    // Test: Drop a notifier and clone the already-cancelled child context.
+    // Expected: All children stay cancelled and pending operations return that reason.
+    #[async_test]
+    async fn dropped_notifier_cancels_operations_and_later_children() {
+        let (mut context, cancel) = CancelContext::new().with_cancel();
+        assert!(!context.is_cancelled());
+        drop(cancel);
+        assert!(context.is_cancelled());
+        assert_eq!(
+            context.until_cancelled(std::future::pending::<()>()).await,
+            Err(CancelReason::Cancelled)
+        );
+        assert!(matches!(
+            context
+                .until_cancelled_failable(std::future::pending::<Result<(), &str>>())
+                .await,
+            Err(super::ErrorOrCancelled::Cancelled(CancelReason::Cancelled))
+        ));
+        let mut clone = context.clone();
+        assert_eq!(clone.cancelled().await, CancelReason::Cancelled);
+        let (mut child, _cancel) = context.with_cancel();
+        assert_eq!(child.cancelled().await, CancelReason::Cancelled);
+    }
+
+    // Test: Add later and earlier child deadlines, including an overflowing timeout.
+    // Expected: The earliest inherited deadline wins and reports DeadlineExceeded.
+    #[async_test]
+    async fn child_deadlines_cannot_extend_parent_deadline() {
+        use std::time::Duration;
+        let expired = Deadline::from(std::time::UNIX_EPOCH);
+        let context = CancelContext::new().with_deadline(expired);
+        assert_eq!(
+            context.with_deadline(Deadline::now()).deadline(),
+            Some(expired)
+        );
+        assert_eq!(
+            context.with_timeout(Duration::MAX).deadline(),
+            Some(expired)
+        );
+        let mut earlier = CancelContext::new()
+            .with_deadline(Deadline::now())
+            .with_deadline(expired);
+        assert_eq!(earlier.deadline(), Some(expired));
+        assert_eq!(earlier.cancelled().await, CancelReason::DeadlineExceeded);
+    }
+
+    // Test: Add, compare, and subtract deadlines with and without monotonic clocks.
+    // Expected: Exact durations survive and negative differences saturate at zero.
+    #[test]
+    fn deadline_arithmetic_preserves_clock_semantics() {
+        use std::time::Duration;
+        let now = Deadline::now();
+        let later = now + Duration::from_secs(3);
+        assert!(now.instant().is_some());
+        assert_eq!(later - now, Duration::from_secs(3));
+        assert_eq!(now - later, Duration::ZERO);
+        assert_eq!(later - Duration::from_secs(3), now);
+        assert_eq!(
+            later
+                .system_time()
+                .duration_since(now.system_time())
+                .unwrap(),
+            Duration::from_secs(3)
+        );
+        let wall = Deadline::from(now.system_time());
+        assert!(wall.instant().is_none());
+        assert_eq!(wall, now);
+        assert!(wall < later);
+        assert_eq!(
+            (wall + Duration::from_secs(3)) - wall,
+            Duration::from_secs(3)
+        );
+        assert_eq!(wall - (wall + Duration::from_secs(3)), Duration::ZERO);
+        assert!(wall.checked_add(Duration::MAX).is_none());
+    }
 }

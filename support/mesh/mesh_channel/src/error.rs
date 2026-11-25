@@ -113,3 +113,46 @@ impl std::error::Error for DecodedError {
 
 /// Alias for a [`Result`] with a [`RemoteError`] error.
 pub type RemoteResult<T> = Result<T, RemoteError>;
+
+#[cfg(test)]
+mod tests {
+    use super::RemoteError;
+    use mesh_node::resource::SerializedMessage;
+    use std::error::Error;
+    use test_with_tracing::test;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("{message}")]
+    struct Layer {
+        message: &'static str,
+        #[source]
+        source: Box<dyn Error + Send + Sync>,
+    }
+
+    // Test: Serialize a multi-level error twice through the remote-error API.
+    // Expected: Both hops preserve every error message and source in order.
+    #[test]
+    fn remote_errors_preserve_source_chains_across_hops() {
+        let mut remote = RemoteError::new(Layer {
+            message: "request failed",
+            source: Box::new(Layer {
+                message: "disk failed",
+                source: Box::new(std::io::Error::other("offline")),
+            }),
+        });
+        for _ in 0..2 {
+            remote = SerializedMessage::from_message(remote)
+                .into_message()
+                .unwrap();
+            let mut error: &dyn Error = &remote;
+            for expected in ["request failed", "disk failed", "offline"] {
+                assert_eq!(error.to_string(), expected);
+                if expected == "offline" {
+                    assert!(error.source().is_none());
+                } else {
+                    error = error.source().unwrap();
+                }
+            }
+        }
+    }
+}

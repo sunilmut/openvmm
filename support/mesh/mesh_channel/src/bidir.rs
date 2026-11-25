@@ -360,4 +360,55 @@ mod tests {
             Poll::Ready(Err(RecvError::Closed))
         );
     }
+
+    // Test: Convert a queued channel to a raw port and a wire-compatible type.
+    // Expected: Queued values, reverse replies, and closure remain observable.
+    #[test]
+    fn port_and_type_conversions_preserve_queued_messages() {
+        #[derive(Debug, mesh_protobuf::Protobuf)]
+        struct Number32(u32);
+        #[derive(Debug, mesh_protobuf::Protobuf)]
+        struct Number64(u64);
+        let (mut sender, receiver) = Channel::<Number32, Number32>::new_pair();
+        assert!(matches!(sender.try_recv(), Err(super::TryRecvError::Empty)));
+        sender.send(Number32(u32::MAX));
+        let port: mesh_node::local_node::Port = receiver.into();
+        let receiver = Channel::<Number32, Number32>::from(port);
+        let mut receiver = receiver.change_types::<Number64, Number64>();
+        assert_eq!(receiver.try_recv().unwrap().0, u32::MAX as u64);
+        receiver.send(Number64(123));
+        assert_eq!(sender.try_recv().unwrap().0, 123);
+        sender.send_and_close(Number32(7));
+        assert!(receiver.is_peer_closed());
+        assert_eq!(receiver.try_recv().unwrap().0, 7);
+        let mut context = Context::from_waker(Waker::noop());
+        assert_matches!(
+            receiver.poll_recv(&mut context),
+            Poll::Ready(Err(RecvError::Closed))
+        );
+        assert!(receiver.is_queue_drained());
+    }
+
+    // Test: Bridge two endpoint pairs that already have queued messages.
+    // Expected: Both directions preserve old and new messages and propagate closure.
+    #[test]
+    fn bridging_preserves_queued_and_later_messages() {
+        let (mut first, first_bridge) = Channel::<u32, u32>::new_pair();
+        let (second_bridge, mut second) = Channel::<u32, u32>::new_pair();
+        first.send(7);
+        second.send(11);
+        first_bridge.bridge(second_bridge);
+        assert_eq!(first.try_recv().unwrap(), 11);
+        assert_eq!(second.try_recv().unwrap(), 7);
+        first.send(13);
+        second.send(17);
+        assert_eq!(first.try_recv().unwrap(), 17);
+        assert_eq!(second.try_recv().unwrap(), 13);
+        drop(first);
+        assert!(second.is_peer_closed());
+        assert!(matches!(
+            second.try_recv(),
+            Err(super::TryRecvError::Closed)
+        ));
+    }
 }
