@@ -1357,6 +1357,7 @@ fn ring_free(size: u32, inp: u32, outp: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
 
     fn write_simple<T: RingMem>(out_ring: &mut OutgoingRing<T>, buf: &[u8]) -> Option<bool> {
         let mut outgoing = out_ring.outgoing().unwrap();
@@ -1501,5 +1502,46 @@ mod tests {
             err,
             ReadError::Corrupt(Error::InvalidDescriptorLengths)
         ));
+    }
+
+    // Test: Repeatedly send differently sized packets across the ring boundary.
+    // Expected: Every packet retains its payload and the ring is empty after reading.
+    #[test]
+    fn wrapped_packets_preserve_payloads() {
+        let memory = FlatRingMem::new(4096);
+        let mut reader = IncomingRing::new(&memory).unwrap();
+        let mut writer = OutgoingRing::new(&memory).unwrap();
+
+        for sequence in 0..64u8 {
+            for size in [8, 80, 4000] {
+                let payload = vec![sequence; size];
+                assert!(write_simple(&mut writer, &payload).is_some());
+                assert_eq!(read_simple(&mut reader).0, payload);
+                assert!(!reader.can_read(&mut reader.incoming().unwrap()).unwrap());
+            }
+        }
+    }
+
+    // Test: Read a packet speculatively, revert the read, and consume it again.
+    // Expected: Reverting preserves the packet; committing removes it exactly once.
+    #[test]
+    fn reverted_read_preserves_packet() {
+        let memory = FlatRingMem::new(4096);
+        let reader = IncomingRing::new(&memory).unwrap();
+        let mut writer = OutgoingRing::new(&memory).unwrap();
+        let payload = [0x5a; 32];
+        write_simple(&mut writer, &payload).unwrap();
+        let mut incoming = reader.incoming().unwrap();
+
+        for _attempt in 0..2 {
+            let packet = reader.read(&mut incoming).unwrap();
+            assert_eq!(packet.payload.reader(&reader).read_all().unwrap(), payload);
+            incoming.revert();
+        }
+
+        let packet = reader.read(&mut incoming).unwrap();
+        assert_eq!(packet.payload.reader(&reader).read_all().unwrap(), payload);
+        reader.commit_read(&mut incoming);
+        assert!(matches!(reader.read(&mut incoming), Err(ReadError::Empty)));
     }
 }
