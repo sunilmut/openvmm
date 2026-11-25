@@ -428,3 +428,37 @@ fn detaching_wakes_readers_waiting_for_eof() {
     assert!(count.0.load(Ordering::SeqCst) > 0);
     assert_eq!(ready(Pin::new(&mut io).poll_read(&mut cx, &mut [0])), 0);
 }
+
+// Test: Transfer a serial backend after a short read and a partial write.
+// Expected: The new adapter receives unread bytes and sends only the unwritten
+//       suffix; the old adapter cannot consume or send any more data.
+#[test]
+fn backend_handoff_preserves_unread_input_and_partial_write_progress() {
+    let (mut original, detacher) = detachable(Backend::new(Response::Data));
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut prefix = [0xaa; 3];
+    assert_eq!(
+        ready(Pin::new(&mut original).poll_read(&mut cx, &mut prefix)),
+        3
+    );
+    assert_eq!(&prefix, b"abc");
+    let output = b"123456";
+    let accepted = ready(Pin::new(&mut original).poll_write(&mut cx, output));
+    assert_eq!(accepted, 3);
+
+    let mut replacement = Connected::new(detacher.detach());
+    disconnected(&mut original);
+    let mut suffix = [0xaa; 8];
+    assert_eq!(
+        ready(Pin::new(&mut replacement).poll_read(&mut cx, &mut suffix)),
+        5
+    );
+    assert_eq!(&suffix[..5], b"defgh");
+    assert_eq!(&suffix[5..], &[0xaa; 3]);
+    assert_eq!(
+        ready(Pin::new(&mut replacement).poll_write(&mut cx, &output[accepted..])),
+        3
+    );
+    ready(Pin::new(&mut replacement).poll_flush(&mut cx));
+    assert_eq!(replacement.into_inner().output, output);
+}
