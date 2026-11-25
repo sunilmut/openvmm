@@ -391,6 +391,8 @@ mod tests {
     use vmbus_channel::test_helpers::stop_with_timeout;
     use vmbus_channel::test_helpers::with_timeout;
 
+    mod behavior_tests;
+
     struct Worker<M: RingMem> {
         device: GuestCrashDevice,
         channel: GuestCrashChannel<M>,
