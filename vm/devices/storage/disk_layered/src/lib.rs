@@ -987,12 +987,16 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::btree_map::Entry;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     #[derive(Inspect)]
     #[inspect(skip)]
     struct TestLayer {
         sectors: Mutex<BTreeMap<u64, Data>>,
         sector_count: u64,
+        sector_size: u32,
+        flushes: AtomicUsize,
     }
 
     impl TestLayer {
@@ -1000,6 +1004,8 @@ mod tests {
             Self {
                 sectors: Mutex::new(BTreeMap::new()),
                 sector_count,
+                sector_size: 512,
+                flushes: AtomicUsize::new(0),
             }
         }
     }
@@ -1016,7 +1022,7 @@ mod tests {
         }
 
         fn sector_size(&self) -> u32 {
-            512
+            self.sector_size
         }
 
         fn disk_id(&self) -> Option<[u8; 16]> {
@@ -1036,6 +1042,7 @@ mod tests {
         }
 
         async fn sync_cache(&self) -> Result<(), disk_backend::DiskError> {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -1105,6 +1112,14 @@ mod tests {
 
         fn write_no_overwrite(&self) -> Option<impl WriteNoOverwrite> {
             Some(self)
+        }
+
+        async fn wait_resize(&self, sector_count: u64) -> u64 {
+            if self.sector_count == sector_count {
+                std::future::pending().await
+            } else {
+                self.sector_count
+            }
         }
     }
 
@@ -1354,4 +1369,6 @@ mod tests {
             );
         }
     }
+
+    mod behavior;
 }
