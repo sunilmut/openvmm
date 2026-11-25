@@ -46,3 +46,6 @@ fn cvt(r: c_int) -> Result<c_int, ErrorStack> {
         Ok(r)
     }
 }
+
+#[cfg(test)]
+mod tests;
