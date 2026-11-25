@@ -3265,4 +3265,8 @@ mod tests {
         // New offer should come through.
         connection.offer_recv.next().await.unwrap();
     }
+
+    mod behavior;
+    mod channel_driver;
+    mod filters;
 }

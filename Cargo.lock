@@ -10854,6 +10854,7 @@ dependencies = [
  "tracelimit",
  "tracing",
  "user_driver",
+ "user_driver_emulated_mock",
  "vmbus_async",
  "vmbus_channel",
  "vmbus_core",

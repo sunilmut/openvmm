@@ -31,6 +31,7 @@ zerocopy.workspace = true
 [dev-dependencies]
 pal_async.workspace = true
 test_with_tracing.workspace = true
+user_driver_emulated_mock.workspace = true
 
 getrandom.workspace = true
 
