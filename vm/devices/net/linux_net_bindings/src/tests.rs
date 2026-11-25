@@ -138,3 +138,42 @@ fn tun_filter_tail_pointers_identify_adjacent_mac_storage() {
         [[0, 1, 2, 3, 4, 5], [0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54]]
     );
 }
+
+// Test: Read and mutate a counted TUN MAC-filter tail with an adjacent guard address.
+// Expected: Slice helpers expose exactly the counted addresses, update the selected MAC in place, and preserve the header/guard.
+#[test]
+fn tun_filter_counted_tail_slices_preserve_header_and_adjacent_storage() {
+    #[repr(C)]
+    struct FilterBuffer {
+        header: tun::tun_filter,
+        addresses: [[u8; 6]; 3],
+    }
+    let first = [0x01, 0x00, 0x5e, 0x00, 0x00, 0x01];
+    let second = [0x33, 0x33, 0x00, 0x00, 0x00, 0x02];
+    let replacement = [0x01, 0x00, 0x5e, 0x7f, 0x12, 0x34];
+    let guard = [0xcc; 6];
+    let mut buffer = FilterBuffer {
+        header: tun::tun_filter {
+            flags: 1,
+            count: 2,
+            addr: tun::__IncompleteArrayField::new(),
+        },
+        addresses: [first, second, guard],
+    };
+    // SAFETY: The repr(C) tail immediately follows the header, has three live MAC slots,
+    // and both requested slices are limited to two slots with exclusive access for mutation.
+    unsafe {
+        let addresses = buffer
+            .header
+            .addr
+            .as_slice(usize::from(buffer.header.count));
+        assert_eq!(addresses, &[first, second]);
+        let addresses = buffer
+            .header
+            .addr
+            .as_mut_slice(usize::from(buffer.header.count));
+        addresses[1] = replacement;
+    }
+    assert_eq!(buffer.addresses, [first, replacement, guard]);
+    assert_eq!((buffer.header.flags, buffer.header.count), (1, 2));
+}
