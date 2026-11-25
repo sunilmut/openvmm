@@ -1438,4 +1438,6 @@ mod tests {
         assert_ne!(lsr & 0x20, 0, "THR should be empty with debugger relay");
         assert_ne!(lsr & 0x40, 0, "TSR should be empty with debugger relay");
     }
+
+    mod behavior;
 }
