@@ -1770,6 +1770,8 @@ impl MmioIntercept for AmdIommuDevice {
 
 #[cfg(test)]
 mod tests {
+    mod behavior_tests;
+
     use super::*;
     use guestmem::GuestMemory;
     use pci_core::bus_range::AssignedBusRange;
