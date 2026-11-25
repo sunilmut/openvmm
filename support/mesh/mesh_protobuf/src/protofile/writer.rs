@@ -477,7 +477,14 @@ impl OneofDescriptor<'_> {
 #[cfg(test)]
 mod tests {
     use super::DescriptorWriter;
+    use super::io::ErrorKind;
     use crate::Protobuf;
+    use crate::protofile::FieldDescriptor;
+    use crate::protofile::FieldType;
+    use crate::protofile::MessageDescription;
+    use crate::protofile::MessageDescriptor;
+    use crate::protofile::OneofDescriptor;
+    use crate::protofile::TopLevelDescriptor;
     use crate::protofile::message_description;
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -485,6 +492,7 @@ mod tests {
     use expect_test::expect;
     use std::collections::HashMap;
     use std::io::Write;
+    use test_with_tracing::test;
 
     /// Comment on this guy.
     #[derive(Protobuf)]
@@ -646,5 +654,148 @@ mod tests {
             }
         "#]);
         expected.assert_eq(&s);
+    }
+
+    // Test: Build a schema dynamically with maps, optional values, and nested types.
+    // Expected: Legal maps use map syntax; non-scalar keys use repeated entry messages.
+    #[test]
+    fn dynamic_descriptors_preserve_map_and_nested_shapes() {
+        let scalar = FieldType::builtin("uint32");
+        let map_pair = [scalar, FieldType::builtin("string")];
+        let fallback_pair = [FieldType::builtin("bytes"), scalar.optional()];
+        let tuple = [scalar, FieldType::builtin("string")];
+        let fields = [
+            FieldDescriptor::new("", FieldType::map(&map_pair), "names", 1),
+            FieldDescriptor::new("", FieldType::map(&fallback_pair), "fallback", 2),
+            FieldDescriptor::new("", FieldType::tuple(&tuple), "pair", 3),
+            FieldDescriptor::new("", scalar.repeated().annotate("values"), "list", 4),
+            FieldDescriptor::new("", FieldType::local("Nested"), "nested", 5),
+        ];
+        let variants = [FieldDescriptor::new("", scalar, "number", 6)];
+        let oneofs = [OneofDescriptor::new("choice", &variants)];
+        let nested = [MessageDescriptor::new("Nested", "", &[], &[], &[])];
+        let message = MessageDescriptor::new("Root", "Schema", &fields, &oneofs, &nested);
+        let root = TopLevelDescriptor::message("dynamic", &message);
+        let description = MessageDescription::Internal(&root);
+        let output = BorrowedWriter(RefCell::new(Vec::new()));
+        let mut writer = DescriptorWriter::new([&description]);
+        writer.file_heading("// Generated for compatibility tests\n");
+        writer
+            .write(|name| {
+                assert_eq!(name, "dynamic.proto");
+                Ok(&output)
+            })
+            .unwrap();
+        let output = String::from_utf8(output.0.into_inner()).unwrap();
+        assert!(output.starts_with("// Generated for compatibility tests\n"));
+        for expected in [
+            "map<uint32, string> names = 1;",
+            "repeated Fallback fallback = 2;",
+            "bytes key = 1;",
+            "optional uint32 value = 2;",
+            "Pair pair = 3;",
+            "uint32 field1 = 1;",
+            "string field2 = 2;",
+            "repeated uint32 list = 4; // values",
+            "Nested nested = 5;",
+            "message Nested {",
+            "oneof choice {",
+            "uint32 number = 6;",
+        ] {
+            assert!(
+                output.contains(expected),
+                "missing {expected} in:\n{output}"
+            );
+        }
+    }
+
+    // Test: Describe single-value tuple fields for each supported wrapper type.
+    // Expected: They refer to standard protobuf wrappers and share one import.
+    #[test]
+    fn scalar_tuples_use_well_known_wrapper_messages() {
+        let types = [
+            ("double", "DoubleValue"),
+            ("float", "FloatValue"),
+            ("int64", "Int64Value"),
+            ("uint64", "UInt64Value"),
+            ("int32", "Int32Value"),
+            ("uint32", "UInt32Value"),
+            ("bool", "BoolValue"),
+            ("string", "StringValue"),
+            ("bytes", "BytesValue"),
+        ];
+        let tuples: Vec<_> = types
+            .iter()
+            .map(|(name, _)| [FieldType::builtin(name)])
+            .collect();
+        let fields: Vec<_> = tuples
+            .iter()
+            .enumerate()
+            .map(|(index, tuple)| {
+                FieldDescriptor::new(
+                    "",
+                    FieldType::tuple(tuple),
+                    types[index].0,
+                    index as u32 + 1,
+                )
+            })
+            .collect();
+        let message = MessageDescriptor::new("Wrappers", "", &fields, &[], &[]);
+        let root = TopLevelDescriptor::message("wrappers", &message);
+        let output = BorrowedWriter(RefCell::new(Vec::new()));
+        DescriptorWriter::new([&MessageDescription::Internal(&root)])
+            .write(|_| Ok(&output))
+            .unwrap();
+        let output = String::from_utf8(output.0.into_inner()).unwrap();
+        for (index, (name, wrapper)) in types.iter().enumerate() {
+            let expected = alloc::format!(".google.protobuf.{wrapper} {name} = {};", index + 1);
+            assert!(
+                output.contains(&expected),
+                "missing {expected} in:\n{output}"
+            );
+        }
+        assert_eq!(
+            output
+                .matches("import \"google/protobuf/wrappers.proto\";")
+                .count(),
+            1
+        );
+    }
+
+    // Test: Have the output factory fail before opening a schema file.
+    // Expected: Descriptor writing returns the original IO error to its caller.
+    #[test]
+    fn output_factory_errors_are_propagated() {
+        let error = DescriptorWriter::new(&[message_description::<Foo>()])
+            .write::<Vec<u8>>(|_| Err(ErrorKind::PermissionDenied.into()))
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::PermissionDenied);
+    }
+
+    // Test: Write schema files under a directory that does not exist yet.
+    // Expected: Directories are created and file contents match in-memory output.
+    #[test]
+    fn schema_files_match_in_memory_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("nested").join("schemas");
+        let descriptions = [message_description::<Foo>()];
+        let writer = DescriptorWriter::new(&descriptions);
+        let paths = writer.write_to_path(&root).unwrap();
+        assert_eq!(paths, [root.join("test.proto")]);
+        let expected = BorrowedWriter(RefCell::new(Vec::new()));
+        writer.write(|_| Ok(&expected)).unwrap();
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), expected.0.into_inner());
+    }
+
+    // Test: Attempt to write a schema under an existing regular file.
+    // Expected: The filesystem error is returned instead of reporting success.
+    #[test]
+    fn schema_file_creation_errors_are_returned() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(
+            DescriptorWriter::new(&[message_description::<Foo>()])
+                .write_to_path(file.path())
+                .is_err()
+        );
     }
 }

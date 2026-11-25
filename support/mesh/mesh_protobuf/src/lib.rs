@@ -1885,4 +1885,6 @@ mod tests {
         let result: Switchy = decode(&combined).unwrap();
         assert_eq!(result, Switchy::Str("hello".to_owned()));
     }
+
+    mod compatibility;
 }

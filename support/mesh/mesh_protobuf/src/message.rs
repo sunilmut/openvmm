@@ -160,6 +160,7 @@ mod tests {
     use crate::tests::as_expect_str;
     use expect_test::expect;
     use std::println;
+    use test_with_tracing::test;
 
     #[test]
     fn test_message() {
@@ -205,5 +206,49 @@ mod tests {
         assert!(!any.is_message::<Other>());
         assert_eq!(any.parse::<Message>().unwrap(), msg);
         println!("{:?}", any.parse::<Other>().unwrap_err());
+    }
+
+    // Test: Merge an opaque message and decode it as its wire-compatible schema.
+    // Expected: New fields combine with existing fields without discarding either.
+    #[test]
+    fn opaque_messages_retain_fields_when_merged() {
+        let original = ProtobufMessage::new((7u32,));
+        let additional = encode(ProtobufMessage::new((
+            0u32,
+            alloc::string::String::from("label"),
+        )));
+        let merged = crate::merge(original, &additional).unwrap();
+        assert_eq!(
+            merged.parse::<(u32, alloc::string::String)>().unwrap(),
+            (7, "label".into())
+        );
+    }
+
+    // Test: Parse Any values with canonical, HTTPS-prefixed, and mismatched type URLs.
+    // Expected: Both supported URL spellings parse; unrelated types are rejected.
+    #[test]
+    fn any_type_urls_are_checked_before_payload_decoding() {
+        #[derive(Protobuf, Debug, PartialEq, Eq)]
+        #[mesh(package = "sample")]
+        struct Record {
+            #[mesh(1)]
+            value: u32,
+        }
+
+        for (url, accepted) in [
+            ("type.googleapis.com/sample.Record", true),
+            ("https://type.googleapis.com/sample.Record", true),
+            ("type.googleapis.com/other.Record", false),
+            ("sample.Record", false),
+        ] {
+            let bytes = encode((url, ProtobufMessage::new(Record { value: 17 })));
+            let any: ProtobufAny = crate::decode(&bytes).unwrap();
+            assert_eq!(any.is_message::<Record>(), accepted);
+            if accepted {
+                assert_eq!(any.parse::<Record>().unwrap(), Record { value: 17 });
+            } else {
+                assert!(any.parse::<Record>().is_err());
+            }
+        }
     }
 }

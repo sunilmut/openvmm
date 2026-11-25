@@ -186,6 +186,7 @@ where
 mod tests {
     use super::write_with;
     use alloc::vec;
+    use test_with_tracing::test;
 
     #[test]
     #[should_panic]
@@ -249,5 +250,36 @@ mod tests {
         });
         assert_eq!(cursor.position(), 100);
         assert_eq!(backing, [0; 4]);
+    }
+
+    // Test: Write both halves of a split buffer, leaving a gap in the first half.
+    // Expected: The gap is zeroed and later writes follow the second half.
+    #[test]
+    fn split_write_zeroes_only_the_gap_before_written_data() {
+        let mut bytes = vec![0xaa];
+        bytes.reserve(16);
+        write_with(&mut bytes, |mut buf| {
+            let result = buf.write_split(4, |mut left, mut right| {
+                write_with(&mut left, |mut nested| nested.append(&[1, 2]));
+                right.append(&[3, 4]);
+                17
+            });
+            assert_eq!(result, 17);
+            buf.push(5);
+        });
+        assert_eq!(bytes, [0xaa, 1, 2, 0, 0, 3, 4, 5]);
+    }
+
+    // Test: Leave the right half of a split buffer completely unwritten.
+    // Expected: No gap is committed; the next byte immediately follows the left.
+    #[test]
+    fn empty_right_split_does_not_extend_the_buffer() {
+        let mut bytes = vec![0xaa];
+        bytes.reserve(16);
+        write_with(&mut bytes, |mut buf| {
+            buf.write_split(4, |mut left, _right| left.push(1));
+            buf.push(2);
+        });
+        assert_eq!(bytes, [0xaa, 1, 2]);
     }
 }
