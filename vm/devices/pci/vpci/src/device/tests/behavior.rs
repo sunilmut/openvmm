@@ -698,3 +698,65 @@ async fn deferred_offers_honor_revocation_and_parent_failures(driver: DefaultDri
     assert!(format!("{err:#}").contains("revoked"));
     assert_eq!(parent.offers.lock().len(), 2);
 }
+
+// Test: Reject a malformed reassignment while a BAR and interrupt are in use.
+// Expected: Existing resources still work, and release permits a new assignment.
+#[async_test]
+async fn rejected_reassignment_preserves_live_resources(driver: DefaultDriver) {
+    let (mut guest, _, controller) = endpoint(&driver, 0x1000);
+    guest.start_device(0x140000000).await;
+    let mut initial = assignment(protocol::MessageType::ASSIGNED_RESOURCES, 0x1000);
+    initial.msi_resource_count = 1;
+    let mut request = initial.as_bytes().to_vec();
+    request.extend_from_slice(protocol::MsiResource::from(descriptor1()).as_bytes());
+    let bytes = exchange(&mut guest, &request).await;
+    let (reply, rest) = protocol::DeviceTranslateReply::read_from_prefix(&bytes).unwrap();
+    assert_eq!(reply.status, protocol::Status::SUCCESS);
+    assert_eq!(reply.msi_resource_count, 1);
+    let interrupt = protocol::MsiResourceRemapped::read_from_prefix(rest)
+        .unwrap()
+        .0;
+    let original = resources(&mut guest).await;
+
+    // The first BAR would change if it were applied before validating BAR one.
+    let mut invalid = assignment(protocol::MessageType::ASSIGNED_RESOURCES, 0x1000);
+    invalid.mmio_resources[0] = memory(0x4000, 0x1000);
+    invalid.mmio_resources[1] = memory(0x3000, 0x1000);
+    assert_eq!(
+        status(&mut guest, invalid.as_bytes()).await,
+        protocol::Status::BAD_DATA
+    );
+    assert_eq!(resources(&mut guest).await.as_bytes(), original.as_bytes());
+    controller.deliver_interrupt(interrupt.address, interrupt.data_payload);
+    let delivered = controller.get_next_interrupt().unwrap();
+    assert_eq!((delivered.vector, delivered.destination), (0x40, 3));
+    assert!(controller.get_next_interrupt().is_none());
+
+    assert_eq!(
+        status(
+            &mut guest,
+            pdo(protocol::MessageType::RELEASE_RESOURCES).as_bytes()
+        )
+        .await,
+        protocol::Status::SUCCESS
+    );
+    controller.deliver_interrupt(interrupt.address, interrupt.data_payload);
+    assert!(controller.get_next_interrupt().is_none());
+
+    let mut retry = assignment(protocol::MessageType::ASSIGNED_RESOURCES, 0x1000);
+    retry.mmio_resources[0] = memory(0x6000, 0x1000);
+    assert_eq!(
+        status(&mut guest, retry.as_bytes()).await,
+        protocol::Status::SUCCESS
+    );
+    let current = resources(&mut guest).await;
+    assert_eq!(
+        current.descriptors[0].as_bytes(),
+        retry.mmio_resources[0].as_bytes()
+    );
+    assert!(
+        current.descriptors[1..]
+            .iter()
+            .all(|resource| resource.adjusted_len == 0)
+    );
+}
