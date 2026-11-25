@@ -113,3 +113,42 @@ fn line_waiter_replacement_and_high_polling_have_exact_wake_semantics() {
     assert_eq!(first.0.load(Ordering::SeqCst), 0);
     assert_eq!(second.0.load(Ordering::SeqCst), 1);
 }
+
+// Test: Repeatedly replace an asserted sharer on a fully shared IRQ while a peer keeps it high.
+// Expected: Removal never loses the peer's assertion; replacements start low and retain independent ownership.
+#[test]
+fn asserted_shared_irq_hot_unplug_preserves_peer_across_repeated_replacement() {
+    let target = TestLineInterruptTarget::new_arc();
+    let root = LineInterrupt::new_with_target("root", target.clone(), 42);
+    let mut shared: Vec<_> = (0..15)
+        .map(|index| root.new_shared(format!("device-{index}")).unwrap())
+        .collect();
+    for generation in 0..600 {
+        let departing = shared.remove(generation % shared.len());
+        departing.set_level(true);
+        root.set_level(true);
+        drop(departing);
+        assert!(target.is_high(42));
+        let replacement = root
+            .new_shared(format!("replacement-{generation}"))
+            .unwrap();
+        root.set_level(false);
+        assert!(!target.is_high(42));
+        replacement.set_level(true);
+        assert!(target.is_high(42));
+        root.set_level(true);
+        replacement.set_level(false);
+        assert!(target.is_high(42));
+        root.set_level(false);
+        assert!(!target.is_high(42));
+        shared.push(replacement);
+    }
+    for source in &shared {
+        source.set_level(true);
+    }
+    for source in shared {
+        assert!(target.is_high(42));
+        drop(source);
+    }
+    assert!(!target.is_high(42));
+}
