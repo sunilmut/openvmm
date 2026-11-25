@@ -317,3 +317,53 @@ fn cloned_spawners_keep_pools_and_device_identity_alive_after_manager_drop() {
         &[2, 3]
     );
 }
+
+// Test: Exhaust shared DMA while private capacity remains, then exhaust private DMA after freeing shared capacity.
+// Expected: Neither client falls back across visibility pools, and failed allocations preserve live private bytes and reusable shared capacity.
+#[test]
+fn exhausted_dma_clients_never_borrow_capacity_from_other_visibility_pool() {
+    let manager = manager(true, true);
+    let shared = manager
+        .new_client(parameters(
+            "paired",
+            AllocationVisibility::Shared,
+            true,
+            false,
+        ))
+        .unwrap();
+    let private = manager
+        .new_client(parameters(
+            "paired",
+            AllocationVisibility::Private,
+            true,
+            false,
+        ))
+        .unwrap();
+    let shared_block = shared.allocate_dma_buffer(4 * PAGE_SIZE).unwrap();
+    assert_eq!(shared_block.pfns(), &[2, 3, 4, 5]);
+    shared_block.write_at(0, b"shared");
+    let error = shared.allocate_dma_buffer(PAGE_SIZE).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<page_pool_alloc::Error>(),
+        Some(page_pool_alloc::Error::PagePoolOutOfMemory { size: 1, .. })
+    ));
+    let private_block = private.allocate_dma_buffer(4 * PAGE_SIZE).unwrap();
+    assert_eq!(private_block.pfns(), &[20, 21, 22, 23]);
+    private_block.write_at(0, b"private");
+    let mut shared_bytes = [0; 6];
+    shared_block.read_at(0, &mut shared_bytes);
+    assert_eq!(&shared_bytes, b"shared");
+    drop(shared_block);
+    let error = private.allocate_dma_buffer(PAGE_SIZE).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<page_pool_alloc::Error>(),
+        Some(page_pool_alloc::Error::PagePoolOutOfMemory { size: 1, .. })
+    ));
+    let reused = shared.allocate_dma_buffer(4 * PAGE_SIZE).unwrap();
+    assert_eq!(reused.pfns(), &[2, 3, 4, 5]);
+    reused.read_at(0, &mut shared_bytes);
+    assert_eq!(shared_bytes, [0; 6]);
+    let mut private_bytes = [0; 7];
+    private_block.read_at(0, &mut private_bytes);
+    assert_eq!(&private_bytes, b"private");
+}
