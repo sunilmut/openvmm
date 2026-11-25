@@ -255,3 +255,59 @@ fn dax_operations_require_a_mapper() {
         assert!(capture.check(lx::Error::ENOSYS.value()).is_empty());
     }
 }
+
+// Test: Retry a higher-major INIT probe using the 16-byte legacy INIT format.
+// Expected: Operations stay blocked until the retry; only its capabilities and
+//       readahead are used, with one filesystem init/destroy callback pair.
+#[test]
+fn init_version_retry_accepts_legacy_payload_without_reusing_probe_capabilities() {
+    let fs = LifecycleFs::default();
+    let calls = fs.0.clone();
+    let session = Session::new(fs);
+    let probe = fuse_init_in {
+        major: 8,
+        max_readahead: 131072,
+        flags: u32::MAX,
+        flags2: u32::MAX,
+        ..FromZeros::new_zeroed()
+    };
+    let mut capture = Capture::default();
+    session.dispatch(request(FUSE_INIT, probe.as_bytes()), &mut capture, None);
+    let version = fuse_init_out::read_from_bytes(capture.check(0)).unwrap();
+    assert_eq!(
+        (version.major, version.minor),
+        (FUSE_KERNEL_VERSION, FUSE_KERNEL_MINOR_VERSION)
+    );
+    assert!(!session.is_initialized());
+    session.dispatch(
+        request(FUSE_SYNCFS, fuse_syncfs_in::new_zeroed().as_bytes()),
+        &mut capture,
+        None,
+    );
+    assert!(capture.check(lx::Error::EIO.value()).is_empty());
+    assert!(calls.lock().is_empty());
+
+    let retry = fuse_init_in {
+        major: 7,
+        minor: 27,
+        max_readahead: 4096,
+        ..FromZeros::new_zeroed()
+    };
+    session.dispatch(
+        request(
+            FUSE_INIT,
+            &retry.as_bytes()[..FUSE_COMPAT_INIT_IN_SIZE as usize],
+        ),
+        &mut capture,
+        None,
+    );
+    let negotiated = fuse_init_out::read_from_bytes(capture.check(0)).unwrap();
+    assert_eq!(negotiated.max_readahead, 4096);
+    assert_eq!((negotiated.flags, negotiated.flags2), (0, 0));
+    assert!(session.is_initialized());
+    session.destroy();
+    assert_eq!(
+        calls.lock().as_slice(),
+        &[(FUSE_INIT, 0, 0), (FUSE_DESTROY, 0, 0)]
+    );
+}
