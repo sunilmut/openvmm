@@ -157,3 +157,46 @@ fn malformed_payloads_fail_nonblocking_and_stream_receivers() {
         assert_eq!(receiver.next().await, None);
     });
 }
+
+// Test: Close local and port-backed senders before draining their queued messages,
+//       with and without converting the closed receiver through a port.
+// Expected: Every accepted message arrives in its sender's order before closure
+//       is reported.
+#[test]
+fn queued_messages_survive_last_sender_close_and_receiver_conversion() {
+    for convert_receiver in [false, true] {
+        let (sender, receiver) = channel::<u32>();
+        let port_sender = Sender::<u32>::from(Port::from(sender.clone()));
+        for value in 0..20 {
+            sender.send(value);
+            port_sender.send(100 + value);
+        }
+        drop(sender);
+        port_sender.send(120);
+        drop(port_sender);
+
+        let mut receiver = if convert_receiver {
+            Receiver::<u32>::from(Port::from(receiver))
+        } else {
+            receiver
+        };
+        let received: Vec<_> = (0..41).map(|_| receiver.try_recv().unwrap()).collect();
+        assert_eq!(
+            received
+                .iter()
+                .copied()
+                .filter(|value| *value < 100)
+                .collect::<Vec<_>>(),
+            (0..20).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            received
+                .iter()
+                .copied()
+                .filter(|value| *value >= 100)
+                .collect::<Vec<_>>(),
+            (100..=120).collect::<Vec<_>>()
+        );
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Closed)));
+    }
+}
