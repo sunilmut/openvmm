@@ -760,3 +760,45 @@ async fn invalid_controller_configuration_reports_fatal_without_enabling(driver:
         assert!(!spec::Cc::from(cc).en());
     }
 }
+
+// Test: Reuse admin queue slots with different submission and completion depths.
+// Expected: Completions keep the right command ID, SQ head and status across wraps;
+//       their phase changes each CQ lap, leaving the next unwritten slot stale.
+#[async_test]
+async fn admin_queue_wraps_preserve_completion_identity_and_phase(driver: DefaultDriver) {
+    let mem = test_memory();
+    let acq = PrpRange::new(vec![0], 0, PAGE_SIZE64).unwrap();
+    let asq = PrpRange::new(vec![0x1000], 0, PAGE_SIZE64).unwrap();
+    let interrupts = TestPciInterruptController::new();
+    let mut controller = instantiate_and_build_admin_queue(
+        &acq,
+        4,
+        &asq,
+        8,
+        true,
+        Some(&interrupts),
+        driver.clone(),
+        &mem,
+        FaultConfiguration::new(CellUpdater::new(false).cell()),
+    )
+    .await;
+    for sequence in 0..20u32 {
+        let next_sq = (sequence + 1) % 8;
+        let next_cq = (sequence + 1) % 4;
+        let mut command = admin(spec::AdminOpcode::ABORT);
+        command.cdw0.set_cid(0xa00 + sequence as u16);
+        write_command_to_queue(&mem, &asq, (sequence % 8) as usize, &command);
+        controller.write_bar0(0x1000, next_sq.as_bytes()).unwrap();
+        wait_for_msi(driver.clone(), &interrupts, 1000, 0xfeed0000, 0x1111).await;
+        let result = read_completion_from_queue(&mem, &acq, (sequence % 4) as usize);
+        assert_eq!(result.cid, command.cdw0.cid());
+        assert_eq!(result.sqhd, next_sq as u16);
+        assert_eq!(result.sqid, 0);
+        assert_eq!(result.status.status(), spec::Status::SUCCESS.0);
+        assert_eq!(result.dw0, 1);
+        assert_eq!(result.status.phase(), (sequence / 4) % 2 == 0);
+        let unwritten = read_completion_from_queue(&mem, &acq, next_cq as usize);
+        assert_ne!(unwritten.status.phase(), ((sequence + 1) / 4) % 2 == 0);
+        controller.write_bar0(0x1004, next_cq.as_bytes()).unwrap();
+    }
+}
