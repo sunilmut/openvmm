@@ -333,3 +333,6 @@ async fn process_pmem_request(
     let _ = work.write(mem, &u32::to_le_bytes(err));
     4
 }
+
+#[cfg(test)]
+mod tests;
