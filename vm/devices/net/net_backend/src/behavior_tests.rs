@@ -393,3 +393,55 @@ fn empty_disconnect_and_closed_control_do_not_create_spurious_actions() {
         assert!(futures::poll!(action.as_mut()).is_pending());
     });
 }
+
+// Test: Submit two packets with receive credit for only the first packet.
+// Expected: The accepted segment count ends at a packet boundary; retrying the
+//       remaining packet after replenishment delivers both exactly once in order.
+#[pal_async::async_test]
+async fn loopback_backpressure_preserves_the_unaccepted_packet(driver: DefaultDriver) {
+    let mut endpoint = LoopbackEndpoint::new();
+    let mut queues = Vec::new();
+    endpoint
+        .get_queues(configs(&driver, 1), None, &mut queues)
+        .await
+        .unwrap();
+    let queue = &mut queues[0];
+    let mut pool = pool();
+    pool.guest_memory().write_at(0x20000, b"head").unwrap();
+    pool.guest_memory().write_at(0x21000, b"tail").unwrap();
+    pool.guest_memory().write_at(0x22000, b"next").unwrap();
+    let segments = [
+        TxSegment {
+            gpa: 0x20000,
+            len: 4,
+            ty: TxSegmentType::Head(TxMetadata {
+                id: TxId(1),
+                segment_count: 2,
+                len: 8,
+                ..Default::default()
+            }),
+        },
+        TxSegment {
+            gpa: 0x21000,
+            len: 4,
+            ty: TxSegmentType::Tail,
+        },
+        packet(0x22000, 4),
+    ];
+    assert_eq!(queue.tx_avail(&mut pool, &segments).unwrap(), (true, 0));
+    queue.rx_avail(&mut pool, &[RxId(1)]);
+    let (synchronous, accepted) = queue.tx_avail(&mut pool, &segments).unwrap();
+    assert!(synchronous);
+    assert_eq!(accepted, 2);
+    let remaining = &segments[accepted..];
+    assert_eq!(queue.tx_avail(&mut pool, remaining).unwrap(), (true, 0));
+    queue.rx_avail(&mut pool, &[RxId(2)]);
+    assert_eq!(queue.tx_avail(&mut pool, remaining).unwrap(), (true, 1));
+    let mut done = [RxId(99); 3];
+    assert_eq!(queue.rx_poll(&mut pool, &mut done).unwrap(), 2);
+    assert_eq!(done.map(|id| id.0), [1, 2, 99]);
+    received(&pool, done[0], b"headtail");
+    received(&pool, done[1], b"next");
+    assert_eq!(queue.rx_poll(&mut pool, &mut done).unwrap(), 0);
+    assert!(queue.poll_ready(&mut context(), &mut pool).is_pending());
+}
