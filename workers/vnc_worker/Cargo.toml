@@ -34,3 +34,4 @@ workspace = true
 
 [dev-dependencies]
 sparse_mmap.workspace = true
+test_with_tracing.workspace = true

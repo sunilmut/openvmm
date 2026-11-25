@@ -471,6 +471,8 @@ struct ViewWrapper(framebuffer::View);
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod broadcast_tests;
+    mod lifecycle_tests;
     use framebuffer::FRAMEBUFFER_SIZE;
     use futures::FutureExt;
     use input_core::InputData;
