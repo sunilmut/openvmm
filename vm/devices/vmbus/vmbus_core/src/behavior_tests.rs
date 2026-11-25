@@ -335,6 +335,7 @@ fn hvsock_connection_conversions_preserve_identity_and_failure_status() {
             assert_eq!(result.success, success);
         }
     }
+
     for status in [
         STATUS_SUCCESS,
         STATUS_CONNECTION_REFUSED,
@@ -349,5 +350,66 @@ fn hvsock_connection_conversions_preserve_identity_and_failure_status() {
         assert_eq!(result.endpoint_id, base.endpoint_id);
         assert_eq!(result.service_id, base.service_id);
         assert_eq!(result.success, status == STATUS_SUCCESS);
+    }
+}
+
+// Test: Encode a GPADL whose page list fills a header and a continuation message.
+// Expected: Parsing preserves both IDs and every high-address PFN in order,
+//       including the last PFN in a full-size continuation payload.
+#[test]
+fn multipart_gpadl_messages_preserve_full_page_lists() {
+    let header_pfns = GpadlHeader::MAX_DATA_VALUES - 1;
+    let page_count = header_pfns + GpadlBody::MAX_DATA_VALUES;
+    let pfns: Vec<u64> = (0..page_count)
+        .map(|index| 0x1_0000_0000 + index as u64 * 3)
+        .collect();
+    let mut ranges = Vec::new();
+    ranges.extend_from_slice(&(page_count as u32 * 4096).to_le_bytes());
+    ranges.extend_from_slice(&0u32.to_le_bytes());
+    for pfn in &pfns {
+        ranges.extend_from_slice(&pfn.to_le_bytes());
+    }
+    let split = (header_pfns + 1) * size_of::<u64>();
+    let header = OutgoingMessage::with_data(
+        &GpadlHeader {
+            channel_id: ChannelId(37),
+            gpadl_id: GpadlId(0x8765_4321),
+            len: ranges.len().try_into().unwrap(),
+            count: 1,
+        },
+        &ranges[..split],
+    );
+    let body = OutgoingMessage::with_data(
+        &GpadlBody {
+            rsvd: 0,
+            gpadl_id: GpadlId(0x8765_4321),
+        },
+        &ranges[split..],
+    );
+    assert!(header.data().len() <= MAX_MESSAGE_SIZE);
+    assert_eq!(body.data().len(), MAX_MESSAGE_SIZE);
+
+    for negotiated in [Version::V1, Version::Copper] {
+        let connected = version(negotiated, FeatureFlags::new());
+        let mut received = Vec::new();
+        match Message::parse(header.data(), connected).unwrap() {
+            Message::GpadlHeader(value, data) => {
+                assert_eq!(value.channel_id, ChannelId(37));
+                assert_eq!(value.gpadl_id, GpadlId(0x8765_4321));
+                assert_eq!(usize::from(value.len), ranges.len());
+                assert_eq!(value.count, 1);
+                received.extend_from_slice(data);
+            }
+            other => panic!("unexpected GPADL header: {other:?}"),
+        }
+        match Message::parse(body.data(), connected).unwrap() {
+            Message::GpadlBody(value, data) => {
+                assert_eq!(value.gpadl_id, GpadlId(0x8765_4321));
+                assert_eq!(value.rsvd, 0);
+                received.extend_from_slice(data);
+            }
+            other => panic!("unexpected GPADL body: {other:?}"),
+        }
+        assert_eq!(received, ranges);
     }
 }
