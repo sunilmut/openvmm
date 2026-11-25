@@ -21,6 +21,7 @@ async fn reply(socket: &VhostUserSocket, code: VhostUserRequestCode, payload: &[
 
 async fn scripted<F, Fut>(
     driver: &DefaultDriver,
+    config_patches: Vec<(u16, Vec<u8>)>,
     handler: F,
 ) -> (VhostUserFrontend, pal_async::task::Task<()>)
 where
@@ -70,7 +71,7 @@ where
             device_id: VirtioDeviceType::BLK,
             use_backend_config: true,
             queue_sizes: vec![16],
-            config_patches: vec![],
+            config_patches,
         },
     )
     .await
@@ -82,7 +83,7 @@ where
 // Expected: The frontend sends an exact zeroed GET_CONFIG request for every read, malformed/short/error replies return zero rather than stale bytes, and later valid data is returned unchanged.
 #[async_test]
 async fn config_read_failures_zero_the_result_and_valid_reads_recover(driver: DefaultDriver) {
-    let (mut frontend, server) = scripted(&driver, |socket| async move {
+    let (mut frontend, server) = scripted(&driver, vec![], |socket| async move {
         let mut receiver = ScmReceiver::new(VHOST_USER_MAX_FDS);
         for index in 0..5 {
             let (header, payload, fds) = socket.recv_message(&mut receiver).await.unwrap();
@@ -126,7 +127,7 @@ async fn config_read_failures_zero_the_result_and_valid_reads_recover(driver: De
 // Expected: Every write carries NEED_REPLY, the requested offset and exact little-endian bytes; rejected writes do not panic or desynchronize the socket, and the final read returns valid backend data.
 #[async_test]
 async fn config_write_ack_failures_preserve_wire_order_and_recover(driver: DefaultDriver) {
-    let (mut frontend, server) = scripted(&driver, |socket| async move {
+    let (mut frontend, server) = scripted(&driver, vec![], |socket| async move {
         let mut receiver = ScmReceiver::new(VHOST_USER_MAX_FDS);
         for index in 0..3 {
             let (header, payload, fds) = socket.recv_message(&mut receiver).await.unwrap();
@@ -174,6 +175,42 @@ async fn config_write_ack_failures_preserve_wire_order_and_recover(driver: Defau
         frontend.write_registers_u32(4, 0x91827364).await;
     }
     assert_eq!(frontend.read_registers_u32(4).await, 0x44332211);
+    drop(frontend);
+    server.await;
+}
+
+// Test: Apply a cross-DWORD frontend config patch while the backend first returns an empty reply and then valid config bytes.
+// Expected: The patch survives backend failure, unpatched bytes alone fall back to zero, and valid backend bytes recover without overwriting the frontend-owned fields.
+#[async_test]
+async fn config_patches_survive_backend_read_failure_and_recovery(driver: DefaultDriver) {
+    let (mut frontend, server) = scripted(
+        &driver,
+        vec![(3, vec![0xaa, 0xbb, 0xcc, 0xdd])],
+        |socket| async move {
+            let mut receiver = ScmReceiver::new(VHOST_USER_MAX_FDS);
+            for fail in [true, false] {
+                let (header, payload, fds) = socket.recv_message(&mut receiver).await.unwrap();
+                assert_eq!(header.request, VhostUserRequestCode::GET_CONFIG.0);
+                assert_eq!(header.flags, VHOST_USER_FLAG_VERSION);
+                assert!(fds.is_empty());
+                let config = VhostUserConfigHeader {
+                    offset: 4,
+                    size: 4,
+                    flags: 0,
+                };
+                assert_eq!(payload, [config.as_bytes(), &[0; 4]].concat());
+                let response = if fail {
+                    Vec::new()
+                } else {
+                    [config.as_bytes(), &[0x11, 0x22, 0x33, 0x44]].concat()
+                };
+                reply(&socket, VhostUserRequestCode::GET_CONFIG, &response).await;
+            }
+        },
+    )
+    .await;
+    assert_eq!(frontend.read_registers_u32(4).await, 0x00ddccbb);
+    assert_eq!(frontend.read_registers_u32(4).await, 0x44ddccbb);
     drop(frontend);
     server.await;
 }
