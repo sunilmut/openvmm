@@ -1211,6 +1211,9 @@ impl SetTime {
 }
 
 #[cfg(test)]
+mod behavior_tests;
+
+#[cfg(test)]
 // UNSAFETY: Calls to libc to check and manipulate permissions.
 #[cfg_attr(all(test, unix), expect(unsafe_code))]
 mod tests {
