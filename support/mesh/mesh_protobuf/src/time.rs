@@ -136,6 +136,7 @@ impl<R> MessageDecode<'_, Duration, R> for DurationEncoding {
 
 #[cfg(test)]
 mod tests {
+    use test_with_tracing::test;
 
     #[cfg(feature = "std")]
     #[test]
@@ -163,5 +164,63 @@ mod tests {
                 nanos: 500_000_000,
             }
         );
+    }
+
+    // Test: Convert timestamps with invalid nanoseconds or an unrepresentable
+    //       negative second count to system time.
+    // Expected: Invalid timestamps are rejected instead of normalized or wrapped.
+    #[cfg(feature = "std")]
+    #[test]
+    fn timestamp_rejects_invalid_components() {
+        use super::Timestamp;
+        use std::time::SystemTime;
+
+        for seconds in [-1, 0, 1] {
+            for nanos in [-1, 1_000_000_000, i32::MAX] {
+                assert!(SystemTime::try_from(Timestamp { seconds, nanos }).is_err());
+            }
+        }
+        assert!(
+            SystemTime::try_from(Timestamp {
+                seconds: i64::MIN,
+                nanos: 0,
+            })
+            .is_err()
+        );
+    }
+
+    // Test: Convert exact whole seconds before the Unix epoch in both directions.
+    // Expected: Negative seconds retain zero nanoseconds and the exact instant.
+    #[cfg(feature = "std")]
+    #[test]
+    fn timestamp_before_epoch_whole_seconds() {
+        use super::Timestamp;
+        use core::time::Duration;
+        use std::time::SystemTime;
+
+        for seconds in [1, 2, 86_400] {
+            let instant = SystemTime::UNIX_EPOCH - Duration::from_secs(seconds);
+            let timestamp = Timestamp {
+                seconds: -(seconds as i64),
+                nanos: 0,
+            };
+            assert_eq!(Timestamp::from(instant), timestamp);
+            assert_eq!(SystemTime::try_from(timestamp).unwrap(), instant);
+        }
+    }
+
+    // Test: Decode duration nanoseconds at and beyond the one-second boundary.
+    // Expected: The largest valid fraction is preserved; invalid fractions fail.
+    #[test]
+    fn duration_nanosecond_bounds() {
+        use core::time::Duration;
+
+        assert_eq!(
+            crate::decode::<Duration>(&crate::encode((1u64, 999_999_999u32))).unwrap(),
+            Duration::new(1, 999_999_999)
+        );
+        for nanos in [1_000_000_000, u32::MAX] {
+            assert!(crate::decode::<Duration>(&crate::encode((1u64, nanos))).is_err());
+        }
     }
 }
