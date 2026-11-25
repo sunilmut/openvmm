@@ -997,3 +997,6 @@ impl ExitStatus {
         self.response.exit_code == 0
     }
 }
+
+#[cfg(test)]
+mod tests;
