@@ -1083,6 +1083,8 @@ mod tests {
     use vmcore::vm_task::SingleDriverBackend;
     use vmcore::vm_task::VmTaskDriverSource;
 
+    mod behavior_tests;
+
     /// File-backed guest memory that supports `sharing()`.
     struct ShareableGuestMemory {
         mapping: SparseMapping,
