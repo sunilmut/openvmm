@@ -325,3 +325,50 @@ async fn receive_flow_control_requires_both_dtr_and_rts() {
     }
     assert_eq!(read(&mut serial, 5) & 1, 0);
 }
+
+// Test: Mask a full receive FIFO, inspect status, then unmask and drain it
+//       across the receive-data/timeout interrupt boundary.
+// Expected: Masking and IIR/LSR reads preserve the bytes; unmasking reasserts
+//       IRQ, which stays high until the last byte is consumed.
+#[test]
+fn receive_masking_and_status_reads_preserve_fifo_until_drained() {
+    let target = TestLineInterruptTarget::new_arc();
+    let (backend, _) = MockBackend::new();
+    let mut serial = Serial16550::new(
+        "rx".into(),
+        MmioOrIoPort::IoPort(0x3f8),
+        1,
+        LineInterrupt::new_with_target("uart", target.clone(), 4),
+        Box::new(backend),
+        false,
+        None,
+    )
+    .unwrap();
+    write(&mut serial, 4, 0x18);
+    write(&mut serial, 2, 0x41);
+    write(&mut serial, 1, 1);
+    let payload = [0, 0x7f, 0x80, 0xff];
+    for &byte in &payload {
+        write(&mut serial, 0, byte);
+    }
+    assert_eq!(read(&mut serial, 2), 0xc4);
+    assert!(target.is_high(4));
+
+    write(&mut serial, 1, 0);
+    assert!(!target.is_high(4));
+    assert_eq!(read(&mut serial, 2), 0xc1);
+    assert_eq!(read(&mut serial, 5) & 1, 1);
+    write(&mut serial, 1, 1);
+    assert!(target.is_high(4));
+    for (index, &byte) in payload.iter().enumerate() {
+        let expected = if index == 0 { 0xc4 } else { 0xcc };
+        assert_eq!(read(&mut serial, 2), expected);
+        assert_eq!(read(&mut serial, 5) & 1, 1);
+        assert_eq!(read(&mut serial, 2), expected);
+        assert!(target.is_high(4));
+        assert_eq!(read(&mut serial, 0), byte);
+    }
+    assert_eq!(read(&mut serial, 2), 0xc1);
+    assert_eq!(read(&mut serial, 5) & 1, 0);
+    assert!(!target.is_high(4));
+}
