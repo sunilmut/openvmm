@@ -728,6 +728,8 @@ mod tests {
     use virtio::spec::VirtioDeviceFeatures;
     use zerocopy::IntoBytes;
 
+    mod behavior_tests;
+
     /// A mock VirtioDevice for testing the protocol adapter.
     struct MockDevice {
         traits: DeviceTraits,
