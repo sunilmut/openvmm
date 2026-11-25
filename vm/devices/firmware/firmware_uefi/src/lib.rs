@@ -801,6 +801,9 @@ mod save_restore {
 
 #[cfg(test)]
 mod tests {
+    mod behavior_tests;
+    mod diagnostics_tests;
+
     use super::*;
     use firmware_uefi_resources::platform::UefiEvent;
     use guid::Guid;
