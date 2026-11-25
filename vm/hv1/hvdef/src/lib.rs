@@ -4520,3 +4520,38 @@ pub struct HvX64InterruptControllerState {
     pub apic_divide_configuration: u32,
     pub apic_remote_read: u32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Decode every possible hypercall target-VTL byte.
+    // Expected: Current-VTL and explicit VTL0-2 encodings work; reserved bits and
+    //       unsupported explicit VTLs return InvalidParameter.
+    #[test]
+    fn input_vtl_validates_wire_encoding() {
+        for raw in u8::MIN..=u8::MAX {
+            let expected = match raw {
+                0x00..=0x0f => Ok(None),
+                0x10 => Ok(Some(Vtl::Vtl0)),
+                0x11 => Ok(Some(Vtl::Vtl1)),
+                0x12 => Ok(Some(Vtl::Vtl2)),
+                _ => Err(HvError::InvalidParameter),
+            };
+            assert_eq!(hypercall::HvInputVtl::from(raw).target_vtl(), expected);
+        }
+    }
+
+    // Test: Convert every wire status to a Rust result and back.
+    // Expected: Only zero succeeds; even unknown nonzero errors retain their code.
+    #[test]
+    fn status_conversion_preserves_unknown_errors() {
+        for raw in u16::MIN..=u16::MAX {
+            let status = HvStatus(raw);
+            let result = status.result();
+            assert_eq!(result.is_ok(), raw == 0);
+            assert_eq!(HvStatus::from(result), status);
+        }
+    }
+}

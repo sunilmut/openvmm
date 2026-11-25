@@ -3650,6 +3650,7 @@ dependencies = [
  "bitfield-struct 0.11.0",
  "open_enum",
  "static_assertions",
+ "test_with_tracing",
  "zerocopy",
 ]
 
