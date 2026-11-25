@@ -289,3 +289,68 @@ fn failed_event_log_write_does_not_publish_tail_or_interrupt_status() {
             .evt_log_int()
     );
 }
+
+// Test: Execute successive store-and-interrupt completion waits with an MSI receiver that reads the completion word synchronously.
+// Expected: Each delivered MSI observes its own complete 64-bit store, never the previous token, and each command advances the visible head exactly once.
+#[test]
+fn completion_store_is_visible_when_its_msi_is_delivered() {
+    struct CompletionObserver {
+        memory: GuestMemory,
+        observations: parking_lot::Mutex<Vec<(u64, u32, u64)>>,
+    }
+    impl SignalMsi for CompletionObserver {
+        fn signal_msi(&self, _: Option<u32>, address: u64, data: u32) {
+            let token = self.memory.read_plain::<u64>(0x2000).unwrap();
+            self.observations.lock().push((address, data, token));
+        }
+    }
+    let memory = GuestMemory::allocate(0x10000);
+    memory
+        .write_plain(0x2000, &0x5555_5555_5555_5555u64)
+        .unwrap();
+    let observer = Arc::new(CompletionObserver {
+        memory: memory.clone(),
+        observations: parking_lot::Mutex::new(Vec::new()),
+    });
+    let connection = pci_core::msi::MsiConnection::new();
+    connection.connect(observer.clone());
+    let mut dev = AmdIommuDevice::new(memory, test_config(), &connection.target());
+    let capability = ((pci_read(&mut dev, 0x40) >> 8) & 0xff) as u16;
+    assert_ne!(capability, 0);
+    for (offset, value) in [(4, 0xfee0_0000), (8, 0), (12, 0x41)] {
+        assert!(matches!(
+            dev.pci_cfg_write(
+                capability + offset,
+                ByteEnabledDwordWrite::with_all_bytes_enabled(value)
+            ),
+            IoResult::Ok
+        ));
+    }
+    let control = pci_read(&mut dev, capability);
+    assert!(matches!(
+        dev.pci_cfg_write(
+            capability,
+            ByteEnabledDwordWrite::with_all_bytes_enabled(control | (1 << 16))
+        ),
+        IoResult::Ok
+    ));
+    setup_iommu_enabled(&mut dev);
+    assert!(observer.observations.lock().is_empty());
+    let mut expected = Vec::new();
+    for (index, token) in [0x1122_3344_5566_7788u64, 0xfedc_ba98_7654_3210]
+        .into_iter()
+        .enumerate()
+    {
+        let mut command = completion_wait_store(0x2000, token);
+        command.dw0 |= 2;
+        write_cmd(&dev, index as u64, &command);
+        poke_tail(&mut dev, index as u64 + 1);
+        expected.push((0xfee0_0000, 0x41, token));
+        assert_eq!(*observer.observations.lock(), expected);
+        assert_eq!(
+            CmdBufHead::from_bits(mmio_read64(&mut dev, MmioRegister::CMD_BUF_HEAD.0 as u64))
+                .head_ptr(),
+            index as u32 + 1
+        );
+    }
+}
