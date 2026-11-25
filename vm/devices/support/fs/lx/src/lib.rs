@@ -535,3 +535,6 @@ pub fn make_minor(minor: u32) -> dev_t {
 pub fn make_dev(major: u32, minor: u32) -> dev_t {
     make_major64(major) | make_minor(minor)
 }
+
+#[cfg(test)]
+mod tests;
