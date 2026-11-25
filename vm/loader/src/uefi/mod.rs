@@ -1139,3 +1139,6 @@ pub mod aarch64 {
         buffer
     }
 }
+
+#[cfg(test)]
+mod tests;

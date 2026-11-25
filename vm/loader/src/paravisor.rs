@@ -1524,3 +1524,6 @@ mod page_table_layout_tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests;

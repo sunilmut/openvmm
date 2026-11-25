@@ -216,12 +216,12 @@ fn parse_bzimage_inner(kernel_image: &mut (impl Read + Seek)) -> Result<BzImageI
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Cursor;
 
     /// Build a minimal synthetic bzImage for testing.
-    fn make_test_bzimage() -> Vec<u8> {
+    pub(crate) fn make_test_bzimage() -> Vec<u8> {
         let setup_sects: u8 = 1;
         let protected_mode_offset = (setup_sects as u32 + 1) * 512;
         // Some fake protected-mode code (1024 bytes).

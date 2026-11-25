@@ -541,3 +541,6 @@ where
     /// IGVM can ignore it.
     fn set_expected_page_hashes_config_page(&mut self, _page_base: u64) {}
 }
+
+#[cfg(test)]
+mod tests;

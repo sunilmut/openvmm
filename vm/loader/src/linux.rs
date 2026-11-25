@@ -1231,7 +1231,10 @@ pub fn set_direct_boot_registers_arm64(
     Ok(())
 }
 #[cfg(test)]
-mod tests {
+mod boot_tests;
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use crate::importer::IgvmParameterType;
     use crate::importer::IsolationConfig;
@@ -1807,7 +1810,15 @@ mod tests {
     /// Builds a minimal little-endian x86-64 ELF executable with one `PT_LOAD`
     /// program header, and no file contents, for each `(paddr, memsz)` in
     /// `load_segments`.
-    fn test_elf(entrypoint: u64, load_segments: &[(u64, u64)]) -> Cursor<Vec<u8>> {
+    pub(crate) fn test_elf(entrypoint: u64, load_segments: &[(u64, u64)]) -> Cursor<Vec<u8>> {
+        test_elf_for_arch(object::elf::EM_X86_64, entrypoint, load_segments)
+    }
+
+    pub(crate) fn test_elf_for_arch(
+        machine: u16,
+        entrypoint: u64,
+        load_segments: &[(u64, u64)],
+    ) -> Cursor<Vec<u8>> {
         use object::LittleEndian;
         use object::U16;
         use object::U32;
@@ -1826,7 +1837,7 @@ mod tests {
                 padding: [0; 7],
             },
             e_type: U16::new(LittleEndian, elf::ET_EXEC),
-            e_machine: U16::new(LittleEndian, elf::EM_X86_64),
+            e_machine: U16::new(LittleEndian, machine),
             e_version: U32::new(LittleEndian, elf::EV_CURRENT.into()),
             e_entry: U64::new(LittleEndian, entrypoint),
             e_phoff: U64::new(LittleEndian, header_size as u64),
@@ -1859,6 +1870,21 @@ mod tests {
             };
             image.extend_from_slice(object::pod::bytes_of(&program_header));
         }
+        Cursor::new(image)
+    }
+
+    pub(crate) fn test_arm64_image() -> Cursor<Vec<u8>> {
+        let header = Aarch64ImageHeader {
+            image_size: HV_PAGE_SIZE,
+            flags: Aarch64ImageFlags::new()
+                .with_page_size(Aarch64ImagePageSize::PAGE4_K)
+                .with_any_start_address(true)
+                .into(),
+            magic: *b"ARM\x64",
+            ..FromZeros::new_zeroed()
+        };
+        let mut image = vec![0x5a; HV_PAGE_SIZE as usize];
+        image[..size_of::<Aarch64ImageHeader>()].copy_from_slice(header.as_bytes());
         Cursor::new(image)
     }
 

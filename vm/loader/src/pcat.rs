@@ -119,3 +119,6 @@ pub fn load(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
