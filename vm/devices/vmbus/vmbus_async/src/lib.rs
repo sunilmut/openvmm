@@ -9,3 +9,6 @@ pub mod async_dgram;
 mod core;
 pub mod pipe;
 pub mod queue;
+
+#[cfg(test)]
+mod tests;
