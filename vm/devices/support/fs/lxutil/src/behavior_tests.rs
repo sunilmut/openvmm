@@ -152,3 +152,43 @@ fn native_volume_capabilities_match_stable_identity_across_rename() {
         b"unchanged"
     );
 }
+
+// Test: Atomically replace an open destination, then write through its displaced handle.
+// Expected: Open handles retain their file identities and bytes; the destination names only the source.
+#[cfg(unix)]
+#[test]
+fn rename_replacement_preserves_displaced_open_handle_without_aliasing_new_file() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("source"), b"new-data").unwrap();
+    std::fs::write(root.path().join("destination"), b"old-data").unwrap();
+    let volume = LxVolume::new(root.path()).unwrap();
+    let source = volume.open("source", lx::O_RDWR, None).unwrap();
+    let displaced = volume.open("destination", lx::O_RDWR, None).unwrap();
+    let source_inode = volume.lstat("source").unwrap().inode_nr;
+    let old_inode = volume.lstat("destination").unwrap().inode_nr;
+    assert_ne!(source_inode, old_inode);
+    volume.rename("source", "destination", 0).unwrap();
+    assert_eq!(volume.lstat("source").unwrap_err(), lx::Error::ENOENT);
+    assert_eq!(volume.lstat("destination").unwrap().inode_nr, source_inode);
+    let source_stat: lx::Stat = source.fstat().unwrap().into();
+    let displaced_stat: lx::Stat = displaced.fstat().unwrap().into();
+    assert_eq!(source_stat.inode_nr, source_inode);
+    assert_eq!(displaced_stat.inode_nr, old_inode);
+    let mut bytes = [0xcc; 12];
+    assert_eq!(displaced.pread(&mut bytes, 0).unwrap(), 8);
+    assert_eq!(&bytes, b"old-data\xcc\xcc\xcc\xcc");
+    assert_eq!(displaced.pwrite(b"OLD", 0, 0).unwrap(), 3);
+    assert_eq!(displaced.pread(&mut bytes, 0).unwrap(), 8);
+    assert_eq!(&bytes, b"OLD-data\xcc\xcc\xcc\xcc");
+    assert_eq!(source.pread(&mut bytes, 0).unwrap(), 8);
+    assert_eq!(&bytes, b"new-data\xcc\xcc\xcc\xcc");
+    assert_eq!(
+        std::fs::read(root.path().join("destination")).unwrap(),
+        b"new-data"
+    );
+    drop(displaced);
+    assert_eq!(
+        std::fs::read(root.path().join("destination")).unwrap(),
+        b"new-data"
+    );
+}
