@@ -522,3 +522,43 @@ async fn worker_stop_shuts_down_a_running_device(driver: DefaultDriver) {
     stop_worker(&mut proxy).await;
     assert!(proxy.save().await.is_err());
 }
+
+// Test: Pause with accepted deferred MMIO/PIO, then make both completions ready.
+// Expected: Device polling stays paused without cancelling accepted operations;
+//       starting again delivers the original read bytes and write completion.
+#[async_test]
+async fn pause_and_start_preserve_accepted_deferred_io_without_polling_while_stopped(
+    driver: DefaultDriver,
+) {
+    let time = VmTimeKeeper::new(&driver, VmTime::from_100ns(0));
+    let mut f = Fixture::new(Mode::Io, &driver, &time).await;
+    f.proxy.start();
+    f.event(Event::Start).await;
+    let mut pending_read = begin_read(&mut f.proxy, Space::Mmio, 0x1_0000_1238, 4);
+    f.event(Event::Read(Space::Mmio, 0x1_0000_1238, 4, None))
+        .await;
+    let mut pending_write = begin_write(&mut f.proxy, Space::Pio, 0x3f8, &[9, 8]);
+    f.event(Event::Write(Space::Pio, 0x3f8, vec![9, 8], None))
+        .await;
+    f.proxy.stop().await;
+    f.event(Event::Stop).await;
+    f.completions
+        .send(Completion::Read(0, Ok(vec![0x12, 0x34, 0x56, 0x78])));
+    f.completions.send(Completion::Write(0, Ok(())));
+
+    // Saving is only a worker-loop barrier here, not a save/restore test.
+    f.proxy.save().await.unwrap();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    f.proxy.poll_device(&mut cx);
+    assert!(pending_read.poll_read(&mut cx, &mut [0; 4]).is_pending());
+    assert!(pending_write.poll_write(&mut cx).is_pending());
+
+    f.proxy.start();
+    f.event(Event::Start).await;
+    assert_eq!(
+        read(&mut f.proxy, pending_read, 4).await.unwrap(),
+        [0x12, 0x34, 0x56, 0x78]
+    );
+    write(&mut f.proxy, pending_write).await.unwrap();
+    f.shutdown().await;
+}
