@@ -142,3 +142,48 @@ async fn relay_drains_both_directions_and_propagates_half_close(driver: DefaultD
         .await
         .unwrap();
 }
+
+// Test: Relay a multi-megabyte request, half-close it, and send a large response only after the application observes EOF.
+// Expected: Both directions drain every binary byte in order, and request EOF does not terminate the still-open response direction.
+#[async_test]
+async fn relay_preserves_large_response_started_after_request_eof(driver: DefaultDriver) {
+    let directory = tempfile::tempdir().unwrap();
+    let console_path = directory.path().join("console.sock");
+    let app_path = directory.path().join("application.sock");
+    let mut console = Console::new_from_path(driver.clone(), &console_path).unwrap();
+    let listener = UnixListener::bind(&app_path).unwrap();
+    let mut listener = PolledSocket::new(&driver, listener).unwrap();
+    let mut terminal = PolledSocket::connect_unix(&driver, &console_path)
+        .await
+        .unwrap();
+    let mut application = PolledSocket::connect_unix(&driver, &app_path)
+        .await
+        .unwrap();
+    let request: Vec<u8> = (0..2 * 1024 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let response: Vec<u8> = request.iter().rev().map(|byte| byte ^ 0x5a).collect();
+    let relay = async {
+        let (stream, _) = listener.accept().await?;
+        console.relay(PolledSocket::new(&driver, stream)?).await
+    };
+    let terminal_peer = async {
+        terminal.write_all(&request).await?;
+        terminal.close().await?;
+        let mut received = Vec::new();
+        terminal.read_to_end(&mut received).await?;
+        assert_eq!(received, response);
+        anyhow::Ok(())
+    };
+    let application_peer = async {
+        let mut received = Vec::new();
+        application.read_to_end(&mut received).await?;
+        assert_eq!(received, request);
+        application.write_all(&response).await?;
+        application.close().await?;
+        anyhow::Ok(())
+    };
+    try_join3(relay, terminal_peer, application_peer)
+        .await
+        .unwrap();
+}
