@@ -1779,4 +1779,7 @@ mod tests {
         handles.release_reservation(&reservation);
         assert_eq!(handles.insert("last"), Some(u64::MAX));
     }
+
+    #[cfg(target_os = "linux")]
+    mod behavior;
 }
