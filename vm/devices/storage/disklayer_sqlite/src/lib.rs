@@ -582,6 +582,8 @@ CREATE TABLE meta (
 
 #[cfg(test)]
 mod tests {
+    mod behavior_tests;
+
     use crate::FormatParams;
     use crate::SqliteDiskLayer;
     use disk_backend::Disk;
