@@ -937,4 +937,6 @@ mod tests {
         assert!(!distributor.irq_pending(&redistributor));
         assert_eq!(distributor.ack(&mut redistributor, true), 1023);
     }
+
+    mod behavior;
 }
