@@ -4,8 +4,8 @@
 use super::*;
 use test_with_tracing::test;
 
-// Test: Broadcast new device dirty rectangles to one full and one ready bounded client channel, then drain the slow channel and deliver another update.
-// Expected: Backpressure never blocks or replaces queued data, only the slow subscriber receives a missed/full-refresh signal, the ready subscriber receives exact rectangles, and later delivery to the recovered subscriber succeeds.
+// Test: Broadcast to full/ready bounded client channels, recover the slow channel, and close the upstream source with one final update queued.
+// Expected: Backpressure affects only the slow subscriber; both recover, drain the final exact update before channel closure, and report no spurious missed update.
 #[test]
 fn bounded_dirty_broadcast_signals_missed_updates_and_recovers_without_blocking() {
     block_with_io(async |driver| {
@@ -72,6 +72,20 @@ fn bounded_dirty_broadcast_signals_missed_updates_and_recovers_without_blocking(
             let delivered = receiver.try_recv().unwrap();
             assert_eq!((delivered[0].left, delivered[0].right), (32, 48));
             assert!(receiver.try_recv().is_err());
+        }
+        assert!(!slow_missed.load(Ordering::Relaxed));
+        assert!(!fast_missed.load(Ordering::Relaxed));
+        dirty_send.send((*rect(48)).clone());
+        drop(dirty_send);
+        assert!(server.process(&driver).now_or_never().is_none());
+        for receiver in [&slow_recv, &fast_recv] {
+            let delivered = receiver.try_recv().unwrap();
+            assert_eq!(delivered.len(), 1);
+            assert_eq!((delivered[0].left, delivered[0].right), (48, 64));
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(async_channel::TryRecvError::Closed)
+            ));
         }
         assert!(!slow_missed.load(Ordering::Relaxed));
         assert!(!fast_missed.load(Ordering::Relaxed));
