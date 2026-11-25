@@ -17,5 +17,8 @@ zerocopy.workspace = true
 tracing = ["dep:tracing", "std"]
 std = []
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

@@ -63,3 +63,6 @@ impl IdentityMapSize {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
