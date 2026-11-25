@@ -284,3 +284,33 @@ fn builder_capacity_boundaries_return_out_of_space() {
         BuildError::OutOfSpace
     );
 }
+
+// Test: Parse phandle aliases whose names share storage in a compact strings
+//       block: "phandle" starts inside the existing "linux,phandle" string.
+// Expected: Both exact property names and their big-endian handle survive;
+//       a name offset need not follow a NUL or begin a separately stored string.
+#[test]
+fn property_names_can_reference_shared_string_suffixes() {
+    let blob = wire(
+        &words(&[1, 0, 3, 4, 0, 0x0102_0304, 3, 4, 6, 0x0102_0304, 2, 9]),
+        b"linux,phandle\0",
+    );
+    let parser = Parser::new(blob.as_bytes()).unwrap();
+    let root = parser.root().unwrap();
+    assert_eq!(
+        root.properties()
+            .map(|property| {
+                let property = property.unwrap();
+                (property.name, property.read_u32(0).unwrap())
+            })
+            .collect::<Vec<_>>(),
+        [("linux,phandle", 0x0102_0304), ("phandle", 0x0102_0304)]
+    );
+    for name in ["linux,phandle", "phandle"] {
+        assert_eq!(
+            root.find_property(name).unwrap().unwrap().data,
+            &[1, 2, 3, 4]
+        );
+    }
+    assert!(root.find_property("handle").unwrap().is_none());
+}
