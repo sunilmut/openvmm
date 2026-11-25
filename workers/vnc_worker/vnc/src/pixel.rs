@@ -259,4 +259,50 @@ mod tests {
         convert_pixels(&[0x00ffffff], &pc, &mut out);
         assert_eq!(out, 0x00070707u32.to_le_bytes());
     }
+
+    // Test: Convert intermediate colors to RGB555 and reversed-channel BGR565 in both byte orders.
+    // Expected: Low channel bits are truncated, channels occupy their negotiated fields, and output appends without changing its prefix.
+    #[test]
+    fn intermediate_colors_quantize_exactly_in_rgb555_and_bgr565() {
+        let source = [0x00123456, 0x00abcdef, 0x00070f07];
+        for (green_max, red_shift, blue_shift, little, big) in [
+            (
+                31,
+                10,
+                0,
+                [0xca, 0x08, 0x3d, 0x57, 0x20, 0x00],
+                [0x08, 0xca, 0x57, 0x3d, 0x00, 0x20],
+            ),
+            (
+                63,
+                0,
+                11,
+                [0xa2, 0x51, 0x75, 0xee, 0x60, 0x00],
+                [0x51, 0xa2, 0xee, 0x75, 0x00, 0x60],
+            ),
+        ] {
+            for (endian, expected) in [(0, little), (1, big)] {
+                let conversion = PixelConversion::from_format(&rfb::PixelFormat {
+                    bits_per_pixel: 16,
+                    depth: if green_max == 31 { 15 } else { 16 },
+                    big_endian_flag: endian,
+                    true_color_flag: 1,
+                    red_max: 31.into(),
+                    green_max: green_max.into(),
+                    blue_max: 31.into(),
+                    red_shift,
+                    green_shift: 5,
+                    blue_shift,
+                    padding: [0; 3],
+                });
+                let mut output = vec![0xde, 0xad];
+                convert_pixels(&source[..1], &conversion, &mut output);
+                assert_eq!(&output[..2], &[0xde, 0xad]);
+                assert_eq!(&output[2..], &expected[..2]);
+                convert_pixels(&source[1..], &conversion, &mut output);
+                assert_eq!(&output[..2], &[0xde, 0xad]);
+                assert_eq!(&output[2..], expected);
+            }
+        }
+    }
 }
