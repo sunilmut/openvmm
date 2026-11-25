@@ -534,7 +534,9 @@ impl DynMessageVtable {
 #[cfg(test)]
 mod tests {
     use super::Message;
+    use super::OwnedMessage;
     use mesh_protobuf::encoding::ImpossibleField;
+    use test_with_tracing::test;
 
     #[test]
     fn roundtrip_without_serialize() {
@@ -547,5 +549,45 @@ mod tests {
         Message::new(CantSerialize)
             .parse::<CantSerialize>()
             .unwrap();
+    }
+
+    // Test: Attempt to unwrap an owned message as the wrong concrete type.
+    // Expected: The returned message still contains its original complete value.
+    #[test]
+    fn failed_unwrap_preserves_message() {
+        let message = OwnedMessage::new((String::from("still here"), 42u32));
+        let message = message.try_unwrap::<u64>().unwrap_err();
+        assert_eq!(
+            message.parse::<(String, u32)>().unwrap(),
+            (String::from("still here"), 42)
+        );
+    }
+
+    // Test: Parse an owned string message using a wire-compatible byte-vector type.
+    // Expected: The serialization fallback preserves every byte, including NUL.
+    #[test]
+    fn different_type_parses_through_wire_format() {
+        let message = OwnedMessage::new((String::from("mesh\0payload"),));
+        assert_eq!(message.parse::<(Vec<u8>,)>().unwrap().0, b"mesh\0payload");
+    }
+
+    // Test: Own a borrowed serialized message and discard its source buffer.
+    // Expected: The owned copy remains decodable; malformed input returns an error.
+    #[test]
+    fn serialized_view_survives_source_buffer() {
+        let message = {
+            let bytes = mesh_protobuf::encode((String::from("independent"), 73u32));
+            Message::serialized(&bytes, Vec::new()).into_owned()
+        };
+        let message = message.try_unwrap::<(String, u32)>().unwrap_err();
+        assert_eq!(
+            message.parse::<(String, u32)>().unwrap(),
+            (String::from("independent"), 73)
+        );
+        assert!(
+            Message::serialized(&[0x0a, 0x05, b'x'], Vec::new())
+                .parse::<(String,)>()
+                .is_err()
+        );
     }
 }
