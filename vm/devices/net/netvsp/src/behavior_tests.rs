@@ -990,3 +990,81 @@ async fn invalid_mtus_use_default_guest_frame_size(driver: DefaultDriver) {
         );
     }
 }
+
+// Test: Submit truncated receive-filter updates while packet reception is enabled.
+// Expected: Each update fails without stopping guest delivery, and complete
+//       disable/enable requests still succeed after those errors.
+#[async_test]
+async fn truncated_packet_filters_preserve_receive_delivery(driver: DefaultDriver) {
+    let endpoint_state = TestNicEndpointState::new();
+    let nic = Nic::builder().build(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        Guid::new_random(),
+        Box::new(TestNicEndpoint::new(Some(endpoint_state.clone()))),
+        [1, 2, 3, 4, 5, 6].into(),
+        0,
+    );
+    let mut device = TestNicDevice::new_with_nic(&driver, nic).await;
+    device.start_vmbus_channel();
+    let mut channel = device.connect_vmbus_channel().await;
+    channel.initialize(0, Default::default()).await;
+    initialize_rndis_control(&mut channel).await;
+    assert_eq!(
+        set(
+            &mut channel,
+            Oid::OID_GEN_CURRENT_PACKET_FILTER,
+            &rndisprot::NPROTO_PACKET_FILTER.to_le_bytes()
+        )
+        .await,
+        rndisprot::STATUS_SUCCESS
+    );
+    let parser = channel.rndis_message_parser();
+    for length in 0..4 {
+        assert_eq!(
+            set(
+                &mut channel,
+                Oid::OID_GEN_CURRENT_PACKET_FILTER,
+                &[0; 4][..length]
+            )
+            .await,
+            rndisprot::STATUS_FAILURE,
+            "truncated filter length {length}"
+        );
+        inject_and_parse_rx(
+            &mut channel,
+            &endpoint_state,
+            &parser,
+            vec![length as u8; 60],
+            RxMetadata {
+                len: 60,
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    for filter in [
+        rndisprot::NDIS_PACKET_TYPE_NONE,
+        rndisprot::NPROTO_PACKET_FILTER,
+    ] {
+        assert_eq!(
+            set(
+                &mut channel,
+                Oid::OID_GEN_CURRENT_PACKET_FILTER,
+                &filter.to_le_bytes()
+            )
+            .await,
+            rndisprot::STATUS_SUCCESS
+        );
+    }
+    inject_and_parse_rx(
+        &mut channel,
+        &endpoint_state,
+        &parser,
+        vec![0x5a; 60],
+        RxMetadata {
+            len: 60,
+            ..Default::default()
+        },
+    )
+    .await;
+}
