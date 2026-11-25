@@ -19,3 +19,6 @@ pub mod dsdt;
 pub mod minimal;
 mod power_button;
 pub mod ssdt;
+
+#[cfg(test)]
+mod tests;
