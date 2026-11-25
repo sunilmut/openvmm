@@ -502,3 +502,6 @@ impl ResolveResource<FramebufferHandleKind, SharedFramebufferHandle> for Framebu
         Ok(self.clone().into())
     }
 }
+
+#[cfg(test)]
+mod tests;
