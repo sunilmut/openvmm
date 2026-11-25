@@ -512,3 +512,7 @@ impl StorageDevice {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "behavior_tests.rs"]
+mod behavior_tests;

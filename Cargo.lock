@@ -8523,6 +8523,7 @@ dependencies = [
  "scsi_defs",
  "scsidisk",
  "slab",
+ "stackfuture",
  "storvsp_protocol",
  "storvsp_resources",
  "task_control",
