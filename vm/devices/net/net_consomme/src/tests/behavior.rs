@@ -470,4 +470,79 @@ async fn rejected_guest_frames_still_complete_transmit(driver: DefaultDriver) {
     );
 }
 
+// Test: Batch differently segmented ARP/drop/ARP frames, then drain TX
+//       completions through a short output slice while two RX replies wait.
+// Expected: Each packet returns its original ID once and in order, including
+//       the dropped middle frame; only valid packets consume RX buffers.
+#[pal_async::async_test]
+async fn batched_packet_completions_preserve_ids_and_receive_ownership(driver: DefaultDriver) {
+    let params = params();
+    let mut endpoint = ConsommeEndpoint::new(params.clone());
+    let mut queue = queue(&mut endpoint, &driver).await;
+    let mut pool = pool();
+    queue.rx_avail(&mut pool, &[RxId(7), RxId(2)]);
+    let mut segments = Vec::new();
+    for (index, (id, frame, chunk_size)) in [
+        (17, arp(&params, false), 7),
+        (3, vec![0; 2], 2),
+        (99, arp(&params, false), 14),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let gpa = 128 * 1024 + index as u64 * 4096;
+        pool.guest_memory().write_at(gpa, &frame).unwrap();
+        let count = frame.len().div_ceil(chunk_size);
+        for (part, bytes) in frame.chunks(chunk_size).enumerate() {
+            segments.push(TxSegment {
+                ty: if part == 0 {
+                    TxSegmentType::Head(TxMetadata {
+                        id: TxId(id),
+                        segment_count: count.try_into().unwrap(),
+                        len: frame.len() as u32,
+                        ..Default::default()
+                    })
+                } else {
+                    TxSegmentType::Tail
+                },
+                gpa: gpa + (part * chunk_size) as u64,
+                len: bytes.len() as u32,
+            });
+        }
+    }
+    assert_eq!(
+        queue.tx_avail(&mut pool, &segments).unwrap(),
+        (false, segments.len())
+    );
+    let mut done = [TxId(u32::MAX); 2];
+    assert_eq!(queue.tx_poll(&mut pool, &mut done).unwrap(), 0);
+    assert!(
+        queue
+            .poll_ready(&mut Context::from_waker(Waker::noop()), &mut pool)
+            .is_ready()
+    );
+    assert_eq!(queue.tx_poll(&mut pool, &mut []).unwrap(), 0);
+    assert_eq!(queue.tx_poll(&mut pool, &mut done[..1]).unwrap(), 1);
+    assert_eq!(done[0].0, 17);
+    assert_eq!(queue.tx_poll(&mut pool, &mut done).unwrap(), 2);
+    assert_eq!(done.map(|id| id.0), [3, 99]);
+    assert_eq!(queue.tx_poll(&mut pool, &mut done).unwrap(), 0);
+
+    assert_eq!(queue.rx_poll(&mut pool, &mut []).unwrap(), 0);
+    let mut received = [RxId(u32::MAX); 2];
+    assert_eq!(queue.rx_poll(&mut pool, &mut received).unwrap(), 2);
+    assert_eq!(received.map(|id| id.0), [7, 2]);
+    for id in received {
+        let metadata = pool.rx_metadata(id).unwrap();
+        let mut bytes = vec![0; metadata.len];
+        pool.guest_memory()
+            .read_at(u64::from(id.0) * 2048, &mut bytes)
+            .unwrap();
+        assert_eq!(bytes, arp(&params, true));
+    }
+    assert_eq!(queue.rx_poll(&mut pool, &mut received).unwrap(), 0);
+    drop(queue);
+    endpoint.stop().await;
+}
+
 mod port_channel;
