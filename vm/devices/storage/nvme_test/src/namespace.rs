@@ -373,3 +373,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod behavior;

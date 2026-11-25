@@ -194,3 +194,6 @@ impl TdispHostDeviceInterface for FaultControllerTdispInterface {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

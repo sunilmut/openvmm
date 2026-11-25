@@ -99,10 +99,11 @@ pub async fn wait_for_msi(
     expected_address: u64,
     expected_data: u32,
 ) {
-    let wait_periods = timeout_in_milliseconds / 10;
-    let mut backoff = Backoff::new(&driver);
+    let deadline =
+        std::time::Instant::now() + Duration::from_millis(u64::from(timeout_in_milliseconds));
+    let mut timer = PolledTimer::new(&driver);
 
-    for _i in 0..wait_periods {
+    loop {
         let int = intc.get_next_interrupt();
         if let Some(int_inner) = int {
             assert_eq!(int_inner.0, expected_address);
@@ -110,11 +111,12 @@ pub async fn wait_for_msi(
             return;
         }
 
-        backoff.back_off().await;
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for MSI address {expected_address:#x}, data {expected_data:#x}"
+        );
+        timer.sleep(Duration::from_millis(1)).await;
     }
-
-    // Should never drop off the end, here.
-    panic!();
 }
 
 pub async fn instantiate_and_build_admin_queue(
@@ -1233,3 +1235,5 @@ async fn test_io_command_with_fuse_refused(driver: DefaultDriver) {
         }
     }
 }
+
+mod behavior;
