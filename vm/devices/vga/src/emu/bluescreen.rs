@@ -401,3 +401,6 @@ impl Emulator {
         self.emulate_masked_double_out(0x3D4, 0x58, 0x13, 0xEC);
     }
 }
+
+#[cfg(test)]
+mod tests;
