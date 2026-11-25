@@ -31,3 +31,6 @@ pub trait SerialIo: AsyncRead + AsyncWrite + Send + InspectMut + Unpin {
     /// Polls for the serial backend to disconnect.
     fn poll_disconnect(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>>;
 }
+
+#[cfg(test)]
+mod tests;
