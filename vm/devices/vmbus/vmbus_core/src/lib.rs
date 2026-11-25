@@ -241,3 +241,6 @@ mod tests {
         )
     }
 }
+
+#[cfg(test)]
+mod behavior_tests;
