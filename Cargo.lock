@@ -3287,6 +3287,7 @@ dependencies = [
  "underhill_config",
  "unicycle",
  "user_driver",
+ "user_driver_emulated_mock",
  "vm_resource",
  "vmbus_async",
  "vmbus_ring",

@@ -923,4 +923,12 @@ mod tests {
         let entry_offset = get.client.load_firmware(0x0107).await.unwrap();
         assert_eq!(entry_offset, 0);
     }
+
+    mod attestation;
+    mod malformed;
+    mod notifications;
+    mod platform;
+    mod requests;
+    mod servicing;
+    mod wire;
 }
