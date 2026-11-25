@@ -66,3 +66,6 @@ pub type WeakDefaultDriver = sys::WeakDefaultDriver;
 pub type DefaultPool = sys::DefaultPool;
 
 pub use pal_async_test::async_test;
+
+#[cfg(all(test, unix))]
+mod tests;
