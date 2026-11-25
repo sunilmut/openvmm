@@ -3567,3 +3567,7 @@ mod tests {
         assert!(*v.get_mut());
     }
 }
+
+#[cfg(all(test, feature = "initiate", feature = "std"))]
+#[path = "tests.rs"]
+mod behavior_tests;
