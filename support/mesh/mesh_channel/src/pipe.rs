@@ -422,6 +422,7 @@ mod tests {
     use futures_concurrency::future::TryJoin;
     use mesh_node::resource::SerializedMessage;
     use pal_async::async_test;
+    use test_with_tracing::test;
 
     #[async_test]
     async fn test_pipe() {
@@ -466,5 +467,43 @@ mod tests {
         let mut b = Vec::new();
         read.read_to_end(&mut b).await.unwrap();
         assert_eq!(b.as_slice(), b"hello world!");
+    }
+
+    // Test: Fill a pipe without blocking, drain it, and send another message.
+    // Expected: Full writes report WouldBlock; draining restores capacity and order.
+    #[async_test]
+    async fn nonblocking_byte_backpressure_recovers() {
+        let (mut reader, mut writer) = pipe();
+        let payload = vec![0x5a; 131072];
+        let written = writer.write_nonblocking(&payload).unwrap();
+        assert!(written > 0 && written < payload.len());
+        assert_eq!(
+            writer.write_nonblocking(b"tail").unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        let mut received = vec![0; written];
+        reader.read_exact(&mut received).await.unwrap();
+        assert_eq!(received, payload[..written]);
+        assert_eq!(writer.write_nonblocking(b"tail").unwrap(), 4);
+        writer.close().await.unwrap();
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(remaining, b"tail");
+    }
+
+    // Test: Drop the reader while a full pipe has a pending write.
+    // Expected: The blocked write fails with BrokenPipe rather than remaining blocked.
+    #[async_test]
+    async fn reader_drop_releases_blocked_writer() {
+        let (reader, mut writer) = pipe();
+        let payload = vec![0x5a; 131072];
+        writer.write_nonblocking(&payload).unwrap();
+        assert!(writer.write(b"tail").now_or_never().is_none());
+        drop(reader);
+        assert_eq!(
+            writer.write(b"tail").await.unwrap_err().kind(),
+            std::io::ErrorKind::BrokenPipe
+        );
     }
 }
