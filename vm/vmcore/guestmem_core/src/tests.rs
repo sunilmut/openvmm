@@ -294,3 +294,56 @@ fn page_fault_errors_retain_their_reason() {
     assert_eq!(error.kind, GuestMemoryErrorKind::Other);
     assert_eq!(error.err.to_string(), "unavailable");
 }
+
+// Test: Apply successive skips and every valid truncation to a scatter/gather
+//       buffer with empty segments, page crossings, and independent offsets.
+// Expected: Every retained window yields exactly its original guest addresses,
+//       without including gaps or losing bytes at segment and page boundaries.
+#[test]
+fn scatter_gather_windows_preserve_the_logical_byte_sequence() {
+    let segments = [
+        PagedRange::empty(),
+        PagedRange::new(PAGE_SIZE - 2, 4, &[4, 9]).unwrap(),
+        PagedRange::empty(),
+        PagedRange::new(7, 3, &[12]).unwrap(),
+        PagedRange::new(PAGE_SIZE - 1, 5, &[1, 7]).unwrap(),
+        PagedRange::empty(),
+    ];
+    let page = PAGE_SIZE as u64;
+    let expected = [
+        5 * page - 2,
+        5 * page - 1,
+        9 * page,
+        9 * page + 1,
+        12 * page + 7,
+        12 * page + 8,
+        12 * page + 9,
+        2 * page - 1,
+        7 * page,
+        7 * page + 1,
+        7 * page + 2,
+        7 * page + 3,
+    ];
+
+    for start in 0..=expected.len() {
+        for len in 0..=expected.len() - start {
+            let mut ranges = PagedRanges::new(segments);
+            ranges.skip(start / 2);
+            ranges.skip(start - start / 2);
+            ranges.truncate(len);
+            let addresses = ranges
+                .paged_ranges()
+                .flat_map(PagedRange::ranges)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .into_iter()
+                .flat_map(|range| range.start..range.end)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                addresses,
+                expected[start..start + len],
+                "start={start}, len={len}"
+            );
+        }
+    }
+}
