@@ -604,3 +604,6 @@ pub struct ApicRegisterValue {
     pub value: u32,
     _reserved: [u32; 3],
 }
+
+#[cfg(test)]
+mod tests;
