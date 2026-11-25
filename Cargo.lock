@@ -1236,6 +1236,7 @@ dependencies = [
  "anyhow",
  "chipset_device",
  "cxl_spec",
+ "futures",
  "inspect",
  "mesh",
  "pci_core",

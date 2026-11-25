@@ -15,3 +15,6 @@ pub use pci_registers::CxlDeviceDevsecExtendedCapability;
 pub use pci_registers::CxlFlexBusPortDvsecExtendedCapability;
 pub use pci_registers::CxlPortDvsecExtendedCapability;
 pub use pci_registers::CxlRegisterLocatorDvsecExtendedCapability;
+
+#[cfg(test)]
+mod tests;
