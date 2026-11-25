@@ -270,3 +270,54 @@ async fn removed_mapping_stays_removed_after_relocation() {
     assert_eq!(read_byte(&gm, 6 * PAGE), 0x49);
     control.unmap_from_guest();
 }
+
+// Test: Map the same backing page through writable and read-only device views,
+//       then remove one view and relocate the other with new permissions.
+// Expected: Data is shared, but access rights and teardown belong to each view;
+//       relocation preserves the backing offset without exposing old addresses.
+#[async_test]
+async fn shared_device_views_keep_permissions_and_lifetimes_independent() {
+    let manager = manager(vec![MemoryRange::new(0..PAGE)], 8 * PAGE).await;
+    let gm = manager.client().guest_memory().await.unwrap();
+    gm.write_at(0, &[0x19]).unwrap();
+    let mapper = manager.device_memory_mapper();
+    let (mut writer, writer_region) = mapper
+        .new_region(PAGE as usize, "shared-writer".into())
+        .unwrap();
+    let (mut reader, reader_region) = mapper
+        .new_region(PAGE as usize, "shared-reader".into())
+        .unwrap();
+    let data: Vec<_> = [0x2d, 0x93]
+        .into_iter()
+        .flat_map(|byte| std::iter::repeat_n(byte, PAGE as usize))
+        .collect();
+    let backing = backing(&data);
+    for region in [&writer_region, &reader_region] {
+        region.map(0, &backing, PAGE, PAGE as usize, true).unwrap();
+    }
+    writer.map_to_guest(2 * PAGE, true).unwrap();
+    reader.map_to_guest(3 * PAGE, false).unwrap();
+    assert_eq!(read_byte(&gm, 2 * PAGE), 0x93);
+    assert_eq!(read_byte(&gm, 3 * PAGE), 0x93);
+    gm.write_at(2 * PAGE, &[0x76]).unwrap();
+    assert_eq!(read_byte(&gm, 3 * PAGE), 0x76);
+    assert!(gm.write_at(3 * PAGE, &[0xff]).is_err());
+    assert_eq!(read_byte(&gm, 2 * PAGE), 0x76);
+
+    writer.unmap_from_guest();
+    assert!(gm.read_at(2 * PAGE, &mut [0]).is_err());
+    assert_eq!(read_byte(&gm, 3 * PAGE), 0x76);
+    reader.map_to_guest(5 * PAGE, true).unwrap();
+    assert!(gm.read_at(3 * PAGE, &mut [0]).is_err());
+    assert_eq!(read_byte(&gm, 5 * PAGE), 0x76);
+    gm.write_at(5 * PAGE, &[0xb8]).unwrap();
+    let file = std::fs::File::from(std::os::fd::OwnedFd::from(backing));
+    let mut actual = vec![0; data.len()];
+    std::os::unix::fs::FileExt::read_exact_at(&file, &mut actual, 0).unwrap();
+    let mut expected = data;
+    expected[PAGE as usize] = 0xb8;
+    assert_eq!(actual, expected);
+    assert_eq!(read_byte(&gm, 0), 0x19);
+    assert!(gm.read_at(4 * PAGE, &mut [0]).is_err());
+    reader.unmap_from_guest();
+}
