@@ -402,3 +402,52 @@ fn empty_next_positional_offers_its_values() {
         ["disk", "floppy", "--verbose"]
     );
 }
+
+struct MixedModeCompleter;
+
+impl CustomCompleterFactory for MixedModeCompleter {
+    type CustomCompleter = Self;
+
+    async fn build(&self, ctx: &RootCtx<'_>) -> Self {
+        assert_eq!(ctx.prev_arg, "--mode");
+        Self
+    }
+}
+
+impl CustomCompleter for MixedModeCompleter {
+    async fn complete(&self, _: &RootCtx<'_>, path: &[&str], arg: &str) -> Vec<String> {
+        assert_eq!(path, ["vmctl"]);
+        assert_eq!(arg, "mode");
+        vec![
+            "r\u{e9}sum\u{e9}".into(),
+            "resume".into(),
+            "r\u{e9}sidence".into(),
+        ]
+    }
+}
+
+// Test: Merge static/dynamic mode choices and complete before a multibyte word's end.
+// Expected: An empty prefix retains both sources in order; a valid UTF-8 byte cursor
+//       uses only the exact prefix to its left and preserves matching Unicode choices.
+#[test]
+fn mixed_value_sources_preserve_unicode_prefixes_at_valid_byte_cursors() {
+    assert_eq!(
+        block_on(
+            request(&["vmctl", "--mode", ""]).generate_completions::<Cli>(None, MixedModeCompleter)
+        ),
+        [
+            "fast",
+            "resume",
+            "r\u{e9}sidence",
+            "r\u{e9}sum\u{e9}",
+            "safe",
+        ]
+    );
+    let mut args = request(&["vmctl", "--mode", "r\u{e9}mainder", "ignored"]);
+    args.raw = Some("vmctl --mode r\u{e9}mainder ignored".into());
+    args.position = Some("vmctl --mode r\u{e9}".len());
+    assert_eq!(
+        block_on(args.generate_completions::<Cli>(None, MixedModeCompleter)),
+        ["r\u{e9}sidence", "r\u{e9}sum\u{e9}"]
+    );
+}
