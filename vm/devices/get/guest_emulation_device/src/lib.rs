@@ -1540,3 +1540,6 @@ impl<T: RingMem + Unpin> GedChannel<T> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;
