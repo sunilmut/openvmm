@@ -982,6 +982,8 @@ mod save_restore {
 
 #[cfg(test)]
 mod tests {
+    mod behavior_tests;
+
     use super::*;
     use chipset_device::io::IoError;
     use chipset_device::io::IoResult;
@@ -1021,18 +1023,24 @@ mod tests {
         data: Vec<u8>,
         #[inspect(skip)]
         write_error: Option<ErrorKind>,
+        #[inspect(skip)]
+        pending_read_when_empty: bool,
+        #[inspect(skip)]
+        connected: bool,
     }
 
     impl SerialIo for SerialIoMock {
         fn is_connected(&self) -> bool {
-            true
+            self.connected
         }
 
         fn poll_connect(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.connected = true;
             Poll::Ready(Ok(()))
         }
 
         fn poll_disconnect(&mut self, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.connected = false;
             Poll::Ready(Ok(()))
         }
     }
@@ -1044,6 +1052,9 @@ mod tests {
             buf: &mut [u8],
         ) -> Poll<io::Result<usize>> {
             if self.data.is_empty() {
+                if self.pending_read_when_empty {
+                    return Poll::Pending;
+                }
                 return Poll::Ready(Err(ErrorKind::ConnectionAborted.into()));
             }
             let n = buf.len().min(self.data.len());
@@ -1082,6 +1093,8 @@ mod tests {
             Self {
                 data: Vec::new(),
                 write_error: None,
+                pending_read_when_empty: false,
+                connected: true,
             }
         }
 
@@ -1089,6 +1102,8 @@ mod tests {
             Self {
                 data: Vec::new(),
                 write_error: Some(error),
+                pending_read_when_empty: false,
+                connected: true,
             }
         }
     }
