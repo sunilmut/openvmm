@@ -324,3 +324,31 @@ async fn core_dump_copies_both_streams_and_checks_remote_exit(driver: DefaultDri
         }
     }
 }
+
+// IGNORED: KmsgStream returns a clean end of stream when the peer closes with
+// an unterminated record buffered, silently losing the final diagnostic entry.
+// Test: Close a kmsg stream after one complete record and a partial final record.
+// Expected: The complete record is delivered, then truncation is an error rather
+//       than a clean EOF or a successful incomplete record.
+#[async_test]
+#[ignore = "product bug: kmsg EOF silently discards an unterminated record"]
+async fn kmsg_reports_a_truncated_final_record(driver: DefaultDriver) {
+    let mut fixture = Fixture::new(driver);
+    let mut stream = underhill(fixture.client.kmsg(false), &mut fixture.underhill, |rpc| {
+        let UnderhillDiag::Kmsg(_, response) = rpc else {
+            panic!("expected Kmsg")
+        };
+        response.send(Ok(()));
+    })
+    .await
+    .unwrap();
+    let (_, mut peer) = fixture.data.recv().await.unwrap();
+    peer.write_all(b"complete\0unfinished").await.unwrap();
+    drop(peer);
+    assert_eq!(stream.next().await.unwrap().unwrap(), b"complete");
+    let result = stream.next().await;
+    assert!(
+        matches!(result, Some(Err(_))),
+        "expected a truncated-record error, got {result:?}"
+    );
+}
