@@ -148,6 +148,7 @@ struct TestNicEndpointState {
     /// TX packets are completed synchronously.  When false it returns
     /// `(false, N)`, leaving packets in-flight.
     pub sync_tx: bool,
+    pub complete_async_tx: bool,
     pub tx_metadata: Vec<net_backend::TxMetadata>,
     /// Per-queue one-shot trigger: when `tx_restart_triggers[idx]` is true,
     /// the next `tx_poll` call on queue `idx` returns `TxError::TryRestart(_)`.
@@ -168,6 +169,7 @@ impl TestNicEndpointState {
             link_status_updater: None,
             queues: Vec::new(),
             sync_tx: true,
+            complete_async_tx: false,
             tx_metadata: Vec::new(),
             tx_restart_triggers: Vec::new(),
             endpoint_action_updater: None,
@@ -396,6 +398,8 @@ struct TestNicQueue {
     #[inspect(skip)]
     next_rx_packet: Option<(Vec<u8>, RxMetadata)>,
     sync_tx: bool,
+    #[inspect(skip)]
+    pending_tx: VecDeque<TxId>,
     queue_idx: usize,
 }
 
@@ -413,6 +417,7 @@ impl TestNicQueue {
             endpoint_state,
             next_rx_packet: None,
             sync_tx,
+            pending_tx: VecDeque::new(),
             queue_idx,
         }
     }
@@ -497,13 +502,22 @@ impl NetQueue for TestNicQueue {
                     }
                 }));
         }
+        if !self.sync_tx {
+            self.pending_tx.extend(packets.iter().filter_map(|packet| {
+                if let net_backend::TxSegmentType::Head(metadata) = &packet.ty {
+                    Some(metadata.id)
+                } else {
+                    None
+                }
+            }));
+        }
         Ok((self.sync_tx, packets.len()))
     }
 
     fn tx_poll(
         &mut self,
         _pool: &mut dyn BufferAccess,
-        _done: &mut [TxId],
+        done: &mut [TxId],
     ) -> Result<usize, TxError> {
         if let Some(endpoint_state) = &self.endpoint_state {
             let mut locked = endpoint_state.lock();
@@ -518,6 +532,13 @@ impl NetQueue for TestNicQueue {
                     "test-injected tx_poll restart on queue {}",
                     self.queue_idx
                 )));
+            }
+            if locked.complete_async_tx {
+                let count = self.pending_tx.len().min(done.len());
+                for (destination, id) in done.iter_mut().zip(self.pending_tx.drain(..count)) {
+                    *destination = id;
+                }
+                return Ok(count);
             }
         }
         Ok(0)
@@ -8326,3 +8347,6 @@ async fn subchannel_tx_restart(driver: DefaultDriver) {
             .unwrap_or_else(|_| panic!("sub-channel {idx} RX packet after restart cycle"));
     }
 }
+
+#[path = "behavior_tests.rs"]
+mod behavior_tests;
