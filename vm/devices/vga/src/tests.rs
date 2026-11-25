@@ -670,3 +670,5 @@ fn blue_screen_extension_selects_direct_color_without_panicking() {
     assert_eq!(f.read_indexed(0x3d4, 0x67) & 0xf0, 0xd0);
     assert_eq!(f.input(0x4ae8) & 1, 1);
 }
+
+mod consumers;
