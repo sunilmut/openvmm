@@ -325,3 +325,60 @@ fn interleaved_ide_channels_cannot_hide_a_duplicate_slot() {
         )],
     );
 }
+
+// Test: Decode two virtual NVMe controllers that each expose namespace 1.
+// Expected: Both encodings accept the repeated ID across controllers and keep
+//       each namespace associated with its own controller, backing and serial.
+#[test]
+fn nvme_namespace_ids_are_scoped_to_their_virtual_controller() {
+    use prost::Message;
+
+    let expected = [(CONTROLLER, 7, "first"), (BACKING, 8, "second")];
+    let document = storage_document(
+        expected
+            .map(|(id, sub_device_path, serial)| {
+                let mut backing = device();
+                backing["sub_device_path"] = json!(sub_device_path);
+                let mut controller = controller(
+                    "NVME",
+                    vec![json!({
+                        "location": 1, "serial_number": serial,
+                        "physical_devices": {"type": "SINGLE", "device": backing},
+                    })],
+                );
+                controller["instance_id"] = json!(id);
+                controller
+            })
+            .into(),
+    );
+    let protobuf: proto::Vtl2Settings = serde_json::from_value(document.clone()).unwrap();
+    for bytes in [
+        serde_json::to_vec(&document).unwrap(),
+        protobuf.encode_to_vec(),
+    ] {
+        let parsed = Vtl2Settings::read_from(&bytes, Default::default()).unwrap();
+        let controllers = parsed.dynamic.nvme_controllers;
+        assert_eq!(controllers.len(), 2);
+        for (id, sub_device_path, serial) in expected {
+            let controller = controllers
+                .iter()
+                .find(|controller| controller.instance_id == id.parse().unwrap())
+                .unwrap();
+            let [namespace] = controller.namespaces.as_slice() else {
+                panic!("expected exactly one namespace per controller");
+            };
+            assert_eq!(namespace.nsid, 1);
+            assert_eq!(namespace.disk_params.serial_number, serial);
+            assert_eq!(
+                namespace.physical_devices,
+                PhysicalDevices::Single {
+                    device: PhysicalDevice {
+                        device_type: DeviceType::NVMe,
+                        vmbus_instance_id: BACKING.parse().unwrap(),
+                        sub_device_path,
+                    },
+                }
+            );
+        }
+    }
+}
