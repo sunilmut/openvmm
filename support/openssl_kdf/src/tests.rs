@@ -238,3 +238,37 @@ fn cmac_mode_derives_with_a_valid_aes128_key() {
         hex::decode("4a63599f94bd3bf38b763386bb5397c690a3a40600f96a691059cc001c163c49").unwrap()
     );
 }
+
+// Test: Derive keys with embedded NULs and non-UTF-8 bytes in counted inputs.
+// Expected: Independent SP800-108 answers include every byte; changing either
+//       label or context after a NUL changes the resulting key.
+#[test]
+fn binary_labels_and_contexts_preserve_bytes_after_embedded_nuls() {
+    for (label, context, expected) in [
+        (
+            b"lab\0el",
+            b"\0ctx\xff\0",
+            "fc828a207aad5cedc91aee2bd81614c5ddfb43d15c78e3d6e8b0f011f81833a626",
+        ),
+        (
+            b"lab\0eL",
+            b"\0ctx\xff\0",
+            "ceeff21f7771ffa90c12de6f5e4c3be25cf8baac9302b790c2539f7982c51c38a7",
+        ),
+        (
+            b"lab\0el",
+            b"\0ctx\xff\x01",
+            "acd741bfb74f3265aaa5a658bde07c55a6df05641d95398bc9d427695db632a77b",
+        ),
+    ] {
+        let mut params = Kbkdf::new(
+            MessageDigest::sha256(),
+            label.to_vec(),
+            b"binary-key\0\xff".to_vec(),
+        );
+        params.set_context(context.to_vec());
+        let mut output = [0xaa; 33];
+        derive(params, &mut output).unwrap();
+        assert_eq!(output.as_slice(), hex::decode(expected).unwrap());
+    }
+}
