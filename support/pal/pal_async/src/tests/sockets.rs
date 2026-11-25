@@ -140,3 +140,37 @@ async fn boxed_and_shared_drivers_support_real_io(driver: DefaultDriver) {
     })
     .await;
 }
+
+// Test: Peek and partially read a stream after the peer closes its write side.
+// Expected: Buffered bytes precede EOF, peeking does not consume them, and
+//       the half-closed peer can still receive a complete response.
+#[async_test]
+async fn half_closed_stream_peeks_preserve_buffered_data_and_the_reply_path(driver: DefaultDriver) {
+    within(&driver, async {
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut client = PolledSocket::new(&driver, client).unwrap();
+        let mut server = PolledSocket::new(&driver, server).unwrap();
+        client.write_all(b"request").await.unwrap();
+        client.close().await.unwrap();
+
+        let mut peeked = [0; 3];
+        assert_eq!(server.peek(&mut peeked).await.unwrap(), 3);
+        assert_eq!(&peeked, b"req");
+        let mut prefix = [0; 2];
+        server.read_exact(&mut prefix).await.unwrap();
+        assert_eq!(&prefix, b"re");
+        assert_eq!(server.peek(&mut peeked).await.unwrap(), 3);
+        assert_eq!(&peeked, b"que");
+        let mut remainder = Vec::new();
+        server.read_to_end(&mut remainder).await.unwrap();
+        assert_eq!(remainder, b"quest");
+        assert_eq!(server.peek(&mut peeked).await.unwrap(), 0);
+
+        server.write_all(b"reply").await.unwrap();
+        server.close().await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert_eq!(response, b"reply");
+    })
+    .await;
+}
