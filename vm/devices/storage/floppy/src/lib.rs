@@ -2231,3 +2231,101 @@ mod save_restore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chipset_device::pio::ExternallyManagedPortIoIntercepts;
+    use test_with_tracing::test;
+    use vmcore::isa_dma_channel::FloatingDmaChannel;
+    use vmcore::save_restore::SaveRestore;
+
+    fn controller() -> FloppyDiskController {
+        FloppyDiskController::new(
+            GuestMemory::empty(),
+            LineInterrupt::detached(),
+            &mut ExternallyManagedPortIoIntercepts,
+            0x3f0,
+            DriveRibbon::None,
+            Box::new(FloatingDmaChannel),
+        )
+        .unwrap()
+    }
+
+    fn read(fdc: &mut FloppyDiskController, port: u16) -> u8 {
+        let mut data = [0];
+        fdc.io_read(port, &mut data).unwrap();
+        data[0]
+    }
+
+    fn write(fdc: &mut FloppyDiskController, port: u16, value: u8) {
+        fdc.io_write(port, &[value]).unwrap();
+    }
+
+    // Test: Issue an unsupported command, drain its result, then request version.
+    // Expected: Error and version results use the read phase and return to idle.
+    #[test]
+    fn invalid_command_does_not_block_next_command() {
+        let mut fdc = controller();
+        write(&mut fdc, 0x3f2, 0x04);
+        for (command, result) in [(0x00, 0x80), (0x10, 0x90)] {
+            write(&mut fdc, 0x3f5, command);
+            assert_eq!(read(&mut fdc, 0x3f4), 0xd0);
+            assert_eq!(read(&mut fdc, 0x3f5), result);
+            assert_eq!(read(&mut fdc, 0x3f4), 0x80);
+        }
+    }
+
+    // Test: Release reset and ask for each pending reset interrupt's status.
+    // Expected: Four results identify drives 0-3 in order with cylinder zero.
+    #[test]
+    fn reset_reports_each_drive_in_order() {
+        let mut fdc = controller();
+        write(&mut fdc, 0x3f2, 0);
+        assert_eq!(read(&mut fdc, 0x3f4), 0);
+        write(&mut fdc, 0x3f2, 0x04);
+        for drive in 0..4 {
+            write(&mut fdc, 0x3f5, 0x08);
+            assert_eq!(read(&mut fdc, 0x3f5), 0xc0 | drive);
+            assert_eq!(read(&mut fdc, 0x3f5), 0);
+        }
+        write(&mut fdc, 0x3f5, 0x08);
+        assert_eq!(read(&mut fdc, 0x3f5), 0x80);
+    }
+
+    // Test: Save a partially received seek and finish it on a restored controller.
+    // Expected: The seek completes at the requested cylinder, not as a new command.
+    #[test]
+    fn restore_resumes_partial_command() {
+        let mut original = controller();
+        write(&mut original, 0x3f2, 0x04);
+        write(&mut original, 0x3f5, 0x0f);
+        write(&mut original, 0x3f5, 0);
+        let mut restored = controller();
+        restored.restore(original.save().unwrap()).unwrap();
+        write(&mut restored, 0x3f5, 37);
+        write(&mut restored, 0x3f5, 0x08);
+        assert_eq!(read(&mut restored, 0x3f5), 0x20);
+        assert_eq!(read(&mut restored, 0x3f5), 37);
+    }
+
+    // Test: Attempt wide FIFO accesses while a version result is pending.
+    // Expected: Both accesses fail without consuming or replacing the result.
+    #[test]
+    fn invalid_access_size_preserves_pending_result() {
+        let mut fdc = controller();
+        write(&mut fdc, 0x3f2, 0x04);
+        write(&mut fdc, 0x3f5, 0x10);
+        let mut data = [0x55; 2];
+        assert!(matches!(
+            fdc.io_read(0x3f5, &mut data),
+            IoResult::Err(IoError::InvalidAccessSize)
+        ));
+        assert_eq!(data, [0x55; 2]);
+        assert!(matches!(
+            fdc.io_write(0x3f5, &[0, 0]),
+            IoResult::Err(IoError::InvalidAccessSize)
+        ));
+        assert_eq!(read(&mut fdc, 0x3f5), 0x90);
+    }
+}
