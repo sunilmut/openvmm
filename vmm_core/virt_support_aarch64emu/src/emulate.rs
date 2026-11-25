@@ -788,3 +788,7 @@ pub fn emulate_mnf_write_fast_path<T: EmulatorSupport>(
         None
     }
 }
+
+#[cfg(test)]
+#[path = "emulate/tests.rs"]
+mod tests;
