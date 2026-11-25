@@ -201,3 +201,108 @@ impl GpadlMapView {
         Some(GpadlView(gpadl))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use test_with_tracing::test;
+
+    // Test: Remove a GPADL while mapped and cloned views still refer to it.
+    // Expected: New mappings fail, existing data remains readable, and teardown
+    //       runs exactly once after the last view is dropped.
+    #[test]
+    fn teardown_waits_for_last_view() {
+        let map = GpadlMap::new();
+        let id = GpadlId(7);
+        map.add(
+            id,
+            MultiPagedRangeBuf::from_range_buffer(1, vec![8192, 10, 11]).unwrap(),
+        );
+        let mapper = map.clone().view();
+        let view = mapper.map(id).unwrap();
+        let clone = view.clone();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let completed = calls.clone();
+        let callback_mapper = mapper.clone();
+        assert!(
+            map.remove(
+                id,
+                Box::new(move || {
+                    assert!(callback_mapper.map(id).is_err());
+                    completed.fetch_add(1, Ordering::SeqCst);
+                })
+            )
+            .is_none()
+        );
+        assert!(mapper.map(id).is_err());
+        assert_eq!(view.id(), id);
+        assert_eq!(view.first().unwrap().gpns(), &[10, 11]);
+        drop(view);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        drop(clone);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Test: Remove a GPADL that has never been mapped.
+    // Expected: Its teardown is returned for immediate execution by the caller.
+    #[test]
+    fn unmapped_teardown_is_returned() {
+        let map = GpadlMap::new();
+        let id = GpadlId(8);
+        map.add(id, MultiPagedRangeBuf::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let completed = calls.clone();
+        let teardown = map
+            .remove(
+                id,
+                Box::new(move || {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(map.view().map(id).is_err());
+        teardown();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(GpadlMapView::default().map(id).is_err());
+    }
+
+    // Test: Reuse an identifier while a removed GPADL still has an active view.
+    // Expected: Old and new views retain their own pages and teardown lifetimes.
+    #[test]
+    fn reused_id_does_not_replace_existing_views() {
+        let map = GpadlMap::new();
+        let id = GpadlId(9);
+        let mapper = map.clone().view();
+        map.add(
+            id,
+            MultiPagedRangeBuf::from_range_buffer(1, vec![4096, 20]).unwrap(),
+        );
+        let old = mapper.map(id).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let completed = calls.clone();
+        assert!(
+            map.remove(
+                id,
+                Box::new(move || {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                })
+            )
+            .is_none()
+        );
+        map.add(
+            id,
+            MultiPagedRangeBuf::from_range_buffer(1, vec![4096, 30]).unwrap(),
+        );
+        let new = mapper.map(id).unwrap();
+        assert_eq!(old.first().unwrap().gpns(), &[20]);
+        assert_eq!(new.first().unwrap().gpns(), &[30]);
+        drop(old);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(new.first().unwrap().gpns(), &[30]);
+        drop(new);
+        map.remove(id, Box::new(|| {})).unwrap()();
+    }
+}
