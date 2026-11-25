@@ -6384,3 +6384,9 @@ async fn teardown_drops_backend_mmio(driver: DefaultDriver) {
         verify_teardown_drops_backend(transport, dropped, started).await;
     }
 }
+
+#[path = "behavior_tests.rs"]
+mod behavior_tests;
+
+#[path = "transport_behavior.rs"]
+mod transport_behavior;
