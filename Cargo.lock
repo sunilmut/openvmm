@@ -9525,6 +9525,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "vtl2_settings_proto",
 ]

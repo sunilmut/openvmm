@@ -416,3 +416,6 @@ impl std::fmt::Display for Vtl2SettingsErrorInfoVec {
 }
 
 impl std::error::Error for Vtl2SettingsErrorInfoVec {}
+
+#[cfg(test)]
+mod tests;
