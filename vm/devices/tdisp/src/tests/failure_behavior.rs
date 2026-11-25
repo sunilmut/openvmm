@@ -335,3 +335,92 @@ fn unsupported_reports_and_truncated_vendor_lengths_return_errors() {
         assert!(error.to_string().contains("DEVICE_SPECIFIC_INFO_LEN"));
     }
 }
+
+// Test: Interleave two devices while one encounters start and state errors.
+// Expected: Failure and teardown affect only that device; the other keeps
+//       running and reporting while the failed device binds and starts again.
+#[test]
+fn device_failures_do_not_interrupt_another_devices_lifecycle() {
+    let (mut first, first_host) = fixture();
+    let (mut second, _) = fixture();
+    for (device, id) in [(&mut first, 11), (&mut second, 22)] {
+        check(
+            &dispatch_roundtrip(device, negotiate_cmd(id)),
+            TdispGuestOperationErrorCode::Success,
+            TdispTdiState::Unlocked,
+            TdispTdiState::Unlocked,
+        );
+        check(
+            &dispatch_roundtrip(device, bind_cmd(id)),
+            TdispGuestOperationErrorCode::Success,
+            TdispTdiState::Unlocked,
+            TdispTdiState::Locked,
+        );
+    }
+
+    first_host.lock().fail = Some(Operation::Start);
+    check(
+        &dispatch_roundtrip(&mut first, start_tdi_cmd(11)),
+        TdispGuestOperationErrorCode::HostFailedToProcessCommand,
+        TdispTdiState::Locked,
+        TdispTdiState::Locked,
+    );
+    check(
+        &dispatch_roundtrip(&mut second, start_tdi_cmd(22)),
+        TdispGuestOperationErrorCode::Success,
+        TdispTdiState::Locked,
+        TdispTdiState::Run,
+    );
+    check(
+        &dispatch_roundtrip(&mut first, bind_cmd(11)),
+        TdispGuestOperationErrorCode::InvalidDeviceState,
+        TdispTdiState::Locked,
+        TdispTdiState::Unlocked,
+    );
+    let response = dispatch_roundtrip(
+        &mut second,
+        get_tdi_report_cmd(22, TdispReportType::InterfaceReport),
+    );
+    check(
+        &response,
+        TdispGuestOperationErrorCode::Success,
+        TdispTdiState::Run,
+        TdispTdiState::Run,
+    );
+    let Some(Response::GetTdiReport(report)) = response.response else {
+        panic!("missing running device report")
+    };
+    assert!(deserialize_tdi_report(&report.report_buffer).is_ok());
+
+    first_host.lock().fail = None;
+    check(
+        &dispatch_roundtrip(&mut first, bind_cmd(11)),
+        TdispGuestOperationErrorCode::Success,
+        TdispTdiState::Unlocked,
+        TdispTdiState::Locked,
+    );
+    check(
+        &dispatch_roundtrip(&mut first, start_tdi_cmd(11)),
+        TdispGuestOperationErrorCode::Success,
+        TdispTdiState::Locked,
+        TdispTdiState::Run,
+    );
+    check(
+        &dispatch_roundtrip(
+            &mut second,
+            unbind_cmd(22, TdispGuestUnbindReason::Graceful),
+        ),
+        TdispGuestOperationErrorCode::Success,
+        TdispTdiState::Run,
+        TdispTdiState::Unlocked,
+    );
+    check(
+        &dispatch_roundtrip(
+            &mut first,
+            get_tdi_report_cmd(11, TdispReportType::InterfaceReport),
+        ),
+        TdispGuestOperationErrorCode::Success,
+        TdispTdiState::Run,
+        TdispTdiState::Run,
+    );
+}
