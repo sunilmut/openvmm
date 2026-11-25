@@ -1467,3 +1467,6 @@ mod tests {
         assert_eq!(TdgTdiMmioAcceptR9::from(input.r9).range_offset(), 3);
     }
 }
+
+#[cfg(test)]
+mod behavior_tests;

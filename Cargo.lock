@@ -8678,6 +8678,7 @@ dependencies = [
  "tracelimit",
  "tracing",
  "x86defs",
+ "zerocopy",
 ]
 
 [[package]]
