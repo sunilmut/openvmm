@@ -731,3 +731,6 @@ mod tests {
         assert_eq!(resolver.resolve(x, ()).await.unwrap().result, "10");
     }
 }
+
+#[cfg(test)]
+mod behavior_tests;
