@@ -481,8 +481,7 @@ mod test {
     use super::*;
     #[cfg(feature = "alloc")]
     use alloc::vec;
-    #[cfg(feature = "alloc")]
-    use alloc::vec::Vec;
+    use std::vec::Vec;
 
     // test sparse madt with not sequential processors enabled
     #[test]

@@ -75,3 +75,9 @@ const_assert_eq!(size_of::<Header>(), 36);
 pub trait Table: IntoBytes + Unaligned + Immutable + KnownLayout {
     const SIGNATURE: [u8; 4];
 }
+
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+mod tests;
