@@ -634,3 +634,6 @@ mod tests {
         let _ = loader.initial_regs_and_page_imports();
     }
 }
+
+#[cfg(test)]
+mod behavior;

@@ -20,6 +20,7 @@ anyhow.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+aarch64defs.workspace = true
 test_with_tracing.workspace = true
 
 [build-dependencies]
