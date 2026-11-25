@@ -80,3 +80,40 @@ fn dma_callbacks_preserve_requests_buffers_and_errors() {
     );
     assert_eq!(*calls.lock(), [5000, 0, 17, 0]);
 }
+
+// Test: Retain exported guest/payload views and a live DMA block beyond the fixture owner, then release the views in different orders.
+// Expected: Live handles retain their backing, DMA writes remain visible through guest memory, payload bytes stay separate, and the last surviving handles preserve their contents.
+#[test]
+fn exported_memory_views_and_dma_block_retain_backing_after_fixture_drop() {
+    for allow_dma in [false, true] {
+        let (guest, payload, buffer) = {
+            let memory = DeviceTestMemory::new(8, allow_dma, "retained-backing");
+            let buffer = memory.dma_client().allocate_dma_buffer(4096).unwrap();
+            buffer.write_at(0, &[0x81, 0, 0xff, 0x27]);
+            (memory.guest_memory(), memory.payload_mem(), buffer)
+        };
+        let address = buffer.pfns()[0] * PAGE_SIZE64;
+        assert_eq!(
+            guest.read_plain::<[u8; 4]>(address).unwrap(),
+            [0x81, 0, 0xff, 0x27]
+        );
+        guest.write_plain(address + 4094, &[0x12u8, 0x34]).unwrap();
+        let mut tail = [0; 2];
+        buffer.read_at(4094, &mut tail);
+        assert_eq!(tail, [0x12, 0x34]);
+        payload.write_plain(0, &0x55667788u32).unwrap();
+        assert_eq!(
+            guest.read_plain::<u32>(4 * PAGE_SIZE64).unwrap(),
+            0x55667788
+        );
+        drop(guest);
+        buffer.write_at(0, &[0xde, 0xad, 0xbe, 0xef]);
+        let mut bytes = [0; 4];
+        buffer.read_at(0, &mut bytes);
+        assert_eq!(bytes, [0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(payload.read_plain::<u32>(0).unwrap(), 0x55667788);
+        drop(buffer);
+        assert_eq!(payload.read_plain::<u32>(0).unwrap(), 0x55667788);
+        assert_eq!(payload.iova(17), allow_dma.then_some(4 * PAGE_SIZE64 + 17));
+    }
+}
