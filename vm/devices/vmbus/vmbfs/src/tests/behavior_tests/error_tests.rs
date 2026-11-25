@@ -163,3 +163,62 @@ async fn backing_errors_do_not_leak_data_and_oversized_reads_never_reach_backing
     let mut reply = [0; 32];
     assert!(guest.recv(&mut reply).now_or_never().is_none());
 }
+
+// Test: Read alternating sparse-file offsets above and below 4 GiB with identical low 32 bits through real message rings.
+// Expected: Each response contains the exact bytes at its full-width absolute offset, never the low-offset alias or bytes from the preceding read position.
+#[async_test]
+async fn sparse_file_wire_reads_preserve_full_width_absolute_offsets(driver: DefaultDriver) {
+    use std::io::Seek;
+
+    let high_offset = (1u64 << 32) + 7;
+    let mut file = tempfile::tempfile().unwrap();
+    file.seek(io::SeekFrom::Start(7)).unwrap();
+    file.write_all(b"lower123").unwrap();
+    file.seek(io::SeekFrom::Start(high_offset)).unwrap();
+    file.write_all(b"UPPER\0\x81\xff").unwrap();
+    let backing = single_file_backing::VmbfsSingleFileBacking::new("hello.bin", file).unwrap();
+    let mut device = VmbfsDevice::new(Box::new(backing));
+    let (mut host, mut guest) = channel();
+
+    for (offset, expected) in [
+        (high_offset, b"UPPER\0\x81\xff"),
+        (7, b"lower123"),
+        (high_offset, b"UPPER\0\x81\xff"),
+    ] {
+        let request = protocol::ReadFileRequest {
+            byte_count: expected.len() as u32,
+            offset: offset.into(),
+        };
+        guest
+            .try_send(&packet(
+                protocol::MessageType::READ_FILE_REQUEST,
+                &[request.as_bytes(), &path_bytes("/hello.bin")].concat(),
+            ))
+            .unwrap();
+        let Request::ReadFile {
+            byte_count,
+            offset,
+            path,
+        } = with_timeout(&driver, host.read_message()).await.unwrap()
+        else {
+            panic!("expected a file read request");
+        };
+        host.handle_read_file(&mut device, &path, offset, byte_count)
+            .unwrap();
+        let reply = receive(&driver, &mut guest).await;
+        assert_eq!(
+            reply,
+            packet(
+                protocol::MessageType::READ_FILE_RESPONSE,
+                &[
+                    protocol::ReadFileResponse {
+                        status: protocol::Status::SUCCESS,
+                    }
+                    .as_bytes(),
+                    expected,
+                ]
+                .concat(),
+            )
+        );
+    }
+}
