@@ -650,3 +650,88 @@ mod save_restore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SioController;
+    use test_with_tracing::test;
+    use vmcore::save_restore::SaveRestore;
+
+    fn enter_config(sio: &mut SioController) {
+        sio.update_config_state(0x87);
+        sio.update_config_state(0x87);
+    }
+
+    fn read(sio: &mut SioController, register: u8) -> u8 {
+        sio.update_config_state(register);
+        sio.config_read().unwrap()
+    }
+
+    fn write(sio: &mut SioController, register: u8, value: u8) {
+        sio.update_config_state(register);
+        sio.config_write(value);
+    }
+
+    // Test: Interrupt the configuration handshake with reads and unrelated bytes.
+    // Expected: Only two consecutive enable bytes unlock access; exit locks it.
+    #[test]
+    fn configuration_requires_complete_handshake() {
+        let mut sio = SioController::default();
+        assert!(sio.config_read().is_err());
+        sio.update_config_state(0x87);
+        assert!(sio.config_read().is_err());
+        sio.update_config_state(0x87);
+        sio.update_config_state(0x20);
+        assert!(sio.config_read().is_err());
+        enter_config(&mut sio);
+        assert_eq!(read(&mut sio, 0x20), 0x97);
+        assert_eq!(read(&mut sio, 0x21), 0x71);
+        sio.update_config_state(0xaa);
+        assert!(sio.config_read().is_err());
+    }
+
+    // Test: Program a logical device, then select another device and an invalid ID.
+    // Expected: Device settings stay isolated, and invalid IDs cannot alter them.
+    #[test]
+    fn logical_device_registers_are_isolated() {
+        let mut sio = SioController::default();
+        enter_config(&mut sio);
+        write(&mut sio, 0x07, 2);
+        for (reg, value) in [(0x60, 0x12), (0x61, 0x34), (0x70, 5), (0xf0, 0x56)] {
+            write(&mut sio, reg, value);
+            assert_eq!(read(&mut sio, reg), value);
+        }
+        write(&mut sio, 0x07, 3);
+        assert_eq!(read(&mut sio, 0x60), 0x02);
+        assert_eq!(read(&mut sio, 0x61), 0xf8);
+        write(&mut sio, 0x07, 0xff);
+        write(&mut sio, 0x61, 0xff);
+        assert_eq!(read(&mut sio, 0x61), 0);
+        write(&mut sio, 0x07, 2);
+        assert_eq!(read(&mut sio, 0x60), 0x12);
+        assert_eq!(read(&mut sio, 0x61), 0x34);
+        write(&mut sio, 0x07, 1);
+        write(&mut sio, 0x30, 1);
+        assert_eq!(read(&mut sio, 0x30), 0);
+    }
+
+    // Test: Save and restore selected registers and an incomplete enable handshake.
+    // Expected: Guest-visible configuration and handshake progress survive restore.
+    #[test]
+    fn configuration_and_handshake_survive_restore() {
+        let mut original = SioController::default();
+        enter_config(&mut original);
+        write(&mut original, 0x07, 2);
+        write(&mut original, 0x61, 0x55);
+        let mut restored = SioController::default();
+        restored.restore(original.save().unwrap()).unwrap();
+        assert_eq!(restored.config_read().unwrap(), 0x55);
+        assert_eq!(read(&mut restored, 0x60), 0x03);
+
+        original.update_config_state(0xaa);
+        original.update_config_state(0x87);
+        restored.restore(original.save().unwrap()).unwrap();
+        restored.update_config_state(0x87);
+        assert_eq!(read(&mut restored, 0x61), 0x55);
+    }
+}
