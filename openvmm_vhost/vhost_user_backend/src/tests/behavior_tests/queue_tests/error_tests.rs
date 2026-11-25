@@ -4,8 +4,8 @@
 use super::*;
 use test_with_tracing::test;
 
-// Test: Reject malformed memory tables while a queue is active, fail a queue restart after valid memory replacement, and then explicitly activate again.
-// Expected: Rejected tables do not stop or restart the queue; failed restart publishes no active queue, and retry receives the committed new backing with the existing setup rather than stale memory.
+// Test: Reject malformed tables and a second-region mapping failure while a queue is active, re-enable to read the old backing, then fail and retry a valid replacement restart.
+// Expected: Rejected tables never stop or replace the live backing, old bytes survive partial construction, and a later valid replacement and retry expose only the committed new bytes.
 #[async_test]
 async fn rejected_tables_and_failed_restart_preserve_recoverable_queue_state(
     driver: DefaultDriver,
@@ -48,10 +48,53 @@ async fn rejected_tables_and_failed_restart_preserve_recoverable_queue_state(
         assert!(calls.lock().active);
         assert_eq!(calls.lock().starts.len(), 1);
         assert!(calls.lock().stopped.is_empty());
+        let replacement: std::fs::File = make_memfd(16384).into();
+        replacement
+            .write_all_at(&0xaabbccddu32.to_le_bytes(), 0x3000)
+            .unwrap();
+        let mut payload = mem_table_payload(0, 16384, 0x10000000);
+        payload[..4].copy_from_slice(&2u32.to_le_bytes());
+        payload.extend_from_slice(
+            VhostUserMemoryRegion {
+                guest_phys_addr: 16384,
+                memory_size: 4096,
+                userspace_addr: 0x10004000,
+                mmap_offset: 0,
+            }
+            .as_bytes(),
+        );
+        let directory = std::fs::File::open(".").unwrap();
+        assert_eq!(
+            exchange_fds(
+                &frontend,
+                VhostUserRequestCode::SET_MEM_TABLE,
+                &payload,
+                true,
+                &[replacement.into(), directory.into()],
+            )
+            .await,
+            1u64.to_le_bytes()
+        );
+        assert!(calls.lock().active);
+        assert_eq!(calls.lock().starts.len(), 1);
+        assert!(calls.lock().stopped.is_empty());
+        for num in [0, 1] {
+            assert_eq!(
+                exchange(
+                    &frontend,
+                    VhostUserRequestCode::SET_VRING_ENABLE,
+                    VhostUserVringState { index: 0, num }.as_bytes(),
+                    true,
+                )
+                .await,
+                0u64.to_le_bytes()
+            );
+        }
+        assert_eq!(calls.lock().starts[1].marker, 0x11223344);
         calls.lock().fail_next_start = true;
         install_memory(&frontend, 0x55667788).await;
         assert!(!calls.lock().active);
-        assert_eq!(calls.lock().starts.len(), 2);
+        assert_eq!(calls.lock().starts.len(), 3);
         assert_eq!(
             exchange(
                 &frontend,
@@ -63,7 +106,7 @@ async fn rejected_tables_and_failed_restart_preserve_recoverable_queue_state(
             0u64.to_le_bytes()
         );
         assert!(calls.lock().active);
-        assert_eq!(calls.lock().starts.len(), 3);
+        assert_eq!(calls.lock().starts.len(), 4);
         let query = VhostUserVringState { index: 0, num: 0 };
         let expected = VhostUserVringState {
             index: 0,
@@ -88,17 +131,17 @@ async fn rejected_tables_and_failed_restart_preserve_recoverable_queue_state(
     result.unwrap();
     let calls = calls.lock();
     assert_eq!(calls.resets, 1);
-    assert_eq!(calls.stopped, [0, 0]);
+    assert_eq!(calls.stopped, [0, 0, 0]);
     assert_eq!(
         calls
             .starts
             .iter()
             .map(|start| start.marker)
             .collect::<Vec<_>>(),
-        [0x11223344, 0x55667788, 0x55667788]
+        [0x11223344, 0x11223344, 0x55667788, 0x55667788]
     );
-    assert_eq!(calls.starts[1].cursors, (0x8023, 0x8045));
-    assert_eq!(calls.starts[2].cursors, (0, 0));
+    assert_eq!(calls.starts[2].cursors, (0x8023, 0x8045));
+    assert_eq!(calls.starts[3].cursors, (0, 0));
 }
 
 // Test: Send an invalid protocol version and invalid queue indices followed by valid feature and cursor queries.
