@@ -1959,4 +1959,94 @@ mod test {
         expected.extend_from_slice(&append_data);
         assert_eq!(data, Some(expected));
     }
+
+    // Test: Probe an existing variable with a null, zero-capacity data buffer, then retry with the required capacity.
+    // Expected: The probe reports BUFFER_TOO_SMALL, exact size and attributes without data; the retry returns the unchanged variable.
+    #[async_test]
+    #[ignore = "Product bug: null-buffer size probe returns SUCCESS and variable data instead of BUFFER_TOO_SMALL"]
+    async fn known_bug_get_variable_null_buffer_probe_reports_required_capacity() {
+        let mut nvram = NvramSpecServices::new(InMemoryNvram::new());
+        nvram.prepare_for_boot();
+        let name = wchz!(u16, "ProbeVariable").as_bytes();
+        let attributes: u32 = EfiVariableAttributes::DEFAULT_ATTRIBUTES.into();
+        nvram
+            .set_test_var(name, attributes, b"firmware")
+            .await
+            .unwrap_efi_success();
+        assert_eq!(
+            nvram.get_test_var(name).await.unwrap_efi_success(),
+            (attributes, Some(b"firmware".to_vec()))
+        );
+        let mut returned_attributes = 0;
+        let mut size = 0;
+        let NvramResult(data, status, error) = nvram
+            .uefi_get_variable(
+                Some(name),
+                Guid::default(),
+                &mut returned_attributes,
+                &mut size,
+                true,
+            )
+            .await;
+        assert_eq!(status, EfiStatus::BUFFER_TOO_SMALL);
+        assert!(error.is_none());
+        assert_eq!(size, 8);
+        assert_eq!(returned_attributes, attributes);
+        assert_eq!(data, None);
+        let data = nvram
+            .uefi_get_variable(
+                Some(name),
+                Guid::default(),
+                &mut returned_attributes,
+                &mut size,
+                false,
+            )
+            .await
+            .unwrap_efi_success();
+        assert_eq!(data, Some(b"firmware".to_vec()));
+        assert_eq!((returned_attributes, size), (attributes, 8));
+    }
+
+    // Test: Probe a variable with undersized non-null buffers, then retry using the returned capacity.
+    // Expected: Every short probe returns exact size/attributes without data, and an exact-capacity retry returns unchanged bytes.
+    #[async_test]
+    async fn get_variable_short_buffer_probes_preserve_value_for_exact_retry() {
+        let mut nvram = NvramSpecServices::new(InMemoryNvram::new());
+        nvram.prepare_for_boot();
+        let name = wchz!(u16, "RetryVariable").as_bytes();
+        let attributes: u32 = EfiVariableAttributes::DEFAULT_ATTRIBUTES.into();
+        nvram
+            .set_test_var(name, attributes, b"firmware")
+            .await
+            .unwrap_efi_success();
+        for capacity in [0, 1, 7] {
+            let mut size = capacity;
+            let mut returned_attributes = 0;
+            let NvramResult(data, status, error) = nvram
+                .uefi_get_variable(
+                    Some(name),
+                    Guid::default(),
+                    &mut returned_attributes,
+                    &mut size,
+                    false,
+                )
+                .await;
+            assert_eq!(status, EfiStatus::BUFFER_TOO_SMALL);
+            assert!(error.is_none());
+            assert_eq!(data, None);
+            assert_eq!((returned_attributes, size), (attributes, 8));
+            let data = nvram
+                .uefi_get_variable(
+                    Some(name),
+                    Guid::default(),
+                    &mut returned_attributes,
+                    &mut size,
+                    false,
+                )
+                .await
+                .unwrap_efi_success();
+            assert_eq!(data, Some(b"firmware".to_vec()));
+            assert_eq!((returned_attributes, size), (attributes, 8));
+        }
+    }
 }
