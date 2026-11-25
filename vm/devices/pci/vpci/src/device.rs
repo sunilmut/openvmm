@@ -3079,4 +3079,6 @@ mod tests {
         assert_ne!(addr, 0);
         assert_eq!(data, 0);
     }
+
+    mod behavior;
 }
