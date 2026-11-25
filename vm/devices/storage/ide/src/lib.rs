@@ -3373,4 +3373,6 @@ mod tests {
             .unwrap();
         assert_eq!(buffer, file_contents.as_bytes()[..buffer.len()]);
     }
+
+    mod bus_master;
 }
