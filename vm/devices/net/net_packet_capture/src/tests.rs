@@ -447,3 +447,57 @@ async fn receive_capture_uses_packet_length_not_buffer_capacity(driver: DefaultD
     assert_eq!(queues[0].rx_poll(&mut pool, &mut [RxId(99)]).unwrap(), 1);
     assert_eq!(decode(&capture).1, vec![(6, b"packet".to_vec()); 2]);
 }
+
+// Test: Truncate a binary TX snapshot inside its second discontiguous fragment.
+// Expected: The PCAP record retains the 19-byte wire length and exact nine-byte
+//       prefix, while loopback still receives all three fragments without changes.
+#[async_test]
+async fn transmit_snapshot_clips_inside_a_fragment_without_truncating_delivery(
+    driver: DefaultDriver,
+) {
+    let (mut endpoint, control) = endpoint();
+    let capture = Capture::default();
+    apply(&mut endpoint, &control, start(9, vec![capture.clone()])).await;
+    let payload: [u8; 19] = std::array::from_fn(|i| (i as u8).wrapping_mul(37));
+    let memory = GuestMemory::allocate(16384);
+    memory.write_at(8190, &payload[..5]).unwrap();
+    memory.write_at(12291, &payload[5..16]).unwrap();
+    memory.write_at(9000, &payload[16..]).unwrap();
+    let mut pool = Bufs::new(memory);
+    let mut head = packet(8190, 19, 7);
+    head.len = 5;
+    let TxSegmentType::Head(metadata) = &mut head.ty else {
+        unreachable!();
+    };
+    metadata.segment_count = 3;
+    let segments = [
+        head,
+        TxSegment {
+            ty: TxSegmentType::Tail,
+            gpa: 12291,
+            len: 11,
+        },
+        TxSegment {
+            ty: TxSegmentType::Tail,
+            gpa: 9000,
+            len: 3,
+        },
+    ];
+    let mut queues = queues(&mut endpoint, &driver).await;
+    let queue = &mut queues[0];
+    queue.rx_avail(&mut pool, &[RxId(0)]);
+    assert_eq!(queue.tx_avail(&mut pool, &segments).unwrap(), (true, 3));
+    assert_eq!(
+        decode(&capture),
+        (vec![9], vec![(19, payload[..9].to_vec())])
+    );
+    let mut received = [RxId(99)];
+    assert_eq!(queue.rx_poll(&mut pool, &mut received).unwrap(), 1);
+    assert_eq!(received[0].0, 0);
+    assert_eq!(pool.rx_metadata(RxId(0)).unwrap().len, 19);
+    let mut delivered = [0; 19];
+    pool.guest_memory().read_at(0, &mut delivered).unwrap();
+    assert_eq!(delivered, payload);
+    drop(queues);
+    endpoint.stop().await;
+}
