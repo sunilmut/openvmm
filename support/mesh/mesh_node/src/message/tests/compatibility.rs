@@ -61,3 +61,26 @@ fn serialized_port_fields_transfer_ownership_and_require_a_resource() {
     assert!(peer.is_closed().unwrap());
     assert!(Message::serialized(&[], vec![]).parse::<(Port,)>().is_err());
 }
+
+// Test: Reject malformed wire data before or after decoding a port capability.
+// Expected: Parsing reports an error and releases both unclaimed resources
+//       and partially decoded ports, closing the peer without retaining it.
+#[test]
+fn malformed_messages_release_unclaimed_and_partially_decoded_ports() {
+    for malformed_first in [true, false] {
+        let (port, peer) = Port::new_pair();
+        let mut wire = OwnedMessage::new((port, 17u32)).serialize();
+        if malformed_first {
+            wire.data.insert(0, 0x0f);
+        } else {
+            wire.data.push(0x0f);
+        }
+        assert!(!peer.is_closed().unwrap());
+        assert!(
+            OwnedMessage::serialized(wire)
+                .parse::<(Port, u32)>()
+                .is_err()
+        );
+        assert!(peer.is_closed().unwrap());
+    }
+}
