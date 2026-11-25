@@ -324,3 +324,6 @@ impl AsyncWrite for Console {
         Pin::new(&mut self.get_mut().sys).poll_close(cx)
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests;

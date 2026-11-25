@@ -908,8 +908,11 @@ dependencies = [
  "crossterm",
  "futures",
  "getrandom 0.4.2",
+ "mesh",
  "pal_async",
+ "tempfile",
  "term",
+ "test_with_tracing",
  "tracing",
  "unix_socket",
 ]
