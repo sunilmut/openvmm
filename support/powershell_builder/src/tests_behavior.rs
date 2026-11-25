@@ -157,3 +157,30 @@ fn paths_display_types_and_owned_strings_remain_literal_arguments() {
         .map(OsString::from)
     );
 }
+
+// Test: Pass an ordinary string containing a typographic right apostrophe.
+// Expected: The apostrophe is doubled because PowerShell also recognizes it
+//       as a single-quote delimiter, preserving the complete literal value.
+//
+// IGNORED: Reproduced enabled: the builder leaves U+2019 undoubled. PowerShell
+//       7.6.10 rejects that emitted literal with TerminatorExpectedAtEndOfString.
+#[test]
+#[ignore = "product bug: typographic apostrophes terminate quoted string values"]
+fn typographic_apostrophes_remain_inside_literal_arguments() {
+    let command = PowerShellBuilder::new()
+        .cmdlet("Write-Output")
+        .positional("user\u{2019}s")
+        .finish()
+        .build();
+    assert_eq!(
+        arguments(&command),
+        [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Write-Output",
+            "'user\u{2019}\u{2019}s'",
+        ]
+        .map(OsString::from)
+    );
+}
