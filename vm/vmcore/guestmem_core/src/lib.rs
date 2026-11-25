@@ -400,3 +400,6 @@ impl<T: MemoryWrite> MemoryWrite for Limit<T> {
         self.len
     }
 }
+
+#[cfg(test)]
+mod tests;
