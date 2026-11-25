@@ -576,3 +576,52 @@ async fn enlightened_read_errors_report_status_and_allow_a_valid_retry() {
         assert_eq!(actual, contents.as_bytes()[..512]);
     }
 }
+
+// Test: Poll alternate status before acknowledging a pending IDENTIFY interrupt.
+// Expected: Polling preserves IRQ; regular status clears IRQ without clearing
+//       the separately acknowledged bus-master interrupt bit.
+#[test]
+fn alternate_status_preserves_irq_and_regular_status_preserves_the_dma_latch() {
+    use vmcore::line_interrupt::test_helpers::TestLineInterruptTarget;
+
+    let file = NamedTempFile::new().unwrap();
+    file.as_file().set_len(1024 * 1024).unwrap();
+    let disk = Disk::new(FileDisk::open(file.reopen().unwrap(), false).unwrap()).unwrap();
+    let target = TestLineInterruptTarget::new_arc();
+    let mut device = IdeDevice::new(
+        GuestMemory::empty(),
+        &mut ExternallyManagedPortIoIntercepts,
+        [Some(DriveMedia::hard_disk(disk)), None],
+        [None, None],
+        LineInterrupt::new_with_target("IDE", target.clone(), 0),
+        LineInterrupt::detached(),
+    )
+    .unwrap();
+    enable_dma(&mut device);
+    execute_command(
+        &mut device,
+        &IdePath::default(),
+        IdeCommand::IDENTIFY_DEVICE.0,
+    );
+    assert!(target.is_high(0));
+    let status = register(&mut device, IdeIoPort::PRI_ALT_STATUS_DEVICE_CTL);
+    assert!(Status::from_bits(status).drq());
+    assert!(!Status::from_bits(status).bsy());
+    for _ in 0..3 {
+        assert_eq!(
+            register(&mut device, IdeIoPort::PRI_ALT_STATUS_DEVICE_CTL),
+            status
+        );
+        assert!(target.is_high(0));
+    }
+
+    assert_eq!(register(&mut device, IdeIoPort::PRI_STATUS_CMD), status);
+    assert!(!target.is_high(0));
+    let mut dma_status = [0];
+    device.io_read(0xc002, &mut dma_status).unwrap();
+    assert_eq!(dma_status[0] & 4, 4);
+    device.io_write(0xc002, &[4]).unwrap();
+    device.io_read(0xc002, &mut dma_status).unwrap();
+    assert_eq!(dma_status[0] & 4, 0);
+    assert!(!target.is_high(0));
+}
