@@ -254,3 +254,24 @@ fn restore_command_parameter_count_does_not_overflow_the_fifo() {
     rig.issue(&[0; 16]);
     assert_eq!(rig.read(0x3f5), 0x80);
 }
+
+// IGNORED: No-pending SENSE returns two invalid-status bytes instead of one.
+//       After a guest reads its single-byte response, the controller remains
+//       in the result phase with MSR 0xd0 instead of command-ready 0x80.
+//
+// Test: Sense interrupt status after all four reset statuses are acknowledged.
+// Expected: The no-pending response is one invalid-status byte, followed by
+//       command-ready status and a successful VERSION command.
+#[test]
+#[ignore = "product bug: no-pending SENSE leaves an extra result byte queued"]
+fn sense_without_pending_interrupt_returns_one_byte_and_releases_the_fifo() {
+    let mut rig = Rig::without_disk();
+    assert_eq!(rig.read(0x3f4), 0x80);
+    rig.issue(&[8]);
+    assert_eq!(rig.read(0x3f5), 0x80);
+    assert_eq!(rig.read(0x3f4), 0x80);
+    assert!(!rig.interrupt.0.load(Ordering::SeqCst));
+    rig.issue(&[0x10]);
+    assert_eq!(rig.read(0x3f5), 0x90);
+    assert_eq!(rig.read(0x3f4), 0x80);
+}
