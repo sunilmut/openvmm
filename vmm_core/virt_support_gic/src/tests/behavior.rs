@@ -415,3 +415,68 @@ fn last_configured_shared_interrupt_is_deliverable() {
         Some(95)
     );
 }
+
+// Test: Mask a pending private interrupt and then unmask it on its owning CPU.
+// Expected: Masking suppresses IRQ without discarding pending state; unmasking
+//       restores delivery once, with no pending interrupt on another CPU.
+#[test]
+fn private_interrupt_masking_preserves_pending_delivery() {
+    let (distributor, [first, mut second, _]) = controller();
+    write32(&distributor, sgi_address(1, S::IGROUPR0), 1 << 17);
+    write32(&distributor, sgi_address(1, S::ISENABLER0), 1 << 17);
+    distributor.raise_ppi(VpIndex::new(1), 17);
+    assert!(distributor.irq_pending(&second));
+    write32(&distributor, sgi_address(1, S::ICENABLER0), 1 << 17);
+    assert!(!distributor.irq_pending(&second));
+    assert_eq!(read32(&distributor, sgi_address(1, S::ISPENDR0)), 1 << 17);
+    assert!(!distributor.irq_pending(&first));
+    write32(&distributor, sgi_address(1, S::ISENABLER0), 1 << 17);
+    assert!(distributor.irq_pending(&second));
+    assert_eq!(
+        distributor.read_sysreg(&mut second, SystemReg::ICC_IAR1_EL1),
+        Some(17)
+    );
+    assert!(
+        distributor.write_sysreg(&mut second, SystemReg::ICC_EOIR1_EL1, 17, |_| panic!(
+            "EOI must not wake"
+        ))
+    );
+    assert!(!distributor.irq_pending(&second));
+    assert_eq!(read32(&distributor, sgi_address(1, S::ISPENDR0)), 0);
+}
+
+// IGNORED: Redistributor acknowledgement does not filter masked pending bits.
+//          With PPI 19 masked and PPI 17 enabled, ICC_IAR1_EL1 returns 19.
+// Test: Raise a masked private interrupt while another enabled interrupt
+//       asserts the owning CPU's IRQ, then acknowledge that IRQ.
+// Expected: Acknowledgement selects the enabled interrupt; the masked one
+//       remains pending and becomes deliverable only after it is unmasked.
+#[test]
+#[ignore = "acknowledgement returns masked PPI 19 instead of enabled PPI 17"]
+fn masked_private_interrupt_cannot_steal_another_interrupt_acknowledgement() {
+    let (distributor, [_, mut second, _]) = controller();
+    let both = (1 << 17) | (1 << 19);
+    write32(&distributor, sgi_address(1, S::IGROUPR0), both);
+    write32(&distributor, sgi_address(1, S::ISENABLER0), both);
+    write32(&distributor, sgi_address(1, S::ICENABLER0), 1 << 19);
+    distributor.raise_ppi(VpIndex::new(1), 19);
+    distributor.raise_ppi(VpIndex::new(1), 17);
+    assert!(distributor.irq_pending(&second));
+    assert_eq!(
+        distributor.read_sysreg(&mut second, SystemReg::ICC_IAR1_EL1),
+        Some(17)
+    );
+    assert_eq!(read32(&distributor, sgi_address(1, S::ISPENDR0)), 1 << 19);
+    assert!(
+        distributor.write_sysreg(&mut second, SystemReg::ICC_EOIR1_EL1, 17, |_| panic!(
+            "EOI must not wake"
+        ))
+    );
+    assert!(!distributor.irq_pending(&second));
+    write32(&distributor, sgi_address(1, S::ISENABLER0), 1 << 19);
+    assert!(distributor.irq_pending(&second));
+    assert_eq!(
+        distributor.read_sysreg(&mut second, SystemReg::ICC_IAR1_EL1),
+        Some(19)
+    );
+}
