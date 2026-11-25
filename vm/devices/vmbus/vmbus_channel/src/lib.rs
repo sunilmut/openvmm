@@ -139,3 +139,6 @@ pub struct RawAsyncChannel<M: RingMem> {
     /// The object to use to communicate notifications with the remote endpoint.
     pub signal: Box<dyn SignalVmbusChannel>,
 }
+
+#[cfg(all(test, feature = "test_helpers"))]
+mod tests;
