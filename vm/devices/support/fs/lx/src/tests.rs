@@ -246,3 +246,37 @@ fn unicode_collection_and_text_comparisons_agree_across_owned_and_borrowed_forms
     let borrowed: &LxStr = name.as_ref();
     assert_eq!(LxString::from(borrowed).into_vec(), expected.as_bytes());
 }
+
+// Test: Convert filesystem timestamps before 1970 and after the signed 2038 limit.
+// Expected: The 64-bit stat ABI retains signed seconds and nanosecond precision;
+//       conversion back to statx neither clamps negative dates nor narrows seconds.
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn stat_timestamps_preserve_pre_epoch_and_post_2038_values() {
+    for (seconds, nanoseconds) in [
+        (-1i64, 999_999_999),
+        (-2_208_988_800, 0),
+        (2_147_483_648, 1),
+        (4_102_444_800, 123_456_789),
+    ] {
+        let expected = StatExTimestamp {
+            seconds,
+            nanoseconds,
+            _rsvd: 0,
+        };
+        let stat = Stat::from(StatEx {
+            access_time: StatExTimestamp {
+                seconds,
+                nanoseconds,
+                _rsvd: 0,
+            },
+            ..Default::default()
+        });
+        assert_eq!(
+            stat.access_time.seconds.to_ne_bytes(),
+            seconds.to_ne_bytes()
+        );
+        assert_eq!(stat.access_time.nanoseconds as u64, u64::from(nanoseconds));
+        assert_eq!(StatExTimestamp::from(stat.access_time), expected);
+    }
+}
