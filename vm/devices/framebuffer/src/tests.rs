@@ -390,3 +390,48 @@ fn restoring_unmapped_snapshot_removes_destination_mapping() {
     destination.restore(source.save().unwrap()).unwrap();
     assert_eq!(mapper.take(), [MappingEvent::Unmap]);
 }
+
+// Test: Read strided scanlines ending at the VRAM boundary, then shrink the
+//       format to the final pixel without replacing the shared backing.
+// Expected: Both rows and the final pixel remain readable; stride padding and
+//       bytes past the visible width never overwrite the caller's output tail.
+#[test]
+fn scanline_reads_include_the_final_vram_pixel_after_format_changes() {
+    let (device, mut view, _) = device();
+    let mut control = device.control();
+    let memory = control.memory().unwrap();
+    memory
+        .write_at((FRAMEBUFFER_SIZE - 48) as u64, &[0xa5; 48])
+        .unwrap();
+    let rows = [b"first scanline!!", b"final scanline!!"];
+    memory
+        .write_at((FRAMEBUFFER_SIZE - 48) as u64, rows[0])
+        .unwrap();
+    memory
+        .write_at((FRAMEBUFFER_SIZE - 16) as u64, rows[1])
+        .unwrap();
+    control.set_format(FramebufferFormat {
+        width: 4,
+        height: 2,
+        bytes_per_line: 32,
+        offset: FRAMEBUFFER_SIZE - 48,
+    });
+    assert_eq!(view.resolution(), (4, 2));
+    for (line, expected) in rows.into_iter().enumerate() {
+        let mut pixels = [0xcc; 24];
+        view.read_line(line as u16, &mut pixels);
+        assert_eq!(&pixels[..16], expected);
+        assert_eq!(&pixels[16..], &[0xcc; 8]);
+    }
+    control.set_format(FramebufferFormat {
+        width: 1,
+        height: 1,
+        bytes_per_line: 4,
+        offset: FRAMEBUFFER_SIZE - 4,
+    });
+    assert_eq!(view.resolution(), (1, 1));
+    let mut pixel = [0xcc; 8];
+    view.read_line(0, &mut pixel);
+    assert_eq!(&pixel[..4], b"ne!!");
+    assert_eq!(&pixel[4..], &[0xcc; 4]);
+}
