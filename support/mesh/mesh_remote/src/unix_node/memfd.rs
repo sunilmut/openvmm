@@ -176,3 +176,47 @@ impl Drop for SealedMemfd {
         self.unmap();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::FileExt;
+    use test_with_tracing::test;
+
+    // Test: Request an empty shared-message mapping.
+    // Expected: Construction rejects it with a contextual InvalidInput error.
+    #[test]
+    fn empty_mapping_is_rejected_with_context() {
+        let error = MemfdBuilder::new(0).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "mapping size cannot be 0");
+    }
+
+    // Test: Seal a message spanning a page boundary and try mutating or resizing its backing file.
+    // Expected: The payload is unchanged in both mappings, and kernel seals reject every mutation.
+    #[test]
+    fn sealed_message_remains_immutable_across_multiple_mappings() {
+        let expected: Vec<_> = (0..4097).map(|i| (i % 251) as u8).collect();
+        let mut builder = MemfdBuilder::new(expected.len()).unwrap();
+        assert!(builder.len() >= expected.len());
+        builder[..expected.len()].copy_from_slice(&expected);
+        let file = builder.seal().unwrap();
+        let first = SealedMemfd::new(file.try_clone().unwrap()).unwrap();
+        let second = SealedMemfd::new(file.try_clone().unwrap()).unwrap();
+        assert_eq!(&first[..expected.len()], expected);
+        assert_eq!(&second[..expected.len()], expected);
+        assert!(first[expected.len()..].iter().all(|&byte| byte == 0));
+        assert_eq!(
+            file.write_at(b"changed", 0).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        for size in [0, file.metadata().unwrap().len() + 4096] {
+            assert_eq!(
+                file.set_len(size).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+        assert_eq!(&first[..expected.len()], expected);
+        assert_eq!(&second[..expected.len()], expected);
+    }
+}

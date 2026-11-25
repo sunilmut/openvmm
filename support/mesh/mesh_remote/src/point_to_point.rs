@@ -341,4 +341,72 @@ mod tests {
         let result = receiver.recv().await;
         assert!(result.is_err(), "expected error, got {:?}", result);
     }
+
+    // Test: Exchange address identities against an independently encoded peer header.
+    // Expected: Both UUIDs retain byte order, and the emitted header uses the mesh wire format.
+    #[async_test]
+    async fn address_handshake_preserves_wire_identities() {
+        use futures::io::Cursor;
+        use mesh_node::common::Address;
+        use mesh_node::common::NodeId;
+        use mesh_node::common::PortId;
+        use mesh_node::common::Uuid;
+
+        let local = Address::new(
+            NodeId(Uuid(std::array::from_fn(|i| i as u8))),
+            PortId(Uuid(std::array::from_fn(|i| 0x10 + i as u8))),
+        );
+        let mut peer = b"mesh".to_vec();
+        peer.extend(0x30..0x40);
+        peer.extend(0x50..0x60);
+        let mut input = Cursor::new(peer);
+        let mut output = Cursor::new(Vec::new());
+        let address = super::exchange_addresses(local, &mut output, &mut input)
+            .await
+            .unwrap();
+        assert_eq!((address.node.0).0, std::array::from_fn(|i| 0x30 + i as u8));
+        assert_eq!((address.port.0).0, std::array::from_fn(|i| 0x50 + i as u8));
+        let mut expected = b"mesh".to_vec();
+        expected.extend(0x00..0x10);
+        expected.extend(0x10..0x20);
+        assert_eq!(*output.get_ref(), expected);
+    }
+
+    // Test: Present a full header with bad magic and every truncated peer-header length.
+    // Expected: Bad magic returns InvalidData; all truncations return UnexpectedEof.
+    #[async_test]
+    async fn address_handshake_rejects_bad_magic_and_all_truncations() {
+        use futures::io::Cursor;
+        use mesh_node::common::Address;
+        use mesh_node::common::NodeId;
+        use mesh_node::common::PortId;
+
+        for length in 0..=36 {
+            let mut header = b"mesh".to_vec();
+            header.extend([0x33; 32]);
+            header.truncate(length);
+            if length == 36 {
+                header[0] = b'M';
+            }
+            let mut input = Cursor::new(header);
+            let mut output = Cursor::new(Vec::new());
+            let result = super::exchange_addresses(
+                Address::new(NodeId::new(), PortId::new()),
+                &mut output,
+                &mut input,
+            )
+            .await;
+            let error = result.unwrap_err();
+            if length == 36 {
+                assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+                assert_eq!(error.to_string(), "invalid address header");
+            } else {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof,
+                    "length {length}"
+                );
+            }
+        }
+    }
 }
