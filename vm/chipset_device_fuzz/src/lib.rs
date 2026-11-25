@@ -628,3 +628,6 @@ impl PollDeviceServices for FuzzChipsetServicesImpl<'_> {
         self.took_poll.get()
     }
 }
+
+#[cfg(test)]
+mod tests;
