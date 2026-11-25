@@ -180,3 +180,5 @@ async fn wire_responses_preserve_error_classification_and_stream_routing(driver:
         peer.await;
     }
 }
+
+mod reference_tests;
