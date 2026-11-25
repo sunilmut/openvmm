@@ -525,3 +525,65 @@ fn page_attribute_read_surfaces_module_errors() {
         Err(TdCallResultCode::OPERAND_INVALID)
     ));
 }
+
+// Test: Fail a visibility change after partial progress, then retry the range.
+// Expected: The host error is returned unchanged and a fresh request starts
+//       at the original GPA with the full length for either visibility.
+#[test]
+fn visibility_error_after_progress_allows_fresh_retry() {
+    for shared in [false, true] {
+        let start = 0x4000
+            | if shared {
+                TDX_SHARED_GPA_BOUNDARY_ADDRESS_BIT
+            } else {
+                0
+            };
+        let mut calls = 0;
+        let mut call = Stub(|input: TdcallInput| {
+            calls += 1;
+            assert!(calls <= 3);
+            assert_eq!(input.leaf, TdCallLeaf::VP_VMCALL);
+            assert_eq!(input.r11, TdVmCallSubFunction::MapGpa as u64);
+            assert_eq!(input.r12, start + if calls == 2 { 0x1000 } else { 0 });
+            assert_eq!(input.r13, if calls == 2 { 0x3000 } else { 0x4000 });
+            let mut reply = output(TdCallResultCode::SUCCESS);
+            if calls == 1 {
+                reply.r10 = TdVmCallR10Result::RETRY.0;
+                reply.r11 = start + 0x1000;
+            } else if calls == 2 {
+                reply.r10 = TdVmCallR10Result::OPERAND_INVALID.0;
+            }
+            reply
+        });
+        assert_eq!(
+            tdcall_map_gpa(&mut call, MemoryRange::new(0x4000..0x8000), shared),
+            Err(TdVmCallR10Result::OPERAND_INVALID)
+        );
+        tdcall_map_gpa(&mut call, MemoryRange::new(0x4000..0x8000), shared).unwrap();
+        assert_eq!(calls, 3);
+    }
+}
+
+// IGNORED: An out-of-range retry GPA terminates the loop and returns success
+//       even though the host did not report a successful visibility change.
+//
+// Test: Return a retry GPA at or beyond the requested visibility range's end.
+// Expected: The helper rejects invalid progress instead of reporting success.
+#[test]
+#[ignore = "MapGPA accepts an out-of-range retry GPA as successful completion"]
+fn visibility_retry_past_end_returns_an_error() {
+    for shared in [false, true] {
+        for invalid_offset in [0x4000, 0x5000] {
+            let mut call = Stub(|input: TdcallInput| {
+                let mut reply = output(TdCallResultCode::SUCCESS);
+                reply.r10 = TdVmCallR10Result::RETRY.0;
+                reply.r11 = input.r12 + invalid_offset;
+                reply
+            });
+            assert!(
+                tdcall_map_gpa(&mut call, MemoryRange::new(0x4000..0x8000), shared).is_err(),
+                "invalid retry offset {invalid_offset:#x}, shared={shared}"
+            );
+        }
+    }
+}
