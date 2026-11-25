@@ -19,5 +19,8 @@ futures.workspace = true
 stackfuture.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+parking_lot.workspace = true
+
 [lints]
 workspace = true

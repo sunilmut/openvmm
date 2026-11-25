@@ -645,3 +645,6 @@ impl<T: DiskIo> DynDisk for T {
         Box::pin(DiskIo::wait_resize(self, sector_count))
     }
 }
+
+#[cfg(test)]
+mod tests;
