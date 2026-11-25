@@ -4,6 +4,7 @@
 use super::*;
 use crate::tpm20proto::*;
 use test_with_tracing::test;
+use zerocopy::FromBytes;
 
 // Test: Round-trip empty, small and maximum-sized 2B payloads, with nonzero trailing input and every truncation.
 // Expected: Only the declared payload is serialized, unused backing bytes are zero, limits are enforced with precise lengths, and all incomplete encodings are rejected.
@@ -91,5 +92,37 @@ fn reply_headers_enforce_session_and_size_invariants() {
 fn known_bug_short_nv_read_reply_is_rejected_without_panicking() {
     for len in 0..10 {
         assert!(NvReadReply::deserialize(&vec![0; len]).is_none());
+    }
+}
+
+// Test: Decode a session command's complete successful reply and its legal header-only TPM failure reply.
+// Expected: The successful control validates with session data, while the short error reply preserves its TPM failure code without demanding success-only authorization bytes.
+#[test]
+#[ignore = "Confirmed product bug: typed session reply decoding rejects a legal header-only TPM failure as ResponseSizeTooSmall"]
+fn known_bug_session_command_accepts_header_only_tpm_failure_reply() {
+    let success = [0x80, 2, 0, 0, 0, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let (_, succeeded) =
+        ClearControlCmd::base_validate_reply(&success, SessionTagEnum::Sessions).unwrap();
+    assert!(succeeded);
+    let failure = [0x80, 1, 0, 0, 0, 10, 0, 0, 1, 1];
+    let (reply, succeeded) =
+        ClearControlCmd::base_validate_reply(&failure, SessionTagEnum::Sessions).unwrap();
+    assert!(!succeeded);
+    let header = common::ReplyHeader::read_from_prefix(reply.as_bytes())
+        .unwrap()
+        .0;
+    assert_eq!(header.response_code.get(), 0x101);
+    assert_eq!(header.size.get(), 10);
+}
+
+// Test: Provide every declared byte of over-capacity TPM2B payloads, with extra trailing input.
+// Expected: Capacity rejection is independent of truncation and never copies or accepts the over-limit payload.
+#[test]
+fn sized_buffer_rejects_complete_oversized_wire_payloads() {
+    for size in [MAX_DIGEST_BUFFER_SIZE + 1, u16::MAX as usize] {
+        let mut wire = (size as u16).to_be_bytes().to_vec();
+        wire.extend(std::iter::repeat_n(0xa5, size));
+        wire.extend_from_slice(&[0x81, 0, 0xff, 0x27]);
+        assert!(Tpm2bBuffer::deserialize(&wire).is_none());
     }
 }
