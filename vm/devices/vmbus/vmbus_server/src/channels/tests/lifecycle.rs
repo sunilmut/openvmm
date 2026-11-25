@@ -550,3 +550,75 @@ fn queued_reopen_waits_for_the_previous_device_close() {
     assert_eq!(response.open_id, 23);
     assert_eq!(response.status, 0);
 }
+
+// Test: Send a discontiguous GPADL in a full header, a full body, and a short body.
+// Expected: Only the complete mapping reaches the device, with every page in
+//       guest-supplied order; the guest reply waits for device acceptance.
+#[test]
+fn full_sized_gpadl_fragments_preserve_page_order_and_defer_completion() {
+    let mut env = TestEnv::new();
+    let offer = env.offer(1);
+    env.connect(Version::Copper, FeatureFlags::new());
+    env.c().handle_request_offers().unwrap();
+    env.notifier.messages.clear();
+
+    // The range descriptor uses one header slot, leaving one page for the last body.
+    let page_count =
+        (protocol::GpadlHeader::MAX_DATA_VALUES + protocol::GpadlBody::MAX_DATA_VALUES) as u64;
+    let mut range = vec![page_count * 4096];
+    range.extend((0..page_count).rev().map(|page| 0x100 + page * 3));
+    let mut header = in_msg(
+        protocol::MessageType::GPADL_HEADER,
+        protocol::GpadlHeader {
+            channel_id: ChannelId(1),
+            gpadl_id: GpadlId(57),
+            count: 1,
+            len: u16::try_from(range.as_bytes().len()).unwrap(),
+        },
+    );
+    header
+        .data
+        .extend_from_slice(range[..protocol::GpadlHeader::MAX_DATA_VALUES].as_bytes());
+    env.send_message(header);
+
+    for pages in
+        range[protocol::GpadlHeader::MAX_DATA_VALUES..].chunks(protocol::GpadlBody::MAX_DATA_VALUES)
+    {
+        assert!(matches!(
+            env.recv.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(env.notifier.messages.is_empty());
+        let mut body = in_msg(
+            protocol::MessageType::GPADL_BODY,
+            protocol::GpadlBody {
+                rsvd: 0,
+                gpadl_id: GpadlId(57),
+            },
+        );
+        body.data.extend_from_slice(pages.as_bytes());
+        env.send_message(body);
+    }
+
+    let (actual_offer, action) = env.recv.try_recv().unwrap();
+    assert_eq!(actual_offer, offer);
+    let Action::Gpadl(id, count, actual_range) = action else {
+        panic!("expected the complete GPADL");
+    };
+    assert_eq!(id, GpadlId(57));
+    assert_eq!(count, 1);
+    assert_eq!(actual_range, range);
+    assert!(matches!(
+        env.recv.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert!(env.notifier.messages.is_empty());
+    env.c()
+        .gpadl_create_complete(offer, GpadlId(57), protocol::STATUS_SUCCESS);
+    env.notifier
+        .check_message(OutgoingMessage::new(&protocol::GpadlCreated {
+            channel_id: ChannelId(1),
+            gpadl_id: GpadlId(57),
+            status: protocol::STATUS_SUCCESS,
+        }));
+}
