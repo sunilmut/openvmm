@@ -298,4 +298,30 @@ mod tests {
         put(&mut file, 0x2108, &0xa008u16.to_le_bytes());
         assert!(matches!(layout(&file), Err(Error::NeedsRelocation)));
     }
+
+    // Test: Load a wholly fileless PE section while its old file location contains nonzero data.
+    // Expected: The complete BSS section and surrounding gap are zero; headers and text stay exact.
+    #[test]
+    fn fileless_section_ignores_file_bytes_and_preserves_initialized_image() {
+        let mut file = test_image();
+        let section = SECTIONS_OFFSET + size_of::<pe::ImageSectionHeader>();
+        put(
+            &mut file,
+            section + offset_of!(pe::ImageSectionHeader, size_of_raw_data),
+            &0u32.to_le_bytes(),
+        );
+        put(
+            &mut file,
+            section + offset_of!(pe::ImageSectionHeader, pointer_to_raw_data),
+            &0u32.to_le_bytes(),
+        );
+        file[0x2000..].fill(0xc7);
+        let loaded = layout(&file).unwrap();
+        assert_eq!(loaded.image.len(), 0x4000);
+        assert_eq!(loaded.entry_offset, 0x1010);
+        assert_eq!(loaded.alignment, 0x1000);
+        assert_eq!(&loaded.image[..0x1000], &file[..0x1000]);
+        assert_eq!(&loaded.image[0x1000..0x1010], &[0xaa; 16]);
+        assert_eq!(&loaded.image[0x1010..], &vec![0; 0x2ff0]);
+    }
 }
