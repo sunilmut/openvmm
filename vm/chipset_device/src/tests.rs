@@ -401,3 +401,42 @@ fn immediate_io_conversion_rejects_deferred_requests() {
     let (_complete, token) = defer_write();
     let _ = IoResult::Defer(token).now_or_never();
 }
+
+// Test: Probe absent PCI functions with byte, word, and DWORD accesses, then
+//       issue writes through the same routes.
+// Expected: Selected read bytes report no device, other bytes stay untouched,
+//       and no write reaches the endpoint callback.
+#[test]
+fn absent_pci_routes_preserve_subword_access_boundaries() {
+    let mut endpoint = Endpoint::default();
+    for (kind, devfn) in [
+        (PciConfigAccessType::Type0, 1),
+        (PciConfigAccessType::Type0, u8::MAX),
+        (PciConfigAccessType::Type1, 0),
+    ] {
+        let address = PciConfigAddress::new(0, devfn, 0).unwrap();
+        for (offset, len) in [(0, 1), (1, 1), (2, 1), (3, 1), (0, 2), (2, 2), (0, 4)] {
+            let lanes = PciConfigByteEnable::from_offset_len(offset, len).unwrap();
+            let initial = [0x12, 0x34, 0x56, 0x78];
+            let mut value = u32::from_le_bytes(initial);
+            endpoint
+                .pci_cfg_read_with_routing(
+                    kind,
+                    address,
+                    ByteEnabledDwordRead::new(&mut value, lanes),
+                )
+                .unwrap();
+            let mut expected = initial;
+            expected[usize::from(offset)..usize::from(offset) + len].fill(0xff);
+            assert_eq!(value.to_le_bytes(), expected);
+            endpoint
+                .pci_cfg_write_with_routing(
+                    kind,
+                    address,
+                    ByteEnabledDwordWrite::from_intercept_buffer(lanes, &[0x5a; 4][..len]),
+                )
+                .unwrap();
+        }
+    }
+    assert!(endpoint.writes.is_empty());
+}
