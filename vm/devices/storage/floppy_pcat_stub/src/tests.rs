@@ -373,3 +373,34 @@ fn register_dump_returns_cylinders_before_timing_bytes() {
         [7, 0, 0, 0, 0x12, 0x34, 0, 0, 0, 0]
     );
 }
+
+// Test: Apply DOR or software reset halfway through a seek-status reply.
+// Expected: The old cylinder byte is discarded, all four reset indications
+//       are fresh, and a new command completes with normal FIFO direction.
+#[test]
+fn resets_discard_unread_result_bytes_before_new_commands() {
+    for software in [false, true] {
+        let (mut device, irq) = fixture();
+        ready(&mut device);
+        command(&mut device, &[0x0f, 0, 23]);
+        command(&mut device, &[0x08]);
+        assert_eq!(read(&mut device, 5), 0x20);
+        assert_eq!(read(&mut device, 4) & 0xd0, 0xd0);
+        if software {
+            write(&mut device, 4, 0x80);
+        } else {
+            write(&mut device, 2, 0);
+            write(&mut device, 2, 0x0c);
+        }
+        assert!(irq.high());
+        assert_eq!(read(&mut device, 4), 0x80);
+        for drive in 0..4 {
+            command(&mut device, &[0x08]);
+            assert_eq!(result::<2>(&mut device), [0xc0 | drive, 0]);
+        }
+        assert!(!irq.high());
+        command(&mut device, &[0x10]);
+        assert_eq!(read(&mut device, 5), 0x90);
+        assert_eq!(read(&mut device, 4), 0x80);
+    }
+}
