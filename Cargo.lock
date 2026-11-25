@@ -11007,6 +11007,7 @@ dependencies = [
  "inspect",
  "inspect_counters",
  "pal_async",
+ "parking_lot",
  "serial_core",
  "task_control",
  "test_with_tracing",
