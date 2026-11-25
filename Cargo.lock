@@ -4505,6 +4505,7 @@ name = "linux_net_bindings"
 version = "0.0.0"
 dependencies = [
  "nix 0.30.1",
+ "test_with_tracing",
 ]
 
 [[package]]

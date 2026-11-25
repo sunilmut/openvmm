@@ -72,3 +72,6 @@ ioctl_write_ptr_bad!(
     request_code_write!(b'T', 216, size_of::<c_int>()),
     c_int
 );
+
+#[cfg(all(test, target_os = "linux", target_pointer_width = "64"))]
+mod tests;
