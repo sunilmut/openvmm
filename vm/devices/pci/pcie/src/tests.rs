@@ -470,3 +470,40 @@ fn its_irqfd_wrapper_forwards_route_operations() {
         &[Some((0xfee00000, 0x40, Some(0x75678))), None]
     );
 }
+
+// Test: Acknowledge hotplug change events through guest Slot Status writes.
+// Expected: Zero writes retain events, write-one clears only event bits, and
+//       presence remains read-only across removal and reinsertion.
+#[test]
+fn hotplug_status_acknowledgement_preserves_live_presence() {
+    let mut rc = root(false, true, false, &MsiConnection::new());
+    let express = capability(&mut rc, 0x10);
+    let status_address = express + 0x1a;
+    let presence = 0x40_u16;
+    let changed = 0x08_u16;
+    let status = |rc: &mut GenericPcieRootComplex| {
+        (read32(rc, express + 0x18) >> 16) as u16 & (presence | changed)
+    };
+
+    assert_eq!(status(&mut rc), 0);
+    rc.hotplug_add_device("port", "first", Box::new(TestPciDevice))
+        .unwrap();
+    assert_eq!(status(&mut rc), presence | changed);
+    rc.mmio_write(status_address, &0_u16.to_le_bytes()).unwrap();
+    assert_eq!(status(&mut rc), presence | changed);
+    rc.mmio_write(status_address, &presence.to_le_bytes())
+        .unwrap();
+    assert_eq!(status(&mut rc), presence | changed);
+    rc.mmio_write(status_address, &changed.to_le_bytes())
+        .unwrap();
+    assert_eq!(status(&mut rc), presence);
+
+    rc.hotplug_remove_device("port").unwrap();
+    assert_eq!(status(&mut rc), changed);
+    rc.mmio_write(status_address, &(presence | changed).to_le_bytes())
+        .unwrap();
+    assert_eq!(status(&mut rc), 0);
+    rc.hotplug_add_device("port", "replacement", Box::new(TestPciDevice))
+        .unwrap();
+    assert_eq!(status(&mut rc), presence | changed);
+}
