@@ -407,4 +407,19 @@ mod tests {
         proxy.poll(&mut cx);
         assert!(!wake.0.load(Ordering::SeqCst));
     }
+
+    // Test: Access remote memory after its parent service has disappeared.
+    // Expected: Reads, writes and fills return errors for both memory spaces without hanging.
+    #[test]
+    fn closed_service_reports_transport_errors() {
+        let (task, normal, encrypted) =
+            GuestMemoryTask::new(GuestMemory::allocate(4096), GuestMemory::allocate(4096));
+        drop(task);
+        for builder in [normal, encrypted] {
+            let memory = builder.build("disconnected-memory");
+            assert!(memory.read_at(0, &mut [0; 4]).is_err());
+            assert!(memory.write_at(0, &[1, 2, 3, 4]).is_err());
+            assert!(memory.fill_at(0, 0xaa, 4).is_err());
+        }
+    }
 }

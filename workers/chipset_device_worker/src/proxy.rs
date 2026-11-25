@@ -590,4 +590,6 @@ mod tests {
         );
         stop_worker(&mut proxy).await;
     }
+
+    mod behavior;
 }
