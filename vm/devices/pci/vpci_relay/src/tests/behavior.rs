@@ -287,3 +287,35 @@ async fn mock_flow_mapping_errors_remain_contextual(driver: DefaultDriver) {
         TdispTdiState::Unlocked
     );
 }
+
+// Test: Queue mixed byte-enable writes to one register during TDISP activation,
+//       with deliberately different data in every disabled byte.
+// Expected: Nothing is forwarded early; all callers finish and only selected
+//       bytes change, preserving earlier queued updates rather than stale data.
+#[async_test]
+async fn queued_partial_writes_merge_against_the_current_register(driver: DefaultDriver) {
+    let relay = connect_relay(&driver, true).await;
+    relay
+        .write(SCRATCH_OFFSET, 0x4433_2211, PciConfigByteEnable::FULL)
+        .unwrap();
+    let activate = relay.deferred_write(
+        HeaderType00::STATUS_COMMAND.0,
+        command(true),
+        PciConfigByteEnable::LOW_WORD,
+    );
+    let pending: Vec<_> = [
+        (PciConfigByteEnable::BYTE0, 0xdead_be55),
+        (PciConfigByteEnable::HIGH_WORD, 0x77bb_8899),
+        (PciConfigByteEnable::BYTE1, 0xaabb_88dd),
+    ]
+    .into_iter()
+    .map(|(mask, value)| relay.deferred_write(SCRATCH_OFFSET, value, mask))
+    .collect();
+    assert_eq!(relay.read(SCRATCH_OFFSET), 0x4433_2211);
+    relay.drive(activate.write_future()).await.unwrap();
+    for token in pending {
+        relay.drive(token.write_future()).await.unwrap();
+    }
+    assert_eq!(relay.read(SCRATCH_OFFSET), 0x77bb_8855);
+    assert_eq!(relay.device.tdisp().tdi_state().await, TdispTdiState::Run);
+}
