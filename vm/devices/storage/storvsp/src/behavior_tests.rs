@@ -676,3 +676,49 @@ async fn performance_guest_helper_completes_batched_reads(driver: DefaultDriver)
     tester.read(1).await;
     tester.read(8).await;
 }
+
+// Test: Retry an absent-LUN inquiry after a direction error on the same channel.
+// Expected: The error returns valid fixed sense without transferring data; the
+//       successful retry reports only its own result and preserves buffer guards.
+#[async_test]
+async fn inquiry_error_sense_does_not_leak_into_successful_retry(driver: DefaultDriver) {
+    let fixture = Fixture::new(
+        &driver,
+        &ScsiController::new(),
+        GuestMemory::allocate(65536),
+    )
+    .await;
+    let mut guest = fixture.open(&driver).await;
+    for step in 0..4 {
+        guest.negotiate_step(step).await;
+    }
+    fixture.bus.memory.write_at(32768, &[0x5a; 128]).unwrap();
+    let mut invalid = inquiry(3);
+    invalid.data_in = 0;
+    let (header, response) = guest.scsi(&invalid, 96).await;
+    assert_eq!(header.status, storvsp_protocol::NtStatus::IO_DEVICE_ERROR);
+    assert_eq!(response.scsi_status, ScsiStatus::CHECK_CONDITION);
+    assert_eq!(response.srb_status.status(), SrbStatus::INVALID_REQUEST);
+    assert!(response.srb_status.autosense_valid());
+    assert_eq!(response.data_transfer_length, 0);
+    // Fixed-format sense: ILLEGAL REQUEST / INVALID FIELD IN CDB.
+    assert_eq!(response.payload[0] & 0x7f, 0x70);
+    assert_eq!(response.payload[2] & 0x0f, 0x05);
+    assert_eq!(&response.payload[12..14], &[0x24, 0]);
+    let mut data = [0; 128];
+    fixture.bus.memory.read_at(32768, &mut data).unwrap();
+    assert_eq!(data, [0x5a; 128]);
+
+    let (header, response) = guest.scsi(&inquiry(3), 96).await;
+    assert_eq!(header.status, storvsp_protocol::NtStatus::SUCCESS);
+    assert_eq!(response.scsi_status, ScsiStatus::GOOD);
+    assert_eq!(response.srb_status.status(), SrbStatus::SUCCESS);
+    assert!(!response.srb_status.autosense_valid());
+    assert_eq!(response.payload, [0; 20]);
+    assert_eq!(response.data_transfer_length, 96);
+    fixture.bus.memory.read_at(32768, &mut data).unwrap();
+    assert_eq!(data[0], 0x7f);
+    assert_eq!(&data[96..], &[0x5a; 32]);
+    drop(guest);
+    fixture.finish().await;
+}
