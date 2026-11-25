@@ -49,3 +49,6 @@ pub fn parse_nvram_entry<'a>(
         _ => ParsedNvramEntry::Unknown(data),
     })
 }
+
+#[cfg(test)]
+mod tests;

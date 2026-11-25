@@ -9373,6 +9373,7 @@ name = "uefi_nvram_specvars"
 version = "0.0.0"
 dependencies = [
  "guid",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "ucs2 0.0.0",
  "uefi_specs",
