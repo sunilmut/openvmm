@@ -4554,4 +4554,8 @@ mod tests {
             assert_eq!(HvStatus::from(result), status);
         }
     }
+
+    mod hypercalls;
+    mod registers;
+    mod wire;
 }
