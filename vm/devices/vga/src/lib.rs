@@ -174,3 +174,6 @@ impl SaveRestore for VgaDevice {
         match state {}
     }
 }
+
+#[cfg(test)]
+mod tests;

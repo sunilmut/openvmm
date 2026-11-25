@@ -198,3 +198,150 @@ fn rebuild_expand_pixels_table(
         expand_table.0[cur_entry] = [color(8), color(4), color(2), color(1)];
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Create a small text layout with independent font banks and a hidden cursor.
+    fn text_state() -> TextModeState {
+        TextModeState {
+            current_text_columns: 80,
+            lo_res_text_mode: false,
+            mono_text_mode: false,
+            character_set_512: false,
+            char_set_1: 0,
+            char_set_2: 1,
+            text_char_width: 8,
+            text_char_height: 2,
+            text_rows: 1,
+            blinking_enabled: false,
+            blinking_state: false,
+            draw_text_cursor: false,
+            cursor_first_scanline: 0,
+            cursor_last_scanline: 0,
+            cursor_row: 0,
+            cursor_col: 0,
+            cursor_blink_state: true,
+        }
+    }
+
+    // Test: Clip a text glyph on both sides while preserving the surrounding image.
+    // Expected: Only the requested pixels change and character bits remain aligned.
+    #[test]
+    fn clipped_glyphs_preserve_neighboring_pixels() {
+        let vram = GuestMemory::allocate(0x20000);
+        vram.write_at(0, &[1, 0x21]).unwrap();
+        vram.write_at(2 + 128, &[0xaa]).unwrap();
+        vram.write_plain(0x10000, &[99u32; 8]).unwrap();
+        let params = Parameters {
+            column_left: 0,
+            column_right: 8,
+            clip_left: 2,
+            clip_right: 5,
+            row_number_top: 0,
+            row_number_bottom: 1,
+        };
+        let colors = std::array::from_fn(|i| i as u32);
+        blit_text(&vram, &params, &text_state(), &colors, 0, 0x10000);
+        assert_eq!(
+            vram.read_plain::<[u32; 8]>(0x10000).unwrap(),
+            [99, 99, 1, 2, 1, 99, 99, 99]
+        );
+    }
+
+    // Test: Expand a low-resolution glyph with different nibbles.
+    // Expected: Every original glyph bit becomes two adjacent pixels in order.
+    #[test]
+    fn low_resolution_glyphs_double_each_pixel() {
+        let vram = GuestMemory::allocate(0x20000);
+        vram.write_at(0, &[1, 0x21]).unwrap();
+        vram.write_at(2 + 128, &[0xa5]).unwrap();
+        let mut state = text_state();
+        state.lo_res_text_mode = true;
+        state.current_text_columns = 40;
+        state.text_char_width = 16;
+        let params = Parameters {
+            column_left: 0,
+            column_right: 16,
+            clip_left: 0,
+            clip_right: 16,
+            row_number_top: 0,
+            row_number_bottom: 1,
+        };
+        let colors = std::array::from_fn(|i| i as u32);
+        blit_text(&vram, &params, &state, &colors, 0, 0x10000);
+        assert_eq!(
+            vram.read_plain::<[u32; 16]>(0x10000).unwrap(),
+            [1, 1, 2, 2, 1, 1, 2, 2, 2, 2, 1, 1, 2, 2, 1, 1]
+        );
+    }
+
+    // Test: Render a blinking glyph and overlay a visible cursor on one scanline.
+    // Expected: Blink hides the glyph, while the cursor fills only its selected row.
+    #[test]
+    fn text_blink_and_cursor_have_independent_visibility() {
+        let vram = GuestMemory::allocate(0x20000);
+        vram.write_at(0, &[1, 0xa1]).unwrap();
+        vram.write_at(2 + 128, &[0xff]).unwrap();
+        let mut state = text_state();
+        state.blinking_enabled = true;
+        state.blinking_state = true;
+        let params = Parameters {
+            column_left: 0,
+            column_right: 8,
+            clip_left: 0,
+            clip_right: 8,
+            row_number_top: 0,
+            row_number_bottom: 2,
+        };
+        let colors = std::array::from_fn(|i| i as u32);
+        blit_text(&vram, &params, &state, &colors, 0, 0x10000);
+        assert_eq!(vram.read_plain::<[u32; 8]>(0x10000).unwrap(), [2; 8]);
+        state.blinking_state = false;
+        state.draw_text_cursor = true;
+        state.cursor_first_scanline = 1;
+        state.cursor_last_scanline = 1;
+        vram.write_at(2 + 128, &[0]).unwrap();
+        blit_text(&vram, &params, &state, &colors, 0, 0x10000);
+        assert_eq!(vram.read_plain::<[u32; 8]>(0x10000).unwrap(), [2; 8]);
+        assert_eq!(
+            vram.read_plain::<[u32; 8]>(0x10000 + 640 * 4).unwrap(),
+            [1; 8]
+        );
+        state.cursor_blink_state = false;
+        blit_text(&vram, &params, &state, &colors, 0, 0x10000);
+        assert_eq!(
+            vram.read_plain::<[u32; 8]>(0x10000 + 640 * 4).unwrap(),
+            [2; 8]
+        );
+    }
+
+    // Test: Select two font banks with the text attribute's intensity bit.
+    // Expected: Each character uses the selected bank rather than the other glyph.
+    #[test]
+    fn extended_character_sets_select_the_requested_font_bank() {
+        let vram = GuestMemory::allocate(0x20000);
+        vram.write_at(0, &[1, 1]).unwrap();
+        vram.write_at(8, &[1, 9]).unwrap();
+        vram.write_at(2 + 128, &[0xff]).unwrap();
+        vram.write_at(0x8000 + 2 + 128, &[0]).unwrap();
+        let mut state = text_state();
+        state.character_set_512 = true;
+        let params = Parameters {
+            column_left: 0,
+            column_right: 16,
+            clip_left: 0,
+            clip_right: 16,
+            row_number_top: 0,
+            row_number_bottom: 1,
+        };
+        let colors = std::array::from_fn(|i| i as u32);
+        blit_text(&vram, &params, &state, &colors, 0, 0x10000);
+        assert_eq!(
+            vram.read_plain::<[u32; 16]>(0x10000).unwrap(),
+            [0, 0, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9]
+        );
+    }
+}

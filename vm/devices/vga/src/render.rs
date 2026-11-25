@@ -285,3 +285,6 @@ impl RendererCore {
         );
     }
 }
+
+#[cfg(test)]
+mod tests;
