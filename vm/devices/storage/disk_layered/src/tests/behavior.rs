@@ -273,3 +273,50 @@ async fn resize_wait_forwards_the_callers_observed_capacity() {
         std::task::Poll::Ready(8)
     ));
 }
+
+// Test: Warm a read cache from its parent, then overwrite the middle sector with zeros.
+// Expected: The zero write shadows cached and parent data, adjacent sectors stay
+//       intact, and no parent sector changes.
+#[async_test]
+async fn zero_write_shadows_a_warmed_parent_sector_without_changing_neighbors() {
+    let parent = Arc::new(TestLayer::new(8));
+    for (sector, value) in [(2, 0x22), (3, 0x23), (4, 0x24)] {
+        parent
+            .sectors
+            .lock()
+            .insert(sector, Data(vec![value; 512].into()));
+    }
+    let disk = LayeredDisk::new(
+        false,
+        vec![
+            LayerConfiguration {
+                read_cache: true,
+                ..sparse(8)
+            },
+            LayerConfiguration {
+                layer: DiskLayer::new(parent.clone()),
+                read_cache: false,
+                write_through: false,
+            },
+        ],
+    )
+    .await
+    .unwrap();
+    let mut mem = GuestMemory::allocate(1536);
+    let buffers = OwnedRequestBuffers::linear(0, 1536, true);
+    let mut expected = [vec![0x22; 512], vec![0x23; 512], vec![0x24; 512]].concat();
+    disk.read_vectored(&buffers.buffer(&mem), 2).await.unwrap();
+    assert_eq!(&mem.inner_buf_mut().unwrap()[..1536], expected);
+
+    mem.inner_buf_mut().unwrap()[512..1024].fill(0);
+    disk.write_vectored(&buffers.buffer(&mem).subrange(512, 512), 3, false)
+        .await
+        .unwrap();
+    mem.inner_buf_mut().unwrap().fill(0xe7);
+    disk.read_vectored(&buffers.buffer(&mem), 2).await.unwrap();
+    expected[512..1024].fill(0);
+    assert_eq!(&mem.inner_buf_mut().unwrap()[..1536], expected);
+    for (sector, value) in [(2, 0x22), (3, 0x23), (4, 0x24)] {
+        assert_eq!(&parent.sectors.lock()[&sector].0[..], &[value; 512]);
+    }
+}
