@@ -83,3 +83,83 @@ pub fn blit_non_linear4to32(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Render eight pixels whose four VGA planes have distinct bit patterns.
+    // Expected: Each output pixel uses the palette entry selected by all planes.
+    #[test]
+    fn planar_pixels_select_palette_colors() {
+        let vram = GuestMemory::allocate(4096);
+        vram.write_plain(0, &0x0ff0_ccaa_u32).unwrap();
+        let colors = std::array::from_fn(|i| 0xff00_0000 | i as u32);
+        let parameters = Parameters {
+            column_left: 0,
+            column_right: 8,
+            clip_left: 0,
+            clip_right: 8,
+            row_number_top: 0,
+            row_number_bottom: 1,
+        };
+        blit_non_linear4to32(&vram, &parameters, &colors, 0, false, false, 0, 1, 256, 32);
+        let pixels: [u32; 8] = vram.read_plain(256).unwrap();
+        assert_eq!(pixels, [7, 6, 5, 4, 11, 10, 9, 8].map(|i| colors[i]));
+    }
+
+    // Test: Pan a planar row and clip both sides of the destination.
+    // Expected: Only clipped pixels change, starting at the panned source bit.
+    #[test]
+    fn panning_and_clipping_preserve_surrounding_pixels() {
+        let vram = GuestMemory::allocate(4096);
+        vram.write_plain(0, &0x0ff0_ccaa_u32).unwrap();
+        vram.write_plain(256, &[0xdead_beef_u32; 8]).unwrap();
+        let colors = std::array::from_fn(|i| i as u32);
+        let parameters = Parameters {
+            column_left: 0,
+            column_right: 8,
+            clip_left: 2,
+            clip_right: 5,
+            row_number_top: 0,
+            row_number_bottom: 1,
+        };
+        blit_non_linear4to32(&vram, &parameters, &colors, 1, false, false, 0, 1, 256, 32);
+        let pixels: [u32; 8] = vram.read_plain(256).unwrap();
+        assert_eq!(
+            pixels,
+            [
+                0xdead_beef,
+                0xdead_beef,
+                4,
+                11,
+                10,
+                0xdead_beef,
+                0xdead_beef,
+                0xdead_beef
+            ]
+        );
+    }
+
+    // Test: Render a planar row with horizontal and vertical pixel doubling.
+    // Expected: Each source pixel becomes a two-by-two block of its palette color.
+    #[test]
+    fn doubled_pixels_repeat_in_both_dimensions() {
+        let vram = GuestMemory::allocate(4096);
+        vram.write_plain(0, &0x0ff0_ccaa_u32).unwrap();
+        let colors = std::array::from_fn(|i| i as u32);
+        let parameters = Parameters {
+            column_left: 0,
+            column_right: 16,
+            clip_left: 0,
+            clip_right: 16,
+            row_number_top: 0,
+            row_number_bottom: 2,
+        };
+        blit_non_linear4to32(&vram, &parameters, &colors, 0, true, true, 0, 1, 256, 64);
+        let expected = [7, 7, 6, 6, 5, 5, 4, 4, 11, 11, 10, 10, 9, 9, 8, 8];
+        assert_eq!(vram.read_plain::<[u32; 16]>(256).unwrap(), expected);
+        assert_eq!(vram.read_plain::<[u32; 16]>(320).unwrap(), expected);
+    }
+}
