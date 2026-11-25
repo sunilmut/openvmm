@@ -153,3 +153,51 @@ fn srat_parser_preserves_records_and_rejects_malformed_tables() {
         Err(ParseSratError::UnknownType(0xfe))
     ));
 }
+
+// Test: Change only the declared length of otherwise valid SRAT CPU and memory records, with a successful full-record control.
+// Expected: Invalid declared lengths fail before delivering that record to a topology callback, rather than treating available bytes as a valid affinity entry.
+#[test]
+#[ignore = "Confirmed product bug: SRAT parser accepts a zero declared APIC length and invokes its callback"]
+fn known_bug_srat_parser_rejects_invalid_declared_record_lengths() {
+    let apic = SratApic::new(0xab, 0x44332211);
+    let memory = SratMemory::new(0x100000000, 0x200000, 7);
+    for (record, cpu_count, memory_count) in [(apic.as_bytes(), 1, 0), (memory.as_bytes(), 0, 1)] {
+        let mut cpus = 0;
+        let mut memories = 0;
+        parse_srat(&srat_table(record), |_| cpus += 1, |_| memories += 1).unwrap();
+        assert_eq!((cpus, memories), (cpu_count, memory_count));
+        for declared in [0, 1, record.len() as u8 - 1, record.len() as u8 + 1] {
+            let mut malformed = record.to_vec();
+            malformed[1] = declared;
+            let mut cpus = 0;
+            let mut memories = 0;
+            let raw = srat_table(&malformed);
+            let result = parse_srat(&raw, |_| cpus += 1, |_| memories += 1);
+            assert!(
+                result.is_err(),
+                "accepted declared record length {declared}"
+            );
+            assert_eq!((cpus, memories), (0, 0));
+        }
+    }
+}
+
+// Test: Parse valid CPU and memory records followed by an unknown type and another valid CPU record.
+// Expected: Callbacks retain exactly the accepted prefix and parsing returns the unknown-type error without visiting later records.
+#[test]
+fn srat_parser_stops_after_unknown_record_without_losing_accepted_prefix() {
+    let apic = SratApic::new(0xab, 0x44332211);
+    let memory = SratMemory::new(0x100000000, 0x200000, 7);
+    let body = [apic.as_bytes(), memory.as_bytes(), &[0xfe], apic.as_bytes()].concat();
+    let raw = srat_table(&body);
+    let mut cpus = Vec::new();
+    let mut memories = Vec::new();
+    let result = parse_srat(
+        &raw,
+        |cpu| cpus.push(cpu.as_bytes()),
+        |memory| memories.push(memory.as_bytes()),
+    );
+    assert!(matches!(result, Err(ParseSratError::UnknownType(0xfe))));
+    assert_eq!(cpus, [apic.as_bytes()]);
+    assert_eq!(memories, [memory.as_bytes()]);
+}
