@@ -215,3 +215,53 @@ async fn tx_backpressure_drops_synchronously_and_recovers(driver: DefaultDriver)
     let length = peer.recv(&mut wire).unwrap();
     assert_eq!(&wire[..length], [vec![0; 12], frame].concat());
 }
+
+// Test: Submit one fragmented checksum-offloaded packet followed by a single-segment non-offloaded packet in the same TX batch.
+// Expected: Segment heads delimit two exact datagrams, checksum fixup affects only the first packet, all three segments complete synchronously, and no extra datagram or deferred completion appears.
+#[async_test]
+async fn tx_batch_preserves_packet_boundaries_and_per_packet_offload_flags(driver: DefaultDriver) {
+    let (mut queue, peer) = queue(&driver);
+    let mut pool = Pool::new(0);
+    let mut frame = vec![0x81; 14 + 115];
+    frame[14..34].copy_from_slice(&[
+        0x45, 0, 0, 0x73, 0, 0, 0x40, 0, 0x40, 0x11, 0, 0, 0xc0, 0xa8, 0, 1, 0xc0, 0xa8, 0, 0xc7,
+    ]);
+    let mut input = segments(
+        &pool,
+        &frame,
+        TxFlags::new()
+            .with_is_ipv4(true)
+            .with_offload_ip_header_checksum(true),
+    );
+    let mut plain = frame.clone();
+    plain[0] = 0x27;
+    pool.memory.write_at(2048, &plain).unwrap();
+    input.push(TxSegment {
+        ty: TxSegmentType::Head(TxMetadata {
+            id: TxId(37),
+            segment_count: 1,
+            len: plain.len() as u32,
+            flags: TxFlags::new().with_is_ipv4(true),
+            l2_len: 14,
+            l3_len: 20,
+            ..Default::default()
+        }),
+        gpa: 2048,
+        len: plain.len() as u32,
+    });
+    assert_eq!(queue.tx_avail(&mut pool, &input).unwrap(), (true, 3));
+    frame[24..26].copy_from_slice(&[0xb8, 0x61]);
+    let mut wire = vec![0; 4096];
+    for expected in [frame, plain] {
+        let length = peer.recv(&mut wire).unwrap();
+        assert_eq!(&wire[..length], [vec![0; 12], expected].concat());
+    }
+    peer.set_nonblocking(true).unwrap();
+    assert_eq!(
+        peer.recv(&mut wire).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    let mut done = [TxId(99)];
+    assert_eq!(queue.tx_poll(&mut pool, &mut done).unwrap(), 0);
+    assert_eq!(done[0].0, 99);
+}
