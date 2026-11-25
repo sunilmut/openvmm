@@ -75,3 +75,6 @@ pub const TPM_V185_VERSION: &str = "185";
 
 /// Default NVRAM index size provisioned for AKCert.
 pub const TPM_DEFAULT_AKCERT_SIZE: usize = 4096;
+
+#[cfg(test)]
+mod tests;
