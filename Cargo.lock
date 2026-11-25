@@ -5796,6 +5796,7 @@ dependencies = [
  "memory_range",
  "mesh",
  "page_pool_alloc",
+ "test_with_tracing",
  "tracing",
  "user_driver",
  "virt",

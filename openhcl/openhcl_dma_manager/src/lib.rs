@@ -484,3 +484,6 @@ impl DmaClient for OpenhclDmaClient {
         self.backing.attach_pending_buffers()
     }
 }
+
+#[cfg(test)]
+mod tests;
