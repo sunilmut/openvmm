@@ -406,3 +406,6 @@ mod tests {
         assert_eq!(val(HashTable::new([(0u32, "a")])), "@{0='a'}");
     }
 }
+
+#[cfg(test)]
+mod tests_behavior;

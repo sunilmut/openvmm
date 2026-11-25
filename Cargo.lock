@@ -7203,6 +7203,7 @@ version = "0.0.0"
 dependencies = [
  "guid",
  "jiff",
+ "test_with_tracing",
 ]
 
 [[package]]
