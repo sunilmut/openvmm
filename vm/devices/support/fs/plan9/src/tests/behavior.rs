@@ -418,3 +418,50 @@ fn ignored_and_unsupported_messages_keep_explicit_wire_results() {
     assert_error_reply(&fs, &request(6, |w| w.u32(7).unwrap()), Error::ENOTSUP);
     assert_error_reply(&fs, &request(255, |_| {}), Error::EINVAL);
 }
+
+// Test: Walk an unopened cloned fid in place through a directory to a file.
+// Expected: Rwalk reports both qids, the reused fid opens/reads the final file,
+//       and the independently attached root fid still identifies the export root.
+//
+// IGNORED: Reproduced with the test enabled: Twalk with fid == newfid returns
+//       Rlerror(EINVAL) instead of Rwalk because the existing fid is not replaced.
+#[test]
+#[ignore = "product bug: an in-place Twalk rejects the existing fid"]
+fn in_place_walk_replaces_only_the_requested_fid() {
+    let (root, fs) = filesystem();
+    std::fs::create_dir(root.path().join("dir")).unwrap();
+    std::fs::write(root.path().join("dir/file"), b"walked").unwrap();
+    attach(&fs, 1);
+    walk(&fs, 1, 2, &[]);
+    let qids = walk(&fs, 2, 2, &["dir", "file"]);
+    for (qid, path, kind) in [(&qids[0], "dir", 0x80), (&qids[1], "dir/file", 0)] {
+        assert_eq!(
+            (qid.qid_type, qid.version, qid.path),
+            (
+                kind,
+                0,
+                std::fs::metadata(root.path().join(path)).unwrap().ino()
+            )
+        );
+    }
+    let opened = reply(&fs, 12, |w| {
+        w.u32(2).unwrap();
+        w.u32(OPEN_FLAG_RDONLY).unwrap();
+    });
+    assert_eq!(
+        &opened[..13],
+        &reply(&fs, 24, |w| {
+            w.u32(2).unwrap();
+            w.u64(u64::MAX).unwrap();
+        })[8..21]
+    );
+    assert_eq!(
+        reply(&fs, 116, |w| {
+            w.u32(2).unwrap();
+            w.u64(0).unwrap();
+            w.u32(32).unwrap();
+        }),
+        b"\x06\0\0\0walked"
+    );
+    assert_eq!(walk(&fs, 1, 3, &["dir"])[0].path, qids[0].path);
+}
