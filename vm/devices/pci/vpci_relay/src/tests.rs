@@ -18,7 +18,6 @@ use chipset_device::pci::ByteEnabledDwordRead;
 use chipset_device::pci::ByteEnabledDwordWrite;
 use chipset_device::pci::PciConfigByteEnable;
 use chipset_device::pci::PciConfigSpace;
-use chipset_device::poll_device::PollDevice;
 use closeable_mutex::CloseableMutex;
 use guestmem::GuestMemory;
 use guid::Guid;
@@ -285,6 +284,8 @@ impl TestRelay {
     fn write(&self, offset: u16, value: u32, byte_enable: PciConfigByteEnable) -> IoResult {
         self.relay
             .lock()
+            .supports_pci()
+            .unwrap()
             .pci_cfg_write(offset, ByteEnabledDwordWrite::new(value, byte_enable))
     }
 
@@ -320,7 +321,11 @@ impl TestRelay {
     async fn drive<T>(&self, fut: impl Future<Output = T>) -> T {
         let mut fut = pin!(fut);
         poll_fn(|cx| {
-            self.relay.lock().poll_device(cx);
+            self.relay
+                .lock()
+                .supports_poll_device()
+                .unwrap()
+                .poll_device(cx);
             fut.as_mut().poll(cx)
         })
         .await
@@ -549,3 +554,5 @@ async fn downlevel_host_never_sees_tdisp_commands(driver: DefaultDriver) {
     assert_eq!(t.relay.lock().tdisp_operations.get(), 0);
     assert_eq!(t.device.tdisp().tdi_state().await, TdispTdiState::Unlocked);
 }
+
+mod behavior;
