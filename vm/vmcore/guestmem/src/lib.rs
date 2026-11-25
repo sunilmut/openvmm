@@ -3262,6 +3262,54 @@ mod tests {
         .unwrap();
         assert!(!gm.supports_kernel_lock());
     }
+
+    // Test: Write and read a range with out-of-order pages and partial end pages.
+    // Expected: Bytes follow the supplied page order and all guard bytes survive.
+    #[test]
+    fn scattered_range_preserves_page_order_and_guards() {
+        let memory = GuestMemory::allocate(PAGE_SIZE * 4);
+        memory.fill_at(0, 0xa5, PAGE_SIZE * 4).unwrap();
+        let pages = [2, 0, 3];
+        let range = crate::PagedRange::new(PAGE_SIZE - 3, PAGE_SIZE + 8, &pages).unwrap();
+        let payload: Vec<_> = (0..PAGE_SIZE + 8).map(|index| index as u8).collect();
+        memory.write_range(&range, &payload).unwrap();
+
+        let mut expected = vec![0xa5; PAGE_SIZE * 4];
+        expected[PAGE_SIZE * 3 - 3..PAGE_SIZE * 3].copy_from_slice(&payload[..3]);
+        expected[..PAGE_SIZE].copy_from_slice(&payload[3..PAGE_SIZE + 3]);
+        expected[PAGE_SIZE * 3..PAGE_SIZE * 3 + 5].copy_from_slice(&payload[PAGE_SIZE + 3..]);
+        let mut actual = vec![0; expected.len()];
+        memory.read_at(0, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+
+        let mut gathered = vec![0; payload.len()];
+        memory.read_range(&range, &mut gathered).unwrap();
+        assert_eq!(gathered, payload);
+    }
+
+    // Test: Fill and zero only a partial range spanning nonadjacent guest pages.
+    // Expected: Both operations touch only the selected bytes, not adjacent pages.
+    #[test]
+    fn scattered_fill_and_zero_preserve_guards() {
+        let memory = GuestMemory::allocate(PAGE_SIZE * 4);
+        memory.fill_at(0, 0xa5, PAGE_SIZE * 4).unwrap();
+        let pages = [3, 1];
+        let range = crate::PagedRange::new(PAGE_SIZE - 2, 5, &pages).unwrap();
+
+        for value in [0x6b, 0] {
+            if value == 0 {
+                memory.zero_range(&range).unwrap();
+            } else {
+                memory.fill_range(&range, value).unwrap();
+            }
+            let mut expected = vec![0xa5; PAGE_SIZE * 4];
+            expected[PAGE_SIZE * 4 - 2..].fill(value);
+            expected[PAGE_SIZE..PAGE_SIZE + 3].fill(value);
+            let mut actual = vec![0; expected.len()];
+            memory.read_at(0, &mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
 }
 
 #[cfg(test)]
