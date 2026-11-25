@@ -249,3 +249,45 @@ async fn unmap_parameter_memory_fault_does_not_dispatch() {
     assert_eq!(result.tx, 0);
     assert!(state.lock().unmap_calls.is_empty());
 }
+
+// Test: Split high-LBA UNMAP requests on 512-byte and 4 KiB disks, then discard the final sector.
+// Expected: Backend ranges retain all LBA bits, use sector-sized chunk limits, and stay within capacity.
+#[async_test]
+async fn high_lba_unmap_chunking_preserves_sector_units_and_capacity_boundary() {
+    for sector_size in [512u32, 4096] {
+        let start = (1u64 << 40) + 3;
+        let chunk = u32::MAX / sector_size;
+        let count = chunk + 3;
+        let capacity = start + u64::from(count) + 8;
+        let (mut backing, state) = TestDisk::new(sector_size, 4096, capacity, false, false);
+        backing.unmap_behavior = UnmapBehavior::Unspecified;
+        let disk = SimpleScsiDisk::new(
+            Disk::new(backing).unwrap(),
+            DiskParameters {
+                unmap: Some(true),
+                ..Default::default()
+            },
+        );
+        let parameters = parameter_list(&[(start, count), (capacity - 1, 1)]);
+        let result = execute_unmap(
+            &disk,
+            &parameters,
+            parameters.len() as u16,
+            scsi::SRB_FLAGS_BLOCK_LEVEL_ONLY,
+        )
+        .await;
+        assert_eq!(result.scsi_status, scsi::ScsiStatus::GOOD);
+        assert_eq!(result.srb_status, scsi::srb::SrbStatus::SUCCESS);
+        assert!(result.sense_data.is_none());
+        assert_eq!(result.tx, 0);
+        assert_eq!(
+            state.lock().unmap_calls,
+            [
+                (start, u64::from(chunk), true),
+                (start + u64::from(chunk), 3, true),
+                (capacity - 1, 1, true),
+            ],
+            "sector size {sector_size}"
+        );
+    }
+}
