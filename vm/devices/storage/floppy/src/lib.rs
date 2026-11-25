@@ -2254,12 +2254,18 @@ mod tests {
 
     fn read(fdc: &mut FloppyDiskController, port: u16) -> u8 {
         let mut data = [0];
-        fdc.io_read(port, &mut data).unwrap();
+        fdc.supports_pio()
+            .unwrap()
+            .io_read(port, &mut data)
+            .unwrap();
         data[0]
     }
 
     fn write(fdc: &mut FloppyDiskController, port: u16, value: u8) {
-        fdc.io_write(port, &[value]).unwrap();
+        fdc.supports_pio()
+            .unwrap()
+            .io_write(port, &[value])
+            .unwrap();
     }
 
     // Test: Issue an unsupported command, drain its result, then request version.
@@ -2328,4 +2334,8 @@ mod tests {
         ));
         assert_eq!(read(&mut fdc, 0x3f5), 0x90);
     }
+
+    mod commands;
+    mod media;
+    mod support;
 }

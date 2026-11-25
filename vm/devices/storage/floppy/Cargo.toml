@@ -24,6 +24,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+parking_lot.workspace = true
 test_with_tracing.workspace = true
 
 [lints]
