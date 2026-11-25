@@ -549,3 +549,89 @@ fn overflowing_guest_timestamp_is_rejected() {
         "unrepresentable timestamps must be rejected"
     );
 }
+
+// Test: Rename one open file over another, then look up and reopen the new name
+//       while retaining both original handles.
+// Expected: The new name keeps the source identity/data; the replaced handle
+//       still reads its original file with zero links, never the replacement.
+#[test]
+fn rename_over_open_target_preserves_both_handle_identities() {
+    let root = tempfile::tempdir().unwrap();
+    let fs = VirtioFs::new(root.path(), None).unwrap();
+    let source = create(&fs, FUSE_ROOT_ID, "source");
+    let target = create(&fs, FUSE_ROOT_ID, "target");
+    for (created, data) in [
+        (&source, &b"replacement"[..]),
+        (&target, &b"original target"[..]),
+    ] {
+        assert_eq!(
+            fs.write(
+                &request(created.entry.nodeid),
+                &fuse_write_in {
+                    fh: created.open.fh,
+                    size: data.len() as u32,
+                    ..fuse_write_in::new_zeroed()
+                },
+                data,
+            )
+            .unwrap(),
+            data.len()
+        );
+    }
+    let parent = request(FUSE_ROOT_ID);
+    fs.rename(
+        &parent,
+        "source".as_ref(),
+        FUSE_ROOT_ID,
+        "target".as_ref(),
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        fs.lookup(&parent, "source".as_ref()).unwrap_err(),
+        lx::Error::ENOENT
+    );
+    let renamed = fs.lookup(&parent, "target".as_ref()).unwrap();
+    assert_eq!(renamed.nodeid, source.entry.nodeid);
+    assert_eq!(renamed.attr.ino, source.entry.attr.ino);
+    assert_ne!(renamed.attr.ino, target.entry.attr.ino);
+    let reopened = fs
+        .open(&request(renamed.nodeid), lx::O_RDONLY as u32)
+        .unwrap();
+    for (node, fh, expected) in [
+        (source.entry.nodeid, source.open.fh, &b"replacement"[..]),
+        (target.entry.nodeid, target.open.fh, &b"original target"[..]),
+        (renamed.nodeid, reopened.fh, &b"replacement"[..]),
+    ] {
+        assert_eq!(
+            fs.read(
+                &request(node),
+                &fuse_read_in {
+                    fh,
+                    size: 64,
+                    ..fuse_read_in::new_zeroed()
+                },
+            )
+            .unwrap(),
+            expected
+        );
+    }
+    assert_eq!(
+        fs.get_attr(
+            &request(target.entry.nodeid),
+            FUSE_GETATTR_FH,
+            target.open.fh
+        )
+        .unwrap()
+        .attr
+        .nlink,
+        0
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("target")).unwrap(),
+        b"replacement"
+    );
+    release(&fs, renamed.nodeid, reopened.fh);
+    release(&fs, source.entry.nodeid, source.open.fh);
+    release(&fs, target.entry.nodeid, target.open.fh);
+}
