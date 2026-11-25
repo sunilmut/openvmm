@@ -219,3 +219,40 @@ fn truncated_utf8_provenance_keeps_exact_bytes_in_the_error() {
         r"JWT data is not valid UTF-8: prefix\xF0\x9F"
     );
 }
+
+// Test: Change only JSON whitespace in a signed key-release JWT body.
+// Expected: The unchanged signature rejects the changed bytes; signing those
+//       exact bytes again releases the same key, without imposing JSON canonicalization.
+#[test]
+fn key_release_signature_binds_the_original_serialized_body() {
+    let rsa = RsaKeyPair::generate(2048).unwrap();
+    let (header, body, signature) =
+        crate::test_helpers::generate_base64_encoded_jwt_components(&rsa);
+    let valid = legacy_response(format!("{header}.{body}.{signature}").as_bytes());
+    assert_eq!(
+        key_release::parse_response(&valid, 256)
+            .unwrap()
+            .wrapped_key,
+        b"test"
+    );
+    let mut changed_body = URL_SAFE_NO_PAD.decode(&body).unwrap();
+    changed_body.push(b' ');
+    let changed_body = URL_SAFE_NO_PAD.encode(changed_body);
+    let payload = format!("{header}.{changed_body}");
+    let changed = legacy_response(format!("{payload}.{signature}").as_bytes());
+    assert!(matches!(
+        key_release::parse_response(&changed, 256),
+        Err(key_release::KeyReleaseError::VerifyAkvJwtSignatureFailed)
+    ));
+    let signature = URL_SAFE_NO_PAD.encode(
+        rsa.pkcs1_sign(payload.as_bytes(), HashAlgorithm::Sha256)
+            .unwrap(),
+    );
+    let signed = legacy_response(format!("{payload}.{signature}").as_bytes());
+    assert_eq!(
+        key_release::parse_response(&signed, 256)
+            .unwrap()
+            .wrapped_key,
+        b"test"
+    );
+}
