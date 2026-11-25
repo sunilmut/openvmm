@@ -6365,6 +6365,7 @@ dependencies = [
  "disk_vmdk",
  "disklayer_vhdx",
  "fs-err",
+ "futures",
  "get_resources",
  "guid",
  "hypervisor_resources",
@@ -6374,6 +6375,7 @@ dependencies = [
  "pal_async",
  "sparse_mmap",
  "tempfile",
+ "test_with_tracing",
  "tracing",
  "vm_resource",
 ]

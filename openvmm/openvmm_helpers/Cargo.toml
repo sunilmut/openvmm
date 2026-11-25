@@ -31,8 +31,10 @@ disk_vhdmp.workspace = true
 sparse_mmap.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
 pal_async.workspace = true
 tempfile.workspace = true
+test_with_tracing.workspace = true
 
 [lints]
 workspace = true

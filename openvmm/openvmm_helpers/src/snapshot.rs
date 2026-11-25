@@ -393,4 +393,7 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    #[cfg(unix)]
+    mod publish_behavior;
 }

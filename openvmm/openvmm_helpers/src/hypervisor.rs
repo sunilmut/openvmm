@@ -54,3 +54,54 @@ pub fn hypervisor_resource(spec: &str) -> anyhow::Result<Resource<HypervisorKind
         .ok_or_else(|| anyhow::anyhow!("unknown hypervisor: {name}"))?;
     probe.new_resource(&params)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Parse backend names, flags, empty values and values containing equals signs.
+    // Expected: Names and values survive unchanged; bare flags become true.
+    #[test]
+    fn hypervisor_spec_preserves_parameters() {
+        for spec in ["backend", "backend:", "backend:,,"] {
+            assert_eq!(parse_hypervisor_spec(spec).unwrap(), ("backend", vec![]));
+        }
+        assert_eq!(
+            parse_hypervisor_spec("backend:mode=2,debug,,empty=,chain=a=b,").unwrap(),
+            (
+                "backend",
+                vec![
+                    ("mode", "2"),
+                    ("debug", "true"),
+                    ("empty", ""),
+                    ("chain", "a=b"),
+                ],
+            )
+        );
+    }
+
+    // Test: Request malformed backend specs and a well-formed unknown backend.
+    // Expected: Syntax errors retain the spec; unknown-backend errors identify its name.
+    #[test]
+    fn hypervisor_resource_rejects_invalid_specs() {
+        for spec in ["", ":flag"] {
+            assert_eq!(
+                hypervisor_resource(spec).unwrap_err().to_string(),
+                format!("empty hypervisor name in spec: {spec}")
+            );
+        }
+        for spec in ["backend:=value", "backend:flag,=value"] {
+            assert_eq!(
+                hypervisor_resource(spec).unwrap_err().to_string(),
+                format!("empty parameter key in spec: {spec}")
+            );
+        }
+        assert_eq!(
+            hypervisor_resource("not-a-registered-hypervisor:mode=2")
+                .unwrap_err()
+                .to_string(),
+            "unknown hypervisor: not-a-registered-hypervisor"
+        );
+    }
+}
