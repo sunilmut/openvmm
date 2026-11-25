@@ -2350,6 +2350,7 @@ dependencies = [
  "arrayvec",
  "bitfield-struct 0.11.0",
  "chipset_device",
+ "futures",
  "inspect",
  "mesh",
  "open_enum",
