@@ -1582,6 +1582,7 @@ mod tests {
     mod many_fds {
         use crate::unix_node::MAX_SMALL_EVENT_SIZE;
         use crate::unix_node::SmallTask;
+        use crate::unix_node::UnixNode;
         use crate::unix_node::UnixSocket;
         use crate::unix_node::start_connection;
         use futures::StreamExt;
@@ -2272,6 +2273,49 @@ mod tests {
                     .await;
                 assert_read_ends_closed(writers);
             }
+        }
+
+        // Test: Queue inline and split/memfd messages with distinct pipe
+        //       descriptors, shut down the sender, and only then receive them.
+        // Expected: Ordered payloads and descriptor identities survive sender
+        //       shutdown; dropping each received batch closes every pipe reader.
+        #[async_test]
+        async fn queued_descriptor_batches_survive_sender_shutdown(driver: DefaultDriver) {
+            let leader = UnixNode::new(driver.clone());
+            let (leader_send, mut recv) = channel::<FdBatch>();
+            let invitation = leader.invite(leader_send.into()).await.unwrap();
+            let (send, follower_recv) = channel::<FdBatch>();
+            let follower = UnixNode::join(driver, invitation, follower_recv.into())
+                .await
+                .unwrap();
+            let mut expected = Vec::new();
+            for (seq, (count, length)) in [(1, 1), (254, MAX_SMALL_EVENT_SIZE + 0x1000), (1, 37)]
+                .into_iter()
+                .enumerate()
+            {
+                let (readers, writers) = pipes(count);
+                let ids: Vec<_> = readers.iter().map(|fd| file_id(fd.as_fd())).collect();
+                let payload: Vec<u8> = (0..length).map(|i| i as u8).collect();
+                expected.push((payload.clone(), ids, writers));
+                send.send(FdBatch {
+                    seq: seq as u32,
+                    payload,
+                    fds: readers,
+                });
+            }
+            drop(send);
+            follower.shutdown().await;
+            for (seq, (payload, ids, writers)) in expected.into_iter().enumerate() {
+                let got = recv.recv().await.unwrap();
+                assert_eq!(got.seq, seq as u32);
+                assert_eq!(got.payload, payload);
+                let received: Vec<_> = got.fds.iter().map(|fd| file_id(fd.as_fd())).collect();
+                assert_eq!(received, ids);
+                drop(got);
+                assert_read_ends_closed(writers);
+            }
+            drop(recv);
+            leader.shutdown().await;
         }
     }
 }
