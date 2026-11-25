@@ -209,3 +209,36 @@ fn memory_firmware_and_battery_messages_match_wire_layouts() {
         &packet(4, 7, &body),
     );
 }
+
+// Test: Decode future host settings with reserved high feature bits, then toggle known firmware support and serialize the complete DPS document.
+// Expected: Unknown fields do not break compatibility, all 64 feature bits retain exact integer precision, and changing a known flag leaves reserved bits intact.
+#[test]
+fn platform_settings_preserve_future_feature_bits_without_numeric_rounding() {
+    use crate::dps_json::DevicePlatformSettingsV2Json;
+    let raw = (1u64 << 63) | (1u64 << 53) | (1u64 << 30) | 1;
+    let mut document = serde_json::to_value(DevicePlatformSettingsV2Json::default()).unwrap();
+    document["V2"]["Static"]["ManagementVtlFeatures"] = serde_json::json!(raw);
+    document["V2"]["Static"]["FutureHostSetting"] = serde_json::json!({"Enabled": true});
+    let mut settings: DevicePlatformSettingsV2Json = serde_json::from_value(document).unwrap();
+    let features = settings.v2.r#static.management_vtl_features;
+    assert_eq!(features.into_bits(), raw);
+    assert!(features.strict_encryption_policy());
+    assert!(!features.load_firmware_supported());
+    settings.v2.r#static.management_vtl_features = features.with_load_firmware_supported(true);
+    let wire = serde_json::to_string(&settings).unwrap();
+    let document: serde_json::Value = serde_json::from_str(&wire).unwrap();
+    assert_eq!(
+        document["V2"]["Static"]["ManagementVtlFeatures"].as_u64(),
+        Some(raw | 2)
+    );
+    let decoded: DevicePlatformSettingsV2Json = serde_json::from_str(&wire).unwrap();
+    assert_eq!(
+        decoded
+            .v2
+            .r#static
+            .management_vtl_features
+            .with_load_firmware_supported(false)
+            .into_bits(),
+        raw
+    );
+}
