@@ -615,3 +615,64 @@ async fn large_gpadl_preserves_fragments_and_coalesces_teardown_waiters(driver: 
     first.await.unwrap();
     second.await.unwrap();
 }
+
+// Test: Create GPADLs on two channels and return their host results in reverse order.
+// Expected: Failure completes only its matching request; the other stays pending
+//       until its own successful response arrives.
+#[async_test]
+async fn concurrent_gpadl_results_remain_bound_to_their_channel_and_handle(driver: DefaultDriver) {
+    let (mut server, mut client) = test_init(&driver);
+    let connection = server.get_channels(&mut client, 2).await;
+    let request = |id| GpadlRequest {
+        id: GpadlId(id),
+        count: 1,
+        buf: vec![vmbus_ring::PAGE_SIZE as u64, 42],
+    };
+    let mut first = pin!(
+        connection.offers[0]
+            .request_send
+            .call_failable(ChannelRequest::Gpadl, request(17))
+    );
+    check_message_with_data(
+        server.next().await.unwrap(),
+        protocol::GpadlHeader {
+            channel_id: ChannelId(0),
+            gpadl_id: GpadlId(17),
+            len: 16,
+            count: 1,
+        },
+        request(17).buf.as_bytes(),
+    );
+    let second = connection.offers[1]
+        .request_send
+        .call_failable(ChannelRequest::Gpadl, request(18));
+    check_message_with_data(
+        server.next().await.unwrap(),
+        protocol::GpadlHeader {
+            channel_id: ChannelId(1),
+            gpadl_id: GpadlId(18),
+            len: 16,
+            count: 1,
+        },
+        request(18).buf.as_bytes(),
+    );
+    server.send(in_msg(
+        MessageType::GPADL_CREATED,
+        protocol::GpadlCreated {
+            channel_id: ChannelId(1),
+            gpadl_id: GpadlId(18),
+            status: protocol::STATUS_UNSUCCESSFUL,
+        },
+    ));
+    assert!(second.await.is_err());
+    assert!(first.as_mut().now_or_never().is_none());
+    server.send(in_msg(
+        MessageType::GPADL_CREATED,
+        protocol::GpadlCreated {
+            channel_id: ChannelId(0),
+            gpadl_id: GpadlId(17),
+            status: 0,
+        },
+    ));
+    first.await.unwrap();
+}
