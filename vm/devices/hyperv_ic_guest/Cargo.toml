@@ -30,5 +30,8 @@ pal_async.workspace = true
 test_with_tracing.workspace = true
 vmbus_channel = { workspace = true, features = ["test_helpers"] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+user_driver.workspace = true
+
 [lints]
 workspace = true

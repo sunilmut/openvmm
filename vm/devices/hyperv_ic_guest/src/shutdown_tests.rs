@@ -13,6 +13,9 @@ use vmbus_channel::test_helpers::gated_channels;
 use vmbus_channel::test_helpers::stop_with_timeout;
 use vmbus_channel::test_helpers::with_timeout;
 
+#[path = "shutdown_tests/protocol_tests.rs"]
+mod protocol_tests;
+
 struct Worker {
     ic: ShutdownGuestIc,
     channel: ShutdownGuestChannel<GatedRingMem>,
