@@ -284,3 +284,62 @@ async fn resource_resolvers_preserve_data_permissions_and_errors() {
         }
     }
 }
+
+// Test: Run two disks concurrently through the same bounded bounce-buffer tracker.
+// Expected: Both finish repeated I/O with their own payloads, intact guest-buffer
+//       guards, and no data from the other disk.
+#[async_test]
+async fn shared_bounce_tracker_keeps_concurrent_disks_isolated() {
+    let pool = test_pool().unwrap();
+    let tracker = Arc::new(BounceBufferTracker::new(1, affinity::max_procs() as usize));
+    let mut disks = Vec::new();
+    let mut observers = Vec::new();
+    for _ in 0..2 {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(4096).unwrap();
+        observers.push(file.try_clone().unwrap());
+        disks.push(
+            BlockDevice::new(
+                file,
+                false,
+                pool.initiator().clone(),
+                None,
+                Some(tracker.clone()),
+                true,
+            )
+            .await
+            .unwrap(),
+        );
+    }
+
+    futures::future::join_all(disks.iter().enumerate().map(|(index, disk)| async move {
+        let gm = GuestMemory::allocate(8192);
+        gm.write_at(0, &[0xcc; 8192]).unwrap();
+        let write = OwnedRequestBuffers::linear(1, 512, true);
+        let read = OwnedRequestBuffers::linear(4097, 512, true);
+        for sector in 0..8 {
+            let value = 0x20 + index as u8 * 0x40 + sector as u8;
+            gm.write_at(1, &[value; 512]).unwrap();
+            disk.write_vectored(&write.buffer(&gm), sector, false)
+                .await
+                .unwrap();
+            disk.read_vectored(&read.buffer(&gm), sector).await.unwrap();
+            let mut actual = [0; 514];
+            gm.read_at(4096, &mut actual).unwrap();
+            assert_eq!(actual[0], 0xcc);
+            assert_eq!(&actual[1..513], &[value; 512]);
+            assert_eq!(actual[513], 0xcc);
+        }
+        disk.sync_cache().await.unwrap();
+    }))
+    .await;
+
+    for (index, observer) in observers.iter().enumerate() {
+        assert_eq!(observer.metadata().unwrap().len(), 4096);
+        for sector in 0..8 {
+            let mut actual = [0; 512];
+            observer.read_exact_at(&mut actual, sector * 512).unwrap();
+            assert_eq!(actual, [0x20 + index as u8 * 0x40 + sector as u8; 512]);
+        }
+    }
+}
