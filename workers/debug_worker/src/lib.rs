@@ -463,3 +463,6 @@ impl gdbstub::conn::Connection for SocketConnection {
         self.0.get_mut().flush()
     }
 }
+
+#[cfg(test)]
+mod tests;
