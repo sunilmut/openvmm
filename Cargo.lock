@@ -9422,6 +9422,7 @@ dependencies = [
  "mesh",
  "pal_async",
  "socket2",
+ "tempfile",
  "thiserror 2.0.16",
  "tracing",
 ]

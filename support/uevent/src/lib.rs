@@ -404,3 +404,6 @@ fn parse_uevent(buf: &str) -> anyhow::Result<Uevent<'_>> {
     uevent.properties.sort_by_key(|(k, _)| *k);
     Ok(uevent)
 }
+
+#[cfg(test)]
+mod tests;
