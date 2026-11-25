@@ -105,3 +105,59 @@ async fn configuration_replies_preserve_exact_wire_contracts(driver: DefaultDriv
     done.send(());
     notification.await.unwrap();
 }
+
+// Test: Write a crash dump tail-first, seek backward, overwrite part of an earlier chunk, and leave unwritten gaps before completing.
+// Expected: Explicit offsets determine the exact final file image without appending or disturbing gaps, and completion arrives only after the complete message.
+#[async_test]
+async fn nonsequential_dump_chunks_preserve_offsets_overwrites_and_gaps(driver: DefaultDriver) {
+    let (host, guest) = connected_async_channels(16384);
+    let mut guest = MessagePipe::new(guest).unwrap();
+    let (send, mut requests) = mesh::channel();
+    let mut worker = worker(host, send);
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&[0xcc; 64]).unwrap();
+    let mut done = open_dump(
+        &mut worker,
+        &mut guest,
+        &mut requests,
+        file.try_clone().unwrap(),
+        &driver,
+    )
+    .await;
+    let activity = Guid::from_slice(&[0x31; 16]);
+    for (offset, bytes) in [
+        (60, &[0x81, 0, 0xff, 0x27][..]),
+        (0, b"abcdefgh".as_slice()),
+        (3, b"XY".as_slice()),
+        (16, b"mid\0".as_slice()),
+    ] {
+        let write = crash::DumpWriteRequestV1 {
+            header: header(crash::MessageType::REQUEST_NIX_DUMP_WRITE_V1, activity),
+            offset,
+            size: bytes.len() as u32,
+        };
+        guest.try_send(write.as_bytes()).unwrap();
+        advance(&mut worker, &driver).await.unwrap();
+        guest.try_send(bytes).unwrap();
+        advance(&mut worker, &driver).await.unwrap();
+        assert!((&mut done).now_or_never().is_none());
+    }
+    guest
+        .try_send(header(crash::MessageType::REQUEST_NIX_DUMP_COMPLETE_V1, activity).as_bytes())
+        .unwrap();
+    advance(&mut worker, &driver).await.unwrap();
+    done.await.unwrap();
+    file.seek(SeekFrom::Start(0)).unwrap();
+    let mut actual = Vec::new();
+    file.read_to_end(&mut actual).unwrap();
+    let expected = [
+        b"abcXYfgh".as_slice(),
+        &[0xcc; 8],
+        b"mid\0".as_slice(),
+        &[0xcc; 40],
+        &[0x81, 0, 0xff, 0x27],
+    ]
+    .concat();
+    assert_eq!(actual, expected);
+    assert!(requests.next().now_or_never().is_none());
+}
