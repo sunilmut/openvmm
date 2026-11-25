@@ -502,3 +502,42 @@ async fn dhcpv6_rejects_malformed_input_and_recovers(driver: DefaultDriver) {
 
 #[path = "transport_behavior.rs"]
 mod transport_behavior;
+
+// IGNORED: Consomme sends advertisements for NDP solicitations whose IPv6 hop
+//       limit is not 255, instead of discarding them as RFC 4861 requires.
+//
+// Test: Send router and neighbor solicitations with valid and invalid hop limits.
+// Expected: Hop limit 255 permits a reply; lower limits produce no reply.
+#[pal_async::async_test]
+#[ignore = "NDP receive path does not validate the IPv6 hop limit"]
+async fn ndp_solicitations_require_the_link_local_hop_limit(driver: DefaultDriver) {
+    let params = params();
+    for message in [
+        NdiscRepr::RouterSolicit {
+            lladdr: Some(params.client_mac.into()),
+        },
+        NdiscRepr::NeighborSolicit {
+            target_addr: params.gateway_link_local_ipv6,
+            lladdr: Some(params.client_mac.into()),
+        },
+    ] {
+        let mut stack = Consomme::new(params.clone());
+        let mut client = TestClient::new(driver.clone());
+        let mut bytes = ndp(&params, "fe80::2".parse().unwrap(), message);
+        for hop_limit in [255, 254, 64, 0] {
+            let mut frame = EthernetFrame::new_unchecked(&mut bytes);
+            Ipv6Packet::new_unchecked(frame.payload_mut()).set_hop_limit(hop_limit);
+            let result = stack.access(&mut client).send(&bytes, &ChecksumState::NONE);
+            if hop_limit == 255 {
+                result.unwrap();
+                assert_eq!(client.received_packets.len(), 1);
+            } else {
+                assert!(
+                    client.received_packets.is_empty(),
+                    "NDP solicitation with hop limit {hop_limit} produced a reply: {result:?}"
+                );
+            }
+            client.received_packets.clear();
+        }
+    }
+}
