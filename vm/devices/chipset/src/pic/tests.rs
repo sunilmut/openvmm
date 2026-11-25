@@ -453,3 +453,5 @@ fn test_non_specific_eois() {
 
     assert_eq!(pic.pics[0].isr, 0b101000);
 }
+
+mod reference_tests;
