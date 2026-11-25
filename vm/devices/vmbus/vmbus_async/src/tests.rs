@@ -390,3 +390,30 @@ async fn queue_read_reports_peer_closure() {
     assert!(error.is_closed_error());
     assert!(error.to_string().contains("closed"));
 }
+
+// Test: Cancel a datagram send blocked by a nearly full ring, then send again.
+// Expected: Only committed messages arrive, and a smaller replacement sends normally.
+#[async_test]
+async fn cancelled_blocked_datagram_does_not_publish_or_block_reuse() {
+    let (mut host, mut guest) = connected_message_pipes(4096);
+    host.send(&[0x55; 4000]).await.unwrap();
+    {
+        let cancelled = [0x99; 4000];
+        let mut send = host.send(&cancelled);
+        assert!(futures::poll!(&mut send).is_pending());
+    }
+
+    let mut received = [0; 4000];
+    guest.recv_exact(&mut received).await.unwrap();
+    assert_eq!(received, [0x55; 4000]);
+
+    // The replacement also crosses the ring end after the initial large packet.
+    host.send(&[0x33; 100]).await.unwrap();
+    let mut replacement = [0; 100];
+    guest.recv_exact(&mut replacement).await.unwrap();
+    assert_eq!(replacement, [0x33; 100]);
+    let mut extra = [0; 1];
+    assert!(futures::poll!(guest.recv(&mut extra)).is_pending());
+    let (_, mut writer) = host.split();
+    writer.wait_empty().await.unwrap();
+}
