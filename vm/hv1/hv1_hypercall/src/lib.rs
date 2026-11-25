@@ -39,3 +39,6 @@ pub use self::support::HypercallIo;
 pub use self::x86::X64HypercallRegister;
 pub use self::x86::X64RegisterIo;
 pub use self::x86::X64RegisterState;
+
+#[cfg(test)]
+mod interface_tests;
