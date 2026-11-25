@@ -398,35 +398,75 @@ async fn negotiation_failure_reaches_queued_and_later_clients(driver: DefaultDri
         );
         stop_with_timeout(&mut task, &driver).await;
     }
+}
 
-    // Test: Save and restore a connected KVP device using its public device hooks.
-    // Expected: Old clients disconnect, the guest renegotiates, and a new connection
-    //       can enumerate normally without inheriting the old transaction.
-    #[async_test]
-    async fn restore_requires_fresh_negotiation_and_new_clients(driver: DefaultDriver) {
-        let (send, recv) = mesh::channel();
-        let (mut task, mut guest) = start(&driver, KvpIc::new(recv));
-        let ready = send.call_failable(r::KvpConnectRpc::WaitForGuest, ());
-        guest.negotiate(proto::KVP_VERSION_5).await;
-        let (_old_rpc, disconnected) = with_timeout(&driver, ready).await.unwrap();
-        stop_with_timeout(&mut task, &driver).await;
-        let mut guest = crate::test_helpers::restore(&driver, &mut task);
-        assert!(with_timeout(&driver, disconnected).await.is_err());
-        assert!(task.start());
-        let ready = send.call_failable(r::KvpConnectRpc::WaitForGuest, ());
-        guest.negotiate(proto::KVP_VERSION_4).await;
-        let (rpc, _disconnected) = with_timeout(&driver, ready).await.unwrap();
-        let result = rpc.call_failable(
-            r::KvpRpc::Enumerate,
-            r::EnumerateParams {
-                pool: r::KvpPool::Guest,
-                index: 0,
-            },
-        );
-        let frame = guest.receive(MessageType::KVP_EXCHANGE).await;
-        assert_eq!(frame.header.message_version, proto::KVP_VERSION_4);
-        guest.respond(&frame, Status::NO_MORE_ITEMS, &[]).await;
-        assert!(with_timeout(&driver, result).await.unwrap().is_none());
-        stop_with_timeout(&mut task, &driver).await;
-    }
+// Test: Save and restore a connected KVP device using its public device hooks.
+// Expected: Old clients disconnect, the guest renegotiates, and a new connection
+//       can enumerate normally without inheriting the old transaction.
+#[async_test]
+async fn restore_requires_fresh_negotiation_and_new_clients(driver: DefaultDriver) {
+    let (send, recv) = mesh::channel();
+    let (mut task, mut guest) = start(&driver, KvpIc::new(recv));
+    let ready = send.call_failable(r::KvpConnectRpc::WaitForGuest, ());
+    guest.negotiate(proto::KVP_VERSION_5).await;
+    let (_old_rpc, disconnected) = with_timeout(&driver, ready).await.unwrap();
+    stop_with_timeout(&mut task, &driver).await;
+    let mut guest = crate::test_helpers::restore(&driver, &mut task);
+    assert!(with_timeout(&driver, disconnected).await.is_err());
+    assert!(task.start());
+    let ready = send.call_failable(r::KvpConnectRpc::WaitForGuest, ());
+    guest.negotiate(proto::KVP_VERSION_4).await;
+    let (rpc, _disconnected) = with_timeout(&driver, ready).await.unwrap();
+    let result = rpc.call_failable(
+        r::KvpRpc::Enumerate,
+        r::EnumerateParams {
+            pool: r::KvpPool::Guest,
+            index: 0,
+        },
+    );
+    let frame = guest.receive(MessageType::KVP_EXCHANGE).await;
+    assert_eq!(frame.header.message_version, proto::KVP_VERSION_4);
+    guest.respond(&frame, Status::NO_MORE_ITEMS, &[]).await;
+    assert!(with_timeout(&driver, result).await.unwrap().is_none());
+    stop_with_timeout(&mut task, &driver).await;
+}
+
+// IGNORED: A response with the right transaction ID but the wrong message type
+//       currently completes KVP enumeration as if it were a KVP response.
+// Test: Send a time-sync response before the real KVP enumeration response.
+// Expected: The caller receives the KVP entry, not false end-of-enumeration
+//       from the unrelated message.
+#[async_test]
+#[ignore = "product bug: KVP accepts a response with the wrong message type"]
+async fn unrelated_message_type_cannot_complete_kvp_enumeration(driver: DefaultDriver) {
+    let (mut task, mut guest, rpc, _disconnected) = connected(&driver, proto::KVP_VERSION_5).await;
+    let result = rpc.call_failable(
+        r::KvpRpc::Enumerate,
+        r::EnumerateParams {
+            pool: r::KvpPool::Guest,
+            index: 0,
+        },
+    );
+    let frame = guest.receive(MessageType::KVP_EXCHANGE).await;
+    let wrong = crate::test_helpers::Frame {
+        header: hyperv_ic_protocol::Header {
+            message_type: MessageType::TIME_SYNC,
+            ..frame.header
+        },
+        body: Vec::new(),
+    };
+    guest.respond(&wrong, Status::NO_MORE_ITEMS, &[]).await;
+    let response = enumerate_response(r::Value::U32(0x12345678));
+    guest
+        .respond(
+            &frame,
+            Status::SUCCESS,
+            &packet(proto::KvpOperation::ENUMERATE, &response),
+        )
+        .await;
+    let actual = with_timeout(&driver, result).await.unwrap();
+    stop_with_timeout(&mut task, &driver).await;
+    let actual = actual.expect("unrelated response falsely ended KVP enumeration");
+    assert_eq!(actual.key, "item");
+    assert_eq!(actual.value, r::Value::U32(0x12345678));
 }
