@@ -1104,3 +1104,40 @@ fn partition_time_validates_reserved_fields() {
         HvError::InvalidParameter,
     );
 }
+
+// Test: Post empty, near-limit and full SynIC payloads, then retry a backend error.
+// Expected: Only declared bytes reach the connection, status is preserved, and
+//       a subsequent full-payload request succeeds without writing output memory.
+#[test]
+fn post_message_payload_boundaries_and_retry_preserve_guest_contract() {
+    let mut backend = Backend::default();
+    let mut message = defs::PostMessage::new_zeroed();
+    message.connection_id = 71;
+    for (index, byte) in message.payload.iter_mut().enumerate() {
+        *byte = index as u8;
+    }
+    for length in [0, 1, 239, 240] {
+        message.payload_size = length;
+        let output = simple::<HvPostMessage>(&mut backend, message.as_bytes());
+        backend.expect("post", &[71], &message.payload[..length as usize]);
+        assert_eq!(output, vec![0xa5; 4096]);
+    }
+
+    backend.error = Some(HvError::InvalidParameter);
+    let (result, output) = invoke::<HvPostMessage>(&mut backend, message.as_bytes(), 0, 0);
+    assert_eq!(result.call_status(), Err(HvError::InvalidParameter).into());
+    backend.expect("post", &[71], &message.payload);
+    assert_eq!(output, vec![0xa5; 4096]);
+    backend.error = None;
+    simple::<HvPostMessage>(&mut backend, message.as_bytes());
+    backend.expect("post", &[71], &message.payload);
+
+    message.payload_size = u32::MAX;
+    rejected::<HvPostMessage>(
+        &mut backend,
+        message.as_bytes(),
+        0,
+        0,
+        HvError::InvalidParameter,
+    );
+}
