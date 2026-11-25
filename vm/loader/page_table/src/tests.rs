@@ -442,3 +442,38 @@ fn arm_existing_block_cannot_be_overwritten_or_split_implicitly() {
     assert_eq!((pa, size), (0x5f_ffff, 0x20_0000));
     assert_eq!(entry & ((1 << 53) | (1 << 54)), (1 << 53) | (1 << 54));
 }
+
+// Test: Map a read-only range with 4KB edges, 2MB shoulders, and a 1GB interior.
+// Expected: Hardware walks select each correct leaf size, retain identity and
+//       read-only permissions, and leave the bytes just outside the range unmapped.
+#[test]
+fn x64_mixed_leaf_sizes_preserve_exact_range_edges_and_permissions() {
+    let base = 0x10_0000;
+    let ranges = [MappedRange::new(0x3fdf_f000, 0x8020_1000).read_only()];
+    let mut tables = vec![PageTable::new_zeroed(); 8];
+    let mut output = vec![0; 8 * 4096];
+    let bytes = PageTableBuilder::new(base, &mut tables, &mut output, &ranges)
+        .unwrap()
+        .build()
+        .unwrap();
+    for (va, page_size) in [
+        (0x3fdf_f000, 4096),
+        (0x3fdf_ffff, 4096),
+        (0x3fe0_0000, 0x20_0000),
+        (0x3fff_ffff, 0x20_0000),
+        (0x4000_0000, 0x4000_0000),
+        (0x7fff_ffff, 0x4000_0000),
+        (0x8000_0000, 0x20_0000),
+        (0x801f_ffff, 0x20_0000),
+        (0x8020_0000, 4096),
+        (0x8020_0fff, 4096),
+    ] {
+        assert_eq!(
+            x64_mapping(bytes, base, va, 3),
+            Some((va, page_size, false))
+        );
+    }
+    for outside in [0x3fdf_efff, 0x8020_1000] {
+        assert_eq!(x64_mapping(bytes, base, outside, 3), None);
+    }
+}
