@@ -1079,4 +1079,6 @@ mod tests {
         let err = worker.await.unwrap_err();
         assert!(matches!(err, Error::UnexpectedPacketOrder));
     }
+
+    mod behavior;
 }

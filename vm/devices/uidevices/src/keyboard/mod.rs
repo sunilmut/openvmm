@@ -549,4 +549,6 @@ mod tests {
         drop(guest);
         worker.await.unwrap();
     }
+
+    mod behavior;
 }

@@ -12,6 +12,10 @@ pub mod video;
 
 #[cfg(test)]
 mod test_helpers {
+    mod gpadl;
+    pub use gpadl::DeviceWorker;
+    pub use gpadl::connected_gpadl_channels;
+
     use futures::FutureExt;
     use input_core::InputSource;
     use pal_async::DefaultDriver;

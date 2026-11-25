@@ -112,3 +112,6 @@ impl AsyncResolveResource<VmbusDeviceHandleKind, SynthMouseHandle> for VmbusUiRe
         Ok(device.into())
     }
 }
+
+#[cfg(test)]
+mod tests;
