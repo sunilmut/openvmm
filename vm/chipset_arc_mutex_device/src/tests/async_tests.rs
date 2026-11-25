@@ -81,3 +81,47 @@ fn async_constructor_failure_keeps_source_and_no_route() {
     );
     assert_eq!(chipset.mmio_read(10, &mut [0; 4]), None);
 }
+
+// Test: Drop a fallible asynchronous constructor suspended after dynamic registration, then construct a complete device with a different dynamic region.
+// Expected: Neither static nor dynamic accesses reach the cancelled incomplete device or alter caller buffers, while the later completed device has working routes and exact read/write data.
+#[test]
+fn cancelled_async_construction_never_publishes_incomplete_device() {
+    let chipset = TestChipset::default();
+    let mut construction = Box::pin(
+        chipset
+            .device_builder::<Device>("cancelled-async")
+            .try_add_async(async |services| {
+                let mut region = services.register_mmio().new_io_region("cancelled", 4);
+                region.map(100);
+                std::future::pending::<()>().await;
+                Ok::<_, std::io::Error>(Device::new(Some(region), true))
+            }),
+    );
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(construction.as_mut().poll(&mut cx).is_pending());
+    drop(construction);
+    for address in [10, 100, 103] {
+        let mut data = [0xa7; 4];
+        assert_eq!(chipset.mmio_read(address, &mut data), None);
+        assert_eq!(data, [0xa7; 4]);
+        assert_eq!(chipset.mmio_write(address, &[0x91; 4]), None);
+    }
+    let device = chipset
+        .device_builder("completed-after-cancel")
+        .add(|services| {
+            let mut region = services.register_mmio().new_io_region("completed", 4);
+            region.map(200);
+            Device::new(Some(region), true)
+        })
+        .unwrap();
+    assert_eq!(chipset.mmio_write(200, &[0x81, 0, 0xff, 0x27]), Some(()));
+    for address in [10, 200, 203] {
+        let mut data = [0; 4];
+        assert_eq!(chipset.mmio_read(address, &mut data), Some(()));
+        assert_eq!(data, [0x81, 0, 0xff, 0x27]);
+    }
+    assert_eq!(device.lock().writes, [(200, vec![0x81, 0, 0xff, 0x27])]);
+    let mut data = [0x5a; 4];
+    assert_eq!(chipset.mmio_read(100, &mut data), None);
+    assert_eq!(data, [0x5a; 4]);
+}
