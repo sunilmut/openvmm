@@ -362,3 +362,59 @@ async fn child_registration_race_rechecks_the_matching_condition(driver: Default
     assert_eq!(found.parent(), Some(Path::new("/sys")));
     assert!(found.exists());
 }
+
+// Test: Interleave resize events for two devices and remove their callbacks.
+// Expected: Each resize reaches only its device, rescan reaches both, and
+//       removing one callback leaves the other's delivery and removal intact.
+#[pal_async::async_test]
+async fn resize_subscriptions_stay_independent_during_removal(driver: DefaultDriver) {
+    let (listener, peer) = fixture(&driver);
+    let counts = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let mut handles = Vec::new();
+    for index in 0..2 {
+        let counts = counts.clone();
+        handles.push(
+            listener
+                .add_block_resize_callback(8, index as u32 + 1, move || {
+                    counts[index].fetch_add(1, Ordering::SeqCst);
+                })
+                .await,
+        );
+    }
+    let (send, mut receive) = mesh::channel();
+    let _observer = listener.add_custom_callback(move |_| send.send(())).await;
+    for (minor, expected) in [(2, [0, 1]), (1, [1, 1]), (2, [1, 2])] {
+        emit(
+            &peer,
+            format!("change@/devices/disk{minor}\0ACTION=change\0SUBSYSTEM=block\0MAJOR=8\0MINOR={minor}\0RESIZE=1\0").as_bytes(),
+        );
+        receive.next().await.unwrap();
+        barrier(&listener).await;
+        assert_eq!(
+            counts.each_ref().map(|count| count.load(Ordering::SeqCst)),
+            expected
+        );
+    }
+    for (remove_first, expected) in [(false, [2, 3]), (true, [2, 4])] {
+        if remove_first {
+            drop(handles.remove(0));
+            barrier(&listener).await;
+        }
+        emit(&peer, b"rescan\0RESCAN=true\0");
+        receive.next().await.unwrap();
+        barrier(&listener).await;
+        assert_eq!(
+            counts.each_ref().map(|count| count.load(Ordering::SeqCst)),
+            expected
+        );
+    }
+    drop(handles);
+    barrier(&listener).await;
+    emit(&peer, b"rescan\0RESCAN=true\0");
+    receive.next().await.unwrap();
+    barrier(&listener).await;
+    assert_eq!(
+        counts.each_ref().map(|count| count.load(Ordering::SeqCst)),
+        [2, 4]
+    );
+}
