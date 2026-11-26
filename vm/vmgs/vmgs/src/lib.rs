@@ -47,3 +47,6 @@ pub mod vmgs_helpers {
 
 /// Expose the `VmgsLogger` trait
 pub mod logger;
+
+#[cfg(test)]
+mod tests;
