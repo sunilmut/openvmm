@@ -938,4 +938,198 @@ pub mod test_support {
             todo!()
         }
     }
+
+    #[cfg(test)]
+    mod lifetime_tests {
+        use crate::*;
+        use futures::StreamExt;
+        use futures::executor::block_on;
+        use futures::stream::FusedStream;
+        use mesh::MeshPayload;
+        use pal_async::DefaultDriver;
+        use pal_async::async_test;
+        use pal_async::task::Spawn;
+        use test_with_tracing::test;
+
+        #[derive(Copy, Clone, PartialEq, Eq, MeshPayload)]
+        enum Failure {
+            None,
+            New,
+            Run,
+            Save,
+            Restore,
+        }
+
+        struct FailingWorker(Failure);
+
+        impl Worker for FailingWorker {
+            type Parameters = Failure;
+            type State = Failure;
+            const ID: WorkerId<Self::Parameters> = WorkerId::new("lifetime-test");
+
+            fn new(parameters: Self::Parameters) -> anyhow::Result<Self> {
+                anyhow::ensure!(parameters != Failure::New, "construction rejected");
+                Ok(Self(parameters))
+            }
+
+            fn restart(state: Self::State) -> anyhow::Result<Self> {
+                anyhow::ensure!(state != Failure::Restore, "restore rejected");
+                Ok(Self(state))
+            }
+
+            fn run(self, mut recv: mesh::Receiver<WorkerRpc<Self::State>>) -> anyhow::Result<()> {
+                anyhow::ensure!(self.0 != Failure::Run, "runtime failed");
+                block_on(async {
+                    while let Ok(request) = recv.recv().await {
+                        match request {
+                            WorkerRpc::Stop => break,
+                            WorkerRpc::Restart(rpc) => {
+                                if self.0 == Failure::Save {
+                                    rpc.complete(Err(mesh::error::RemoteError::new(
+                                        anyhow::anyhow!("save rejected"),
+                                    )));
+                                } else {
+                                    rpc.complete(Ok(self.0));
+                                    break;
+                                }
+                            }
+                            _ => unreachable!("tests never request inspection"),
+                        }
+                    }
+                    Ok(())
+                })
+            }
+        }
+
+        runnable_workers! {
+            LifetimeWorkers {
+                FailingWorker,
+            }
+        }
+
+        // Test: Launch local workers whose constructor or runtime returns an error.
+        // Expected: Constructor error prevents a handle; runtime error reaches join
+        //       rather than being reported as successful worker shutdown.
+        #[test]
+        fn local_failures_reach_the_caller() {
+            block_on(async {
+                let error = launch_local_worker::<FailingWorker>(Failure::New)
+                    .await
+                    .err()
+                    .unwrap();
+                assert!(format!("{error:#}").contains("construction rejected"));
+                let mut worker = launch_local_worker::<FailingWorker>(Failure::Run)
+                    .await
+                    .unwrap();
+                let error = worker.join().await.unwrap_err();
+                assert!(format!("{error:#}").contains("runtime failed"));
+                assert!(worker.next().await.is_none());
+                assert!(worker.is_terminated());
+            });
+        }
+
+        // Test: Start a host worker whose construction fails, without waiting for launch.
+        // Expected: The event stream reports the constructor's failure once and
+        //       then terminates; the host runner can shut down cleanly.
+        #[async_test]
+        async fn start_failure_event(driver: DefaultDriver) {
+            let (host, runner) = worker_host();
+            let task = driver.spawn("runner", runner.run(LifetimeWorkers));
+            let mut worker = host.start_worker(FailingWorker::ID, Failure::New).unwrap();
+            let WorkerEvent::Failed(error) = worker.next().await.unwrap() else {
+                panic!("expected construction failure");
+            };
+            assert!(error.to_string().contains("construction rejected"));
+            assert!(worker.next().await.is_none());
+            assert!(worker.is_terminated());
+            drop(host);
+            task.await;
+        }
+
+        // Test: Fail restart before state transfer, through save refusal or an
+        //       unsupported destination worker factory.
+        // Expected: RestartFailed is nonterminal and communication rolls back;
+        //       Stop still reaches the original worker and produces Stopped.
+        #[async_test]
+        async fn restart_failure_preserves_the_old_worker(driver: DefaultDriver) {
+            for failure in [Failure::Save, Failure::None] {
+                let (host, runner) = worker_host();
+                let task = driver.spawn("runner", runner.run(LifetimeWorkers));
+                let mut worker = host
+                    .launch_worker(FailingWorker::ID, failure)
+                    .await
+                    .unwrap();
+                let (other_host, other_runner) = worker_host();
+                struct RejectWorkers;
+                impl WorkerFactory for RejectWorkers {
+                    fn builder(&self, _name: &str) -> anyhow::Result<WorkerBuilder> {
+                        anyhow::bail!("destination rejected")
+                    }
+                }
+                let other_task = driver.spawn("other-runner", other_runner.run(RejectWorkers));
+                worker.restart(if failure == Failure::Save {
+                    &host
+                } else {
+                    &other_host
+                });
+                let WorkerEvent::RestartFailed(error) = worker.next().await.unwrap() else {
+                    panic!("expected nonterminal restart failure");
+                };
+                assert!(error.to_string().contains(if failure == Failure::Save {
+                    "save rejected"
+                } else {
+                    "destination rejected"
+                }));
+                assert!(!worker.is_terminated());
+                worker.stop();
+                assert!(matches!(worker.next().await, Some(WorkerEvent::Stopped)));
+                worker.join().await.unwrap();
+                assert!(worker.is_terminated());
+                drop(host);
+                drop(other_host);
+                task.await;
+                other_task.await;
+            }
+        }
+
+        // Test: Fail restore after the original worker has successfully saved.
+        // Expected: This failure is terminal, not RestartFailed with a live worker;
+        //       join returns the restore error and the event stream closes.
+        #[async_test]
+        async fn restore_failure_is_terminal(driver: DefaultDriver) {
+            let (host, runner) = worker_host();
+            let task = driver.spawn("runner", runner.run(LifetimeWorkers));
+            let mut worker = host
+                .launch_worker(FailingWorker::ID, Failure::Restore)
+                .await
+                .unwrap();
+            worker.restart(&host);
+            let error = worker.join().await.unwrap_err();
+            assert!(format!("{error:#}").contains("restore rejected"));
+            assert!(worker.next().await.is_none());
+            assert!(worker.is_terminated());
+            drop(host);
+            task.await;
+        }
+
+        // Test: Drop the worker host while one worker is still accepting commands.
+        // Expected: Host shutdown waits for outstanding workers, and completes
+        //       only after the last worker has stopped and closed its event stream.
+        #[test]
+        fn host_rundown_waits_for_workers() {
+            block_on(async {
+                let (host, runner) = worker_host();
+                let mut runner = std::pin::pin!(runner.run(LifetimeWorkers));
+                let mut worker = host.start_worker(FailingWorker::ID, Failure::None).unwrap();
+                assert!(futures::poll!(&mut runner).is_pending());
+                assert!(matches!(worker.next().await, Some(WorkerEvent::Started)));
+                drop(host);
+                assert!(futures::poll!(&mut runner).is_pending());
+                worker.stop();
+                worker.join().await.unwrap();
+                runner.await;
+                assert!(worker.is_terminated());
+            });
+        }
+    }
 }
