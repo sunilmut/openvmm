@@ -136,9 +136,16 @@ impl DiskIo for DelayDisk {
 mod tests {
     use crate::DelayDisk;
     use disk_backend::Disk;
+    use guestmem::GuestMemory;
     use pal_async::DefaultDriver;
     use pal_async::async_test;
+    use scsi_buffers::OwnedRequestBuffers;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::Context;
+    use std::task::Waker;
     use std::time::Duration;
+    use test_with_tracing::test;
     use vmcore::vm_task::SingleDriverBackend;
     use vmcore::vm_task::VmTaskDriverSource;
 
@@ -151,5 +158,61 @@ mod tests {
         let inner = disklayer_ram::ram_disk(1024 * 1024, false).unwrap();
         let disk = Disk::new(DelayDisk::new(cell, inner, &source)).unwrap();
         storage_tests::sector_range::test_disk_sector_range_conformance(&disk).await;
+    }
+
+    // Test: Cancel reads and writes while delayed, then remove the delay at runtime.
+    // Expected: Pending I/O has no disk or guest-memory effects; cache sync bypasses
+    //       the read/write delay, and subsequent zero-delay I/O transfers exact data.
+    #[async_test]
+    async fn cancellation_and_live_delay_update(driver: DefaultDriver) {
+        let source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+        let (mut updater, delay) = mesh::cell(Duration::from_secs(3600));
+        let backing = disklayer_ram::ram_disk(4096, false).unwrap();
+        let disk = Disk::new(DelayDisk::new(delay, backing.clone(), &source)).unwrap();
+        let memory = GuestMemory::allocate(4096);
+        let range = OwnedRequestBuffers::new_unaligned(&[0], 0, 512);
+        let buffers = range.buffer(&memory);
+        memory.write_at(0, &[0x96; 512]).unwrap();
+        let mut cx = Context::from_waker(Waker::noop());
+
+        {
+            let mut write = pin!(disk.write_vectored(&buffers, 3, true));
+            assert!(write.as_mut().poll(&mut cx).is_pending());
+        }
+        backing.read_vectored(&buffers, 3).await.unwrap();
+        let mut actual = [0xff; 512];
+        memory.read_at(0, &mut actual).unwrap();
+        assert_eq!(actual, [0; 512], "cancelled write reached the backing disk");
+
+        memory.write_at(0, &[0x96; 512]).unwrap();
+        backing.write_vectored(&buffers, 3, false).await.unwrap();
+        memory.write_at(0, &[0x35; 512]).unwrap();
+        {
+            let mut read = pin!(disk.read_vectored(&buffers, 3));
+            assert!(read.as_mut().poll(&mut cx).is_pending());
+        }
+        memory.read_at(0, &mut actual).unwrap();
+        assert_eq!(actual, [0x35; 512], "cancelled read changed guest memory");
+
+        {
+            let mut sync = pin!(disk.sync_cache());
+            let std::task::Poll::Ready(result) = sync.as_mut().poll(&mut cx) else {
+                panic!("cache sync acquired the read/write delay");
+            };
+            result.unwrap();
+        }
+        updater.set(Duration::ZERO).await;
+        disk.read_vectored(&buffers, 3).await.unwrap();
+        memory.read_at(0, &mut actual).unwrap();
+        assert_eq!(actual, [0x96; 512]);
+        memory.write_at(0, &[0xa7; 512]).unwrap();
+        disk.write_vectored(&buffers, 5, true).await.unwrap();
+        memory.write_at(0, &[0; 512]).unwrap();
+        backing.read_vectored(&buffers, 5).await.unwrap();
+        memory.read_at(0, &mut actual).unwrap();
+        assert_eq!(actual, [0xa7; 512]);
+        backing.read_vectored(&buffers, 3).await.unwrap();
+        memory.read_at(0, &mut actual).unwrap();
+        assert_eq!(actual, [0x96; 512], "write changed an unrelated sector");
     }
 }

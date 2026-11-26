@@ -1624,11 +1624,13 @@ dependencies = [
  "disk_backend",
  "disk_backend_resources",
  "disklayer_ram",
+ "guestmem",
  "inspect",
  "mesh",
  "pal_async",
  "scsi_buffers",
  "storage_tests",
+ "test_with_tracing",
  "vm_resource",
  "vmcore",
 ]
