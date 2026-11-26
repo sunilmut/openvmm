@@ -198,3 +198,57 @@ pub mod tap {
         const ID: &'static str = "tap";
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::consomme::HostIpAddress;
+    use super::mac_address::MacAddress;
+    use std::net::IpAddr;
+    use test_with_tracing::test;
+
+    // Test: Send explicitly bound IPv4, IPv6 and mapped IPv6 addresses as resources.
+    // Expected: The host bind address retains every bit and its address family;
+    //       a mapped IPv6 address must not silently become an IPv4 bind.
+    #[test]
+    fn host_bind_addresses_preserve_family_across_serialization() {
+        for text in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "::",
+            "2001:db8:1234::abcd",
+            "::ffff:192.0.2.7",
+        ] {
+            let address: IpAddr = text.parse().unwrap();
+            let (encoded, resources) = mesh::Message::new(HostIpAddress::from(address)).serialize();
+            let decoded: HostIpAddress = mesh::Message::serialized(&encoded, resources)
+                .parse()
+                .unwrap();
+            assert_eq!(IpAddr::from(decoded), address);
+        }
+    }
+
+    // Test: Canonicalize a nonuniform MAC supplied in either accepted notation.
+    // Expected: Leading zeroes, octet order and all six bytes survive formatting
+    //       and reparsing; non-ASCII and malformed separators are rejected.
+    #[test]
+    fn mac_text_roundtrip_preserves_identity() {
+        let expected = [0x02, 0x0a, 0xb0, 0x01, 0xfe, 0x80];
+        for address in [
+            MacAddress::from(expected),
+            MacAddress::new(expected),
+            "02:0A:B0:01:Fe:80".parse().unwrap(),
+        ] {
+            let text = address.to_string();
+            assert_eq!(text, "02-0a-b0-01-fe-80");
+            let reparsed: MacAddress = text.parse().unwrap();
+            assert_eq!(<[u8; 6]>::from(reparsed), expected);
+        }
+        for text in [
+            "02.0a.b0.01.fe.80",
+            "é:0a:b0:01:fe:80",
+            "02:0a:b0:01:fe:\0\0",
+        ] {
+            assert!(text.parse::<MacAddress>().is_err(), "{text:?}");
+        }
+    }
+}
