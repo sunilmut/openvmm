@@ -1728,3 +1728,48 @@ async fn cyclic_descriptor_chain_does_not_wedge_worker(driver: DefaultDriver) {
     )
     .await;
 }
+
+// Test: Write past the disk end, then read the last valid sector.
+// Expected: The rejected write reports IOERR without modifying the final sector.
+#[async_test]
+async fn crossing_disk_end_preserves_last_sector(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver, ram_disk(4096, false), false);
+    harness.enable().await;
+    let status = harness.post_write_request(0, 7, &[0x5a; 512]);
+    assert_eq!(harness.wait_for_used().await, (0, 1));
+    assert_eq!(harness.read_status(status), VIRTIO_BLK_S_OK);
+
+    let status = harness.post_write_request(3, 7, &[0xcc; 1024]);
+    assert_eq!(harness.wait_for_used().await, (3, 1));
+    assert_eq!(harness.read_status(status), VIRTIO_BLK_S_IOERR);
+
+    let data = harness.post_read_request(6, 7, 512);
+    assert_eq!(harness.wait_for_used().await, (6, 513));
+    assert_eq!(harness.read_status(data + 512), VIRTIO_BLK_S_OK);
+    let mut actual = [0; 512];
+    harness.mem.read_at(data, &mut actual).unwrap();
+    assert_eq!(actual, [0x5a; 512]);
+    harness.device.stop_queue(0).await;
+}
+
+// Test: Submit misaligned read and write offsets to a native 4K-sector disk.
+// Expected: Both fail with IOERR and an aligned request still completes.
+#[async_test]
+async fn unaligned_4k_io_does_not_poison_queue(driver: DefaultDriver) {
+    let disk = HookDisk::new(16384, 4096).into_disk();
+    let mut harness = TestHarness::new(&driver, disk, false);
+    harness.enable().await;
+    let status = harness.post_write_request(0, 1, &[0x44; 4096]);
+    assert_eq!(harness.wait_for_used().await, (0, 1));
+    assert_eq!(harness.read_status(status), VIRTIO_BLK_S_IOERR);
+    let data = harness.post_read_request(3, 1, 4096);
+    harness.wait_for_used().await;
+    assert_eq!(harness.read_status(data + 4096), VIRTIO_BLK_S_IOERR);
+    let data = harness.post_read_request(5, 0, 4096);
+    assert_eq!(harness.wait_for_used().await, (5, 4097));
+    assert_eq!(harness.read_status(data + 4096), VIRTIO_BLK_S_OK);
+    let mut actual = [0xff; 4096];
+    harness.mem.read_at(data, &mut actual).unwrap();
+    assert_eq!(actual, [0; 4096]);
+    harness.device.stop_queue(0).await;
+}
