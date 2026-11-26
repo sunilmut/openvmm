@@ -3832,6 +3832,7 @@ name = "hyperv_keyboard_protocol"
 version = "0.0.0"
 dependencies = [
  "guid",
+ "test_with_tracing",
  "zerocopy",
 ]
 
