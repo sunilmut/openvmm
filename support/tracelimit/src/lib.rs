@@ -449,3 +449,6 @@ macro_rules! event_ratelimited {
         }
     };
 }
+
+#[cfg(test)]
+mod tests;
