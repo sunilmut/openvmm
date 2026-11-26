@@ -329,3 +329,6 @@ impl CpuContextX64 {
     /// The index of the R15 register.
     pub const R15: usize = 15;
 }
+
+#[cfg(test)]
+mod tests;

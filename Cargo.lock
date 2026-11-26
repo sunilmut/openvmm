@@ -8196,6 +8196,7 @@ version = "0.0.0"
 dependencies = [
  "hvdef",
  "open_enum",
+ "test_with_tracing",
  "x86defs",
  "zerocopy",
 ]
