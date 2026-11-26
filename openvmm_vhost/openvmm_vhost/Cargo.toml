@@ -22,5 +22,9 @@ virtio_resources.workspace = true
 vm_resource.workspace = true
 vmcore.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

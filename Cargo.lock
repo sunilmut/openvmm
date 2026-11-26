@@ -6498,6 +6498,8 @@ dependencies = [
  "disk_backend_resources",
  "disk_file",
  "pal_async",
+ "tempfile",
+ "test_with_tracing",
  "tracing-subscriber",
  "vhost_user_backend",
  "virtio",
