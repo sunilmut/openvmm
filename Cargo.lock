@@ -8559,6 +8559,8 @@ dependencies = [
  "arbitrary",
  "guid",
  "mesh",
+ "pal_async",
+ "test_with_tracing",
  "vm_resource",
 ]
 

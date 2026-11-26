@@ -102,3 +102,6 @@ pub struct StorvspIdeDeviceHandle {
 impl ResourceId<VmbusDeviceHandleKind> for StorvspIdeDeviceHandle {
     const ID: &'static str = "storvsp-ide";
 }
+
+#[cfg(test)]
+mod tests;
