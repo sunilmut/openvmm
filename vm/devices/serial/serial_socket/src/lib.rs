@@ -12,3 +12,6 @@ pub mod net;
 pub mod windows;
 #[cfg(all(test, windows))]
 mod windows_tests;
+
+#[cfg(test)]
+mod transport_tests;
