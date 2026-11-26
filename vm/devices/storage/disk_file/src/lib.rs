@@ -311,3 +311,157 @@ mod tests {
         assert!(matches!(r, Err(DiskError::IllegalBlock)), "{r:?}");
     }
 }
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use guestmem::GuestMemory;
+    use pal_async::DefaultDriver;
+    use pal_async::async_test;
+    use scsi_buffers::OwnedRequestBuffers;
+    use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
+    use std::io::Write;
+    use test_with_tracing::test;
+    use vmcore::vm_task::SingleDriverBackend;
+    use vmcore::vm_task::VmTaskDriverSource;
+
+    // Test: Scatter/gather two 4K sectors inside a metadata-bounded disk image.
+    // Expected: Sector scaling, buffer order and flush preserve exact file
+    //       data, adjacent sectors and an excluded footer; unmap is a no-op.
+    #[async_test]
+    async fn scatter_gather_respects_metadata_and_preserves_footer() {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let mut file = tempfile::tempfile_in(directory.path()).unwrap();
+        let mut expected = vec![0x6d; 0x4200];
+        file.write_all(&expected).unwrap();
+        let disk = FileDisk::with_metadata(
+            file,
+            Metadata {
+                disk_size: 0x4000,
+                sector_size: 4096,
+                physical_sector_size: 4096,
+                read_only: false,
+            },
+        );
+        let memory = GuestMemory::allocate(0x3000);
+        memory.write_at(0x2000, &[0x19; 4096]).unwrap();
+        memory.write_at(0, &[0xb3; 4096]).unwrap();
+        let buffers = OwnedRequestBuffers::new(&[2, 0]);
+        disk.write_vectored(&buffers.buffer(&memory), 1, true)
+            .await
+            .unwrap();
+        disk.sync_cache().await.unwrap();
+        disk.unmap(1, 2, false).await.unwrap();
+        memory.fill_at(0, 0x88, 0x3000).unwrap();
+        disk.read_vectored(&buffers.buffer(&memory), 1)
+            .await
+            .unwrap();
+        let mut observed = vec![0; 0x3000];
+        memory.read_at(0, &mut observed).unwrap();
+        assert_eq!(&observed[..4096], &[0xb3; 4096]);
+        assert_eq!(&observed[4096..8192], &[0x88; 4096]);
+        assert_eq!(&observed[8192..], &[0x19; 4096]);
+        let footer_request = OwnedRequestBuffers::linear(0, 4096, false);
+        assert!(matches!(
+            disk.write_vectored(&footer_request.buffer(&memory), 4, false)
+                .await,
+            Err(DiskError::IllegalBlock)
+        ));
+        assert!(matches!(
+            disk.read_vectored(&footer_request.buffer(&memory), 4).await,
+            Err(DiskError::IllegalBlock)
+        ));
+        expected[0x1000..0x2000].fill(0x19);
+        expected[0x2000..0x3000].fill(0xb3);
+        let mut file = disk.into_inner();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, expected);
+    }
+
+    // Test: Resolve a read-only file resource and issue reads and discard.
+    // Expected: File bytes remain readable while the resolved read-only policy
+    //       rejects discard without altering the underlying file.
+    #[async_test]
+    async fn resolver_preserves_read_only_policy(driver: DefaultDriver) {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let mut file = tempfile::tempfile_in(directory.path()).unwrap();
+        file.write_all(&[0x93; 1024]).unwrap();
+        let source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+        let disk = FileDiskResolver
+            .resolve(
+                FileDiskHandle(file),
+                ResolveDiskParameters {
+                    read_only: true,
+                    driver_source: &source,
+                },
+            )
+            .unwrap()
+            .0;
+        let memory = GuestMemory::allocate(512);
+        disk.read_vectored(
+            &OwnedRequestBuffers::linear(0, 512, true).buffer(&memory),
+            1,
+        )
+        .await
+        .unwrap();
+        let mut bytes = [0; 512];
+        memory.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x93; 512]);
+        assert!(matches!(
+            disk.unmap(0, 1, false).await,
+            Err(DiskError::ReadOnly)
+        ));
+        disk.read_vectored(
+            &OwnedRequestBuffers::linear(0, 512, true).buffer(&memory),
+            0,
+        )
+        .await
+        .unwrap();
+        memory.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x93; 512]);
+    }
+
+    // Test: Write through an OS read-only descriptor and an inaccessible guest buffer.
+    // Expected: Both failures propagate rather than reporting successful I/O,
+    //       and neither can modify the backing file.
+    #[async_test]
+    async fn backing_and_guest_access_errors_propagate() {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let path = directory.path().join("disk");
+        fs::write(&path, [0x32; 1024]).unwrap();
+        let disk = FileDisk::open(fs::File::open(&path).unwrap(), true).unwrap();
+        let memory = GuestMemory::allocate(512);
+        let buffers = OwnedRequestBuffers::linear(0, 512, false);
+        assert!(matches!(
+            disk.write(&buffers.buffer(&memory), 0, false).await,
+            Err(DiskError::Io(_))
+        ));
+        let writable = FileDisk::open(
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+            false,
+        )
+        .unwrap();
+        let inaccessible = OwnedRequestBuffers::linear(0x2000, 512, false);
+        assert!(
+            writable
+                .write(&inaccessible.buffer(&memory), 0, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            writable
+                .read(&inaccessible.buffer(&memory), 0)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(path).unwrap(), [0x32; 1024]);
+    }
+}
