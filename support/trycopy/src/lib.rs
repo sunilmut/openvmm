@@ -1115,6 +1115,58 @@ mod tests {
         }
     }
 
+    // Test: Recover from real read/write access faults, inspect typed error causes, and immediately perform a valid copy on each thread.
+    // Expected: Both directions report access violations with a source error and zero offset; recovery state is thread-local and does not poison subsequent valid accesses.
+    #[test]
+    fn fault_errors_preserve_causes_and_allow_subsequent_copies() {
+        use std::error::Error;
+        let workers: Vec<_> = (0..2)
+            .map(|worker| {
+                std::thread::spawn(move || {
+                    let mapping = GuardedMapping::new();
+                    let source = [0x81, worker, 0, 0xff];
+                    let mut destination = [0; 4];
+                    unsafe {
+                        let guard = mapping.ptr.add(mapping.page_size);
+                        for is_write in [false, true] {
+                            let error = if is_write {
+                                try_copy(source.as_ptr(), guard, source.len()).unwrap_err()
+                            } else {
+                                try_copy(guard, destination.as_mut_ptr(), destination.len())
+                                    .unwrap_err()
+                            };
+                            assert_eq!(error.kind(), crate::MemoryErrorKind::AccessViolation);
+                            assert_eq!(error.offset(), 0);
+                            assert_eq!(error.is_write, is_write);
+                            assert_eq!(
+                                error.to_string(),
+                                if is_write {
+                                    "failed to write memory"
+                                } else {
+                                    "failed to read memory"
+                                }
+                            );
+                            let cause = error
+                                .source()
+                                .expect("access failure must retain its cause");
+                            #[cfg(unix)]
+                            assert!(cause.to_string().contains("SIGSEGV"), "{cause}");
+                            #[cfg(windows)]
+                            assert_eq!(cause.to_string(), "access violation");
+                            try_copy(source.as_ptr(), destination.as_mut_ptr(), source.len())
+                                .unwrap();
+                            assert_eq!(destination, source);
+                            destination.fill(0);
+                        }
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+    }
+
     #[test]
     fn test_public_copy_and_fill_element_counts() {
         initialize_try_copy();
