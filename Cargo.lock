@@ -7777,6 +7777,7 @@ dependencies = [
  "scsi_buffers",
  "scsi_defs",
  "stackfuture",
+ "test_with_tracing",
  "vm_resource",
  "vmcore",
 ]

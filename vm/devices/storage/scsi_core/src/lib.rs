@@ -209,3 +209,6 @@ pub mod save_restore {
         MediaToMedia = 0x03,
     }
 }
+
+#[cfg(test)]
+mod tests;
