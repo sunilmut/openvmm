@@ -14,3 +14,6 @@ mesh.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+test_with_tracing.workspace = true

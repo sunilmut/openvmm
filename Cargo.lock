@@ -11207,6 +11207,7 @@ name = "vmgs_resources"
 version = "0.0.0"
 dependencies = [
  "mesh",
+ "test_with_tracing",
  "vm_resource",
  "vmgs_format",
 ]
