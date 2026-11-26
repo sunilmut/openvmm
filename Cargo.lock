@@ -9149,6 +9149,9 @@ dependencies = [
  "guid",
  "inspect",
  "mesh",
+ "pal_async",
+ "parking_lot",
+ "test_with_tracing",
  "vm_resource",
 ]
 

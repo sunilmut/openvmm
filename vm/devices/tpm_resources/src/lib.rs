@@ -212,3 +212,6 @@ impl TpmLogger for Option<Arc<dyn TpmLogger>> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
