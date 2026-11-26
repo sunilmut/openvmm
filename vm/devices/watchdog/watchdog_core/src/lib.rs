@@ -772,3 +772,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod protocol_tests;
