@@ -253,3 +253,6 @@ mod save_restore {
         }
     }
 }
+
+#[cfg(test)]
+mod contract_tests;
