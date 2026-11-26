@@ -352,6 +352,270 @@ mod tests {
     use crate::delta::SignaturesDelta;
     use crate::delta::SignaturesReplace;
     use crate::delta::UefiVarsDelta;
+    use test_with_tracing::test;
+
+    fn signature(marker: u8) -> Signature {
+        Signature::Sha256(vec![Sha256Digest([marker; 32])])
+    }
+
+    // Test: Retain deferred template and delta JSON envelopes without eagerly validating or normalizing their bytes.
+    // Expected: Empty, whitespace-rich, malformed and non-UTF8 inputs remain byte-identical across wrapper construction and cloning.
+    #[test]
+    fn deferred_json_envelopes_preserve_opaque_bytes() {
+        for bytes in [
+            vec![],
+            b" { \"Name\" : 1 } \n".to_vec(),
+            vec![b'{', 0, 0xff],
+        ] {
+            let base = BaseTemplate {
+                json: bytes.clone().into(),
+            };
+            let delta = UefiVarsDeltaJson::from(bytes.clone());
+            assert_eq!(base.json.as_bytes(), bytes);
+            assert_eq!(base.clone().json.as_bytes(), bytes);
+            assert_eq!(delta.as_bytes(), bytes);
+            assert_eq!(delta.clone().as_bytes(), bytes);
+        }
+    }
+
+    fn base() -> UefiVars {
+        UefiVars {
+            signatures: Some(Signatures {
+                pk: signature(0),
+                kek: vec![signature(1)],
+                db: vec![signature(2)],
+                dbx: vec![signature(3)],
+                moklist: vec![signature(4)],
+                moklistx: vec![signature(5)],
+            }),
+            non_signature_vars: Vec::new(),
+        }
+    }
+
+    fn markers(signatures: &[Signature]) -> Vec<u8> {
+        signatures
+            .iter()
+            .map(|signature| {
+                let Signature::Sha256(digests) = signature else {
+                    panic!("expected SHA256 signature")
+                };
+                assert_eq!(digests.len(), 1);
+                let marker = digests[0].0[0];
+                assert_eq!(digests[0].0, [marker; 32]);
+                marker
+            })
+            .collect()
+    }
+
+    // Test: Append distinct signatures to every appendable collection.
+    // Expected: The platform key stays unchanged and each list retains old-before-new order without crossing collections.
+    #[test]
+    fn append_preserves_platform_key_and_each_collection_order() {
+        let template: BaseTemplateVars = base().into();
+        assert_eq!(markers(&[template.signatures().unwrap().pk.clone()]), [0]);
+        let delta = UefiVarsDelta {
+            signatures: SignaturesDelta::Append(SignaturesAppend {
+                kek: Some(vec![signature(11)]),
+                db: Some(vec![signature(12)]),
+                dbx: Some(vec![signature(13)]),
+                moklist: Some(vec![signature(14)]),
+                moklistx: Some(vec![signature(15)]),
+            }),
+            non_signature_vars: Vec::new(),
+        };
+        let vars = FinalVars::resolve(Some(template), Some(delta))
+            .unwrap()
+            .into_uefi_vars();
+        let signatures = vars.signatures.unwrap();
+        assert_eq!(markers(&[signatures.pk]), [0]);
+        for (index, list) in [
+            signatures.kek,
+            signatures.db,
+            signatures.dbx,
+            signatures.moklist,
+            signatures.moklistx,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(markers(list), [index as u8 + 1, index as u8 + 11]);
+        }
+    }
+
+    // Test: Replace with defaults, explicit values, empty lists, and omitted optional MOK lists.
+    // Expected: Defaults/omissions retain base entries; explicit empty lists clear them; no-base explicit replacements create a complete set.
+    #[test]
+    fn replacement_distinguishes_defaults_omissions_and_explicit_empty_lists() {
+        for mode in 0..3 {
+            let replace = SignaturesReplace {
+                pk: if mode == 0 {
+                    SignatureDelta::Default
+                } else {
+                    SignatureDelta::Sig(signature(20))
+                },
+                kek: if mode == 0 {
+                    SignatureDeltaVec::Default
+                } else {
+                    SignatureDeltaVec::Sigs(Vec::new())
+                },
+                db: if mode == 0 {
+                    SignatureDeltaVec::Default
+                } else {
+                    SignatureDeltaVec::Sigs(vec![signature(22)])
+                },
+                dbx: if mode == 0 {
+                    SignatureDeltaVec::Default
+                } else {
+                    SignatureDeltaVec::Sigs(Vec::new())
+                },
+                moklist: match mode {
+                    0 => Some(SignatureDeltaVec::Default),
+                    1 => Some(SignatureDeltaVec::Sigs(Vec::new())),
+                    _ => None,
+                },
+                moklistx: match mode {
+                    0 => Some(SignatureDeltaVec::Default),
+                    1 => Some(SignatureDeltaVec::Sigs(vec![signature(25)])),
+                    _ => None,
+                },
+            };
+            let vars = base()
+                .apply_delta(UefiVarsDelta {
+                    signatures: SignaturesDelta::Replace(replace),
+                    non_signature_vars: Vec::new(),
+                })
+                .unwrap();
+            let signatures = vars.signatures.unwrap();
+            assert_eq!(
+                markers(&[signatures.pk]),
+                if mode == 0 { vec![0] } else { vec![20] }
+            );
+            assert_eq!(
+                markers(&signatures.kek),
+                if mode == 0 { vec![1] } else { vec![] }
+            );
+            assert_eq!(
+                markers(&signatures.db),
+                if mode == 0 { vec![2] } else { vec![22] }
+            );
+            assert_eq!(
+                markers(&signatures.dbx),
+                if mode == 0 { vec![3] } else { vec![] }
+            );
+            assert_eq!(
+                markers(&signatures.moklist),
+                if mode == 1 { vec![] } else { vec![4] }
+            );
+            assert_eq!(
+                markers(&signatures.moklistx),
+                if mode == 1 { vec![25] } else { vec![5] }
+            );
+        }
+        for optional in [None, Some(SignatureDeltaVec::Sigs(vec![signature(9)]))] {
+            let vars = UefiVars::new()
+                .apply_delta(UefiVarsDelta {
+                    signatures: SignaturesDelta::Replace(SignaturesReplace {
+                        pk: SignatureDelta::Sig(signature(7)),
+                        kek: SignatureDeltaVec::Sigs(Vec::new()),
+                        db: SignatureDeltaVec::Sigs(Vec::new()),
+                        dbx: SignatureDeltaVec::Sigs(Vec::new()),
+                        moklist: optional.clone(),
+                        moklistx: optional.clone(),
+                    }),
+                    non_signature_vars: Vec::new(),
+                })
+                .unwrap();
+            let signatures = vars.signatures.unwrap();
+            assert_eq!(markers(&[signatures.pk]), [7]);
+            assert!(
+                signatures.kek.is_empty() && signatures.db.is_empty() && signatures.dbx.is_empty()
+            );
+            let expected = if optional.is_some() { vec![9] } else { vec![] };
+            assert_eq!(markers(&signatures.moklist), expected);
+            assert_eq!(markers(&signatures.moklistx), expected);
+        }
+        let error = UefiVars::new()
+            .apply_delta(UefiVarsDelta {
+                signatures: SignaturesDelta::Replace(SignaturesReplace {
+                    pk: SignatureDelta::Sig(signature(7)),
+                    kek: SignatureDeltaVec::Default,
+                    db: SignatureDeltaVec::Sigs(Vec::new()),
+                    dbx: SignatureDeltaVec::Sigs(Vec::new()),
+                    moklist: None,
+                    moklistx: None,
+                }),
+                non_signature_vars: Vec::new(),
+            })
+            .unwrap_err();
+        assert!(matches!(error, ApplyDeltaError::DefaultWithoutBase));
+    }
+
+    fn variable(guid: Guid, marker: u8) -> UefiVar {
+        UefiVar {
+            guid,
+            attr: 7,
+            value: vec![marker],
+        }
+    }
+
+    fn apply_variables(vars: UefiVars, variables: Vec<(String, UefiVar)>) -> UefiVars {
+        vars.apply_delta(UefiVarsDelta {
+            signatures: SignaturesDelta::Append(SignaturesAppend {
+                kek: None,
+                db: None,
+                dbx: None,
+                moklist: None,
+                moklistx: None,
+            }),
+            non_signature_vars: variables,
+        })
+        .unwrap()
+    }
+
+    // Test: Replace an exact variable identity and append a differently named variable, including dbDefault outside the restricted namespace.
+    // Expected: Exact replacements keep ordering, appended entries retain values/attributes, and restriction is vendor-sensitive.
+    #[test]
+    fn ordinary_variable_replacement_and_append_preserve_values() {
+        let mut vars = base();
+        vars.non_signature_vars
+            .push(("Name".into(), variable(EFI_GLOBAL_VARIABLE, 1)));
+        let vars = apply_variables(
+            vars,
+            vec![
+                ("Name".into(), variable(EFI_GLOBAL_VARIABLE, 2)),
+                ("dbDefault".into(), variable(Guid::ZERO, 3)),
+            ],
+        );
+        assert_eq!(vars.non_signature_vars.len(), 2);
+        for (index, (name, value)) in vars.non_signature_vars.iter().enumerate() {
+            assert_eq!(name, ["Name", "dbDefault"][index]);
+            assert_eq!(value.value, [index as u8 + 2]);
+            assert_eq!(value.attr, 7);
+            assert_eq!(value.guid, [EFI_GLOBAL_VARIABLE, Guid::ZERO][index]);
+        }
+    }
+
+    // Test: Add the same variable name in a distinct vendor namespace after an exact-identity replacement control.
+    // Expected: UEFI variable identity includes both name and GUID, so the two namespace values coexist.
+    #[test]
+    #[ignore = "product bug: delta replacement matches variable name without vendor GUID"]
+    fn same_name_variables_in_distinct_vendor_namespaces_coexist() {
+        let mut vars = base();
+        vars.non_signature_vars
+            .push(("Name".into(), variable(EFI_GLOBAL_VARIABLE, 1)));
+        let vars = apply_variables(
+            vars,
+            vec![("Name".into(), variable(EFI_GLOBAL_VARIABLE, 2))],
+        );
+        assert_eq!(vars.non_signature_vars.len(), 1);
+        assert_eq!(vars.non_signature_vars[0].1.value, [2]);
+        let vars = apply_variables(vars, vec![("Name".into(), variable(Guid::ZERO, 3))]);
+        assert_eq!(vars.non_signature_vars.len(), 2);
+        assert_eq!(vars.non_signature_vars[0].1.guid, EFI_GLOBAL_VARIABLE);
+        assert_eq!(vars.non_signature_vars[0].1.value, [2]);
+        assert_eq!(vars.non_signature_vars[1].1.guid, Guid::ZERO);
+        assert_eq!(vars.non_signature_vars[1].1.value, [3]);
+    }
 
     #[test]
     fn no_templates_resolve_to_empty_final_vars() {
