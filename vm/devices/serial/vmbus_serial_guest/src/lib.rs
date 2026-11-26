@@ -689,4 +689,226 @@ mod tests {
         host_io.read_exact(&mut data_recv2).await.unwrap();
         assert_eq!(data2, data_recv2);
     }
+
+    async fn scripted_transport() -> (
+        impl vmbus_async::async_dgram::AsyncRecv + vmbus_async::async_dgram::AsyncSend + Unpin,
+        VmbusSerialDriver,
+    ) {
+        let (mut host, guest) = vmbus_async::pipe::connected_message_pipes(4096);
+        let host_handshake = async {
+            let mut buf = [0; MAX_MESSAGE_SIZE];
+            host.recv(&mut buf).await.unwrap();
+            host.send(
+                VersionRequestResponse {
+                    header: Header::new_host_response(HostRequests::VERSION),
+                    version_accepted: 1,
+                    pad: 0,
+                }
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            host.send(
+                SetModumStatusMessage {
+                    header: Header::new_guest_notification(GuestNotifications::SET_MODEM_STATUS),
+                    is_connected: 1,
+                    modem_status: 0,
+                }
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        };
+        let (_, guest) = join!(host_handshake, VmbusSerialDriver::new(guest, false));
+        (host, guest.unwrap())
+    }
+
+    // Test: Negotiate with truncated, misrouted, or unsupported-version replies.
+    // Expected: Each reply is rejected rather than creating a usable serial port.
+    #[async_test]
+    async fn malformed_version_replies(_driver: DefaultDriver) {
+        let valid = VersionRequestResponse {
+            header: Header::new_host_response(HostRequests::VERSION),
+            version_accepted: 1,
+            pad: 0,
+        };
+        let mut replies = vec![valid.as_bytes()[..3].to_vec()];
+        for header in [
+            Header::new_guest_notification(GuestNotifications::SET_MODEM_STATUS),
+            Header::new_host_response(HostRequests::GET_RX_DATA),
+            Header {
+                message_version: MessageVersions(255),
+                ..valid.header
+            },
+        ] {
+            replies.push(
+                VersionRequestResponse { header, ..valid }
+                    .as_bytes()
+                    .to_vec(),
+            );
+        }
+        for reply in replies {
+            let (mut host, guest) = vmbus_async::pipe::connected_message_pipes(4096);
+            let response = async {
+                let mut buf = [0; MAX_MESSAGE_SIZE];
+                host.recv(&mut buf).await.unwrap();
+                host.send(&reply).await.unwrap();
+            };
+            let (_, result) = join!(response, VmbusSerialDriver::new(guest, false));
+            assert!(result.is_err(), "accepted malformed reply {reply:?}");
+        }
+    }
+
+    // Test: Receive malformed runtime frames, then receive valid data.
+    // Expected: Reads fail and the port remains disconnected and rejects writes.
+    #[async_test]
+    async fn protocol_failure_is_terminal(_driver: DefaultDriver) {
+        use serial_core::SerialIo;
+
+        let oversized = RxDataResponse {
+            header: Header::new_host_response(HostRequests::GET_RX_DATA),
+            buffer_length: (UART_MSG_MAX_PAYLOAD + 1) as u8,
+            more_data_available: 0,
+            buffer: [0; UART_MSG_MAX_PAYLOAD],
+        };
+        let malformed = [
+            vec![0],
+            Header::new_guest_notification(GuestNotifications(255))
+                .as_bytes()
+                .to_vec(),
+            Header::new_host_response(HostRequests::VERSION)
+                .as_bytes()
+                .to_vec(),
+            Header::new_guest_notification(GuestNotifications::SET_MODEM_STATUS)
+                .as_bytes()
+                .to_vec(),
+            Header {
+                message_version: MessageVersions(255),
+                ..Header::new_guest_notification(GuestNotifications::RX_DATA_AVAILABLE)
+            }
+            .as_bytes()
+            .to_vec(),
+            Header {
+                message_type: MessageTypes(255),
+                ..Header::new_host_response(HostRequests::GET_RX_DATA)
+            }
+            .as_bytes()
+            .to_vec(),
+            oversized.as_bytes().to_vec(),
+        ];
+        for frame in malformed {
+            let (mut host, mut guest) = scripted_transport().await;
+            host.send(&frame).await.unwrap();
+            assert!(guest.read(&mut [0; 1]).await.is_err());
+            assert!(!guest.is_connected());
+            host.send(
+                SetModumStatusMessage {
+                    header: Header::new_guest_notification(GuestNotifications::SET_MODEM_STATUS),
+                    is_connected: 1,
+                    modem_status: 0,
+                }
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            assert!(guest.read(&mut [0; 1]).await.is_err());
+            assert!(guest.write(b"retry").await.is_err());
+            assert!(guest.flush().await.is_err());
+            assert!(!guest.is_connected());
+        }
+    }
+
+    // Test: A short write is followed by a flush and suffix retry before TX completion.
+    // Expected: No second frame or successful flush precedes the acknowledgement;
+    //       the next frame contains only the suffix, and modem changes reach callers.
+    #[async_test]
+    async fn completion_gates_suffix_and_modem_changes(_driver: DefaultDriver) {
+        use serial_core::SerialIo;
+        use std::future::poll_fn;
+        use zerocopy::FromBytes;
+
+        let (mut host, mut guest) = scripted_transport().await;
+        let input = [0x5a; UART_MSG_MAX_PAYLOAD + 3];
+        assert_eq!(guest.write(&input).await.unwrap(), UART_MSG_MAX_PAYLOAD);
+        assert!(guest.flush().now_or_never().is_none());
+        assert!(
+            guest
+                .write(&input[UART_MSG_MAX_PAYLOAD..])
+                .now_or_never()
+                .is_none()
+        );
+        let mut buf = [0; MAX_MESSAGE_SIZE];
+        let n = host.recv(&mut buf).await.unwrap();
+        let frame = TxDataAvailableMessage::read_from_bytes(&buf[..n]).unwrap();
+        assert_eq!(frame.buffer_length as usize, UART_MSG_MAX_PAYLOAD);
+        assert_eq!(frame.buffer, input[..UART_MSG_MAX_PAYLOAD]);
+        assert!(host.recv(&mut buf).now_or_never().is_none());
+        host.send(Header::new_guest_notification(GuestNotifications::TX_COMPLETED).as_bytes())
+            .await
+            .unwrap();
+        guest.flush().await.unwrap();
+        assert_eq!(
+            guest.write(&input[UART_MSG_MAX_PAYLOAD..]).await.unwrap(),
+            3
+        );
+        let n = host.recv(&mut buf).await.unwrap();
+        let frame = TxDataAvailableMessage::read_from_bytes(&buf[..n]).unwrap();
+        assert_eq!(frame.buffer_length, 3);
+        assert_eq!(&frame.buffer[..3], &input[UART_MSG_MAX_PAYLOAD..]);
+        for connected in [0, 1] {
+            host.send(
+                SetModumStatusMessage {
+                    header: Header::new_guest_notification(GuestNotifications::SET_MODEM_STATUS),
+                    is_connected: connected,
+                    modem_status: 0,
+                }
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            if connected == 0 {
+                poll_fn(|cx| guest.poll_disconnect(cx)).await.unwrap();
+                assert_eq!(guest.read(&mut [0; 1]).await.unwrap(), 0);
+            } else {
+                poll_fn(|cx| guest.poll_connect(cx)).await.unwrap();
+            }
+            assert_eq!(guest.is_connected(), connected != 0);
+        }
+    }
+
+    // Test: Cancel a pending read after its RX request reaches the host, then drain RX.
+    // Expected: Draining accepts the response without losing its bytes; subsequent
+    //       short reads consume only the declared payload, never the padding.
+    #[async_test]
+    async fn cancelled_read_can_drain_accepted_response(_driver: DefaultDriver) {
+        let (mut host, mut guest) = scripted_transport().await;
+        host.send(Header::new_guest_notification(GuestNotifications::RX_DATA_AVAILABLE).as_bytes())
+            .await
+            .unwrap();
+        assert!(guest.read(&mut [0; 1]).now_or_never().is_none());
+        assert!(guest.read(&mut [0; 1]).now_or_never().is_none());
+        let mut request = [0; MAX_MESSAGE_SIZE];
+        let n = host.recv(&mut request).await.unwrap();
+        assert_eq!(
+            &request[..n],
+            Header::new_host_request(HostRequests::GET_RX_DATA).as_bytes()
+        );
+        assert!(guest.drain_rx().now_or_never().is_none());
+        let mut response = RxDataResponse {
+            header: Header::new_host_response(HostRequests::GET_RX_DATA),
+            buffer_length: 3,
+            more_data_available: 0,
+            buffer: [0xee; UART_MSG_MAX_PAYLOAD],
+        };
+        response.buffer[..3].copy_from_slice(b"abc");
+        host.send(response.as_bytes()).await.unwrap();
+        guest.drain_rx().await.unwrap();
+        let mut bytes = [0; 2];
+        assert_eq!(guest.read(&mut bytes).await.unwrap(), 2);
+        assert_eq!(&bytes, b"ab");
+        assert_eq!(guest.read(&mut bytes).await.unwrap(), 1);
+        assert_eq!(bytes[0], b'c');
+        assert!(guest.read(&mut bytes).now_or_never().is_none());
+        assert!(host.recv(&mut request).now_or_never().is_none());
+    }
 }
