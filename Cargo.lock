@@ -6629,6 +6629,7 @@ dependencies = [
  "getrandom 0.4.2",
  "libc",
  "mesh_protobuf",
+ "test_with_tracing",
  "windows-sys 0.61.0",
 ]
 
