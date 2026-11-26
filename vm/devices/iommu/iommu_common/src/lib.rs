@@ -643,3 +643,234 @@ mod tests {
         assert_eq!(buf, [0x11]);
     }
 }
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use pci_core::dma::DmaPassthrough;
+    use pci_core::msi::MsiConnection;
+    use pci_core::msi::SignalMsi;
+    use test_with_tracing::test;
+
+    #[derive(Clone, Default)]
+    struct PagedTranslator(Arc<Mutex<Vec<(u16, u64, bool)>>>);
+
+    impl IommuTranslator for PagedTranslator {
+        type Error = std::io::Error;
+
+        fn max_iova(&self) -> u64 {
+            0x4000
+        }
+
+        fn translate<R>(
+            &self,
+            rid: u16,
+            iova: u64,
+            write: bool,
+            op: impl FnOnce(u64) -> R,
+        ) -> Result<R, TranslationFault<Self::Error>> {
+            self.0.lock().push((rid, iova, write));
+            let page = match iova >> 12 {
+                0 => 2,
+                1 => 0,
+                2 => {
+                    return Err(TranslationFault {
+                        iova,
+                        error: std::io::Error::other("unmapped IOVA"),
+                    });
+                }
+                _ => 8,
+            };
+            Ok(op((page << 12) | (iova & 0xfff)))
+        }
+    }
+
+    fn buses() -> AssignedBusRange {
+        let buses = AssignedBusRange::new();
+        buses.set_bus_range(4, 6);
+        buses
+    }
+
+    // Test: DMA crosses two noncontiguous translated pages and encounters faults.
+    // Expected: Read/write/fill split at IOVA page boundaries without touching
+    //       physical neighbors; translation and backing failures propagate.
+    #[test]
+    fn noncontiguous_dma_and_faults() {
+        let inner = GuestMemory::allocate(0x4000);
+        inner.fill_at(0, 0x55, 0x4000).unwrap();
+        let translator = PagedTranslator::default();
+        let gm = TranslatingMemory::new_guest_memory(
+            "paged",
+            translator.clone(),
+            buses(),
+            inner.clone(),
+        );
+        let payload = [1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23];
+        gm.write_at(0xffa, &payload).unwrap();
+        let mut read = [0; 12];
+        gm.read_at(0xffa, &mut read).unwrap();
+        assert_eq!(read, payload);
+        let mut physical = vec![0; 0x4000];
+        inner.read_at(0, &mut physical).unwrap();
+        let mut expected = vec![0x55; 0x4000];
+        expected[0x2ffa..0x3000].copy_from_slice(&payload[..6]);
+        expected[..6].copy_from_slice(&payload[6..]);
+        assert_eq!(physical, expected);
+        gm.fill_at(0xffe, 0x81, 4).unwrap();
+        expected[0x2ffe..0x3000].fill(0x81);
+        expected[..2].fill(0x81);
+        inner.read_at(0, &mut physical).unwrap();
+        assert_eq!(physical, expected);
+        assert_eq!(
+            *translator.0.lock(),
+            [
+                (0x400, 0xffa, true),
+                (0x400, 0x1000, true),
+                (0x400, 0xffa, false),
+                (0x400, 0x1000, false),
+                (0x400, 0xffe, true),
+                (0x400, 0x1000, true),
+            ]
+        );
+        assert!(gm.write_at(0x2000, &[0xee]).is_err());
+        assert!(gm.read_at(0x3000, &mut [0]).is_err());
+        let translated = translator.0.lock().len();
+        assert!(gm.fill_at(0x4000, 0xee, 1).is_err());
+        assert_eq!(translator.0.lock().len(), translated);
+        inner.read_at(0, &mut physical).unwrap();
+        assert_eq!(physical, expected);
+    }
+
+    #[derive(Default)]
+    struct MsiRecorder(Mutex<Vec<(Option<u32>, u64, u32)>>);
+
+    impl SignalMsi for MsiRecorder {
+        fn signal_msi(&self, device: Option<u32>, address: u64, data: u32) {
+            self.0.lock().push((device, address, data));
+        }
+    }
+
+    // Test: Derive a VF before rebasing its live bus range, in both IOMMU modes.
+    // Expected: DMA and MSI use the same carried RID and track bus changes;
+    //       hardware nesting preserves the exact assignment context.
+    #[test]
+    fn derived_targets_keep_dma_msi_identity_and_nesting() {
+        let translator = PagedTranslator::default();
+        let buses = buses();
+        let connection = MsiConnection::new();
+        let interrupts = Arc::new(MsiRecorder::default());
+        connection.connect(interrupts.clone());
+        let memory = GuestMemory::allocate(0x4000);
+        let software = new_dma_target(
+            "software",
+            translator.clone(),
+            buses.clone(),
+            7,
+            memory.clone(),
+            &connection,
+        );
+        let context = Arc::new(0x1234_u64);
+        let nested = new_nestable_dma_target(
+            "nested",
+            translator.clone(),
+            buses.clone(),
+            7,
+            memory,
+            context.clone(),
+            &connection,
+        );
+        for target in [&software, &nested] {
+            let vf = target.with_rid_offset(0x102);
+            vf.guest_memory().write_at(0, &[0x73]).unwrap();
+            vf.msi_target().signal_msi(0xfee0_1000, 0xa5);
+            buses.set_bus_range(8, 10);
+            let mut observed = [0];
+            vf.guest_memory().read_at(0, &mut observed).unwrap();
+            assert_eq!(observed, [0x73]);
+            vf.msi_target().signal_msi(0xfee0_2000, 0x5a);
+            buses.set_bus_range(4, 6);
+        }
+        assert_eq!(
+            *translator.0.lock(),
+            [
+                (0x509, 0, true),
+                (0x909, 0, false),
+                (0x509, 0, true),
+                (0x909, 0, false),
+            ]
+        );
+        assert_eq!(
+            *interrupts.0.lock(),
+            [
+                (Some(0x509), 0xfee0_1000, 0xa5),
+                (Some(0x909), 0xfee0_2000, 0x5a),
+                (Some(0x509), 0xfee0_1000, 0xa5),
+                (Some(0x909), 0xfee0_2000, 0x5a),
+            ]
+        );
+        assert!(matches!(
+            software.passthrough(),
+            DmaPassthrough::SoftwareBlocked
+        ));
+        let DmaPassthrough::HardwareNestable(handle) = nested.passthrough() else {
+            panic!("nested DMA target lost assignment context");
+        };
+        assert!(std::ptr::eq(
+            handle.downcast_ref::<u64>().unwrap(),
+            context.as_ref()
+        ));
+    }
+
+    struct Route {
+        device: u16,
+        delivered: Arc<Mutex<Vec<u16>>>,
+    }
+
+    impl RetranslateInterrupts for Route {
+        fn device_id(&self) -> u16 {
+            self.device
+        }
+        fn retranslate(&self) {
+            self.delivered.lock().push(self.device);
+        }
+    }
+
+    // Test: Invalidate selectively and globally across unregister and route drop.
+    // Expected: Only live matching routes receive notifications; unregister
+    //       removes only that route even when another route has the same device.
+    #[test]
+    fn route_lifetime_and_device_selection() {
+        let list = RetranslateInterruptsList::new();
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let route = |device| {
+            Arc::new(Route {
+                device,
+                delivered: delivered.clone(),
+            }) as Arc<dyn RetranslateInterrupts>
+        };
+        let first = route(7);
+        let sibling = route(7);
+        let other = route(8);
+        let dead = route(9);
+        for r in [&first, &sibling, &other, &dead] {
+            list.register(r);
+        }
+        drop(dead);
+        list.invalidate(Some(7));
+        assert_eq!(*delivered.lock(), [7, 7]);
+        delivered.lock().clear();
+        list.unregister(&first);
+        list.invalidate(None);
+        assert_eq!(*delivered.lock(), [7, 8]);
+        delivered.lock().clear();
+        drop(sibling);
+        list.invalidate(Some(7));
+        assert!(delivered.lock().is_empty());
+        list.invalidate(None);
+        assert_eq!(*delivered.lock(), [8]);
+        delivered.lock().clear();
+        list.unregister(&other);
+        list.invalidate(None);
+        assert!(delivered.lock().is_empty());
+    }
+}
