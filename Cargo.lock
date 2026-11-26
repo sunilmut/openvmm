@@ -5388,6 +5388,7 @@ name = "nostd_spin_channel"
 version = "0.0.0"
 dependencies = [
  "spin",
+ "test_with_tracing",
  "thiserror 2.0.16",
 ]
 

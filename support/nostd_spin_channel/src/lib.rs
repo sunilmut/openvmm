@@ -310,6 +310,7 @@ impl<T> Drop for Receiver<T> {
 mod tests {
     use super::*;
     use alloc::vec;
+    use test_with_tracing::test;
 
     #[test]
     fn send_and_recv_roundtrip() {
@@ -348,5 +349,83 @@ mod tests {
         let (sender, receiver) = Channel::<()>::new().split();
         drop(sender);
         assert_eq!(receiver.recv().unwrap_err(), RecvError::Disconnected);
+    }
+
+    // Test: Drop cloned endpoints while other senders and receivers remain,
+    //       then drain accepted messages after the final sender closes.
+    // Expected: Remaining endpoints stay usable, each message is delivered once,
+    //       and all send modes reject work only after the final receiver closes.
+    #[test]
+    fn cloned_endpoints_drain_before_disconnection() {
+        let (sender, receiver) = Channel::new().split();
+        let other_sender = sender.clone();
+        let other_receiver = receiver.clone();
+        sender.send(1).unwrap();
+        drop(sender);
+        other_sender.send_batch([2, 3]).unwrap();
+        assert_eq!(receiver.try_recv(), Ok(1));
+        drop(receiver);
+        other_sender.send(4).unwrap();
+        drop(other_sender);
+        assert_eq!(other_receiver.try_recv_batch(2), vec![2, 3]);
+        assert_eq!(other_receiver.recv(), Ok(4));
+        assert_eq!(other_receiver.try_recv(), Err(RecvError::Disconnected));
+
+        let (sender, receiver) = Channel::<u32>::new().split();
+        let other_receiver = receiver.clone();
+        drop(receiver);
+        sender.send(5).unwrap();
+        assert_eq!(other_receiver.recv(), Ok(5));
+        drop(other_receiver);
+        assert_eq!(sender.send(6), Err(SendError::Disconnected));
+        assert_eq!(sender.send_priority(7), Err(SendError::Disconnected));
+        let visited = core::cell::Cell::new(false);
+        let items = core::iter::once_with(|| {
+            visited.set(true);
+            8
+        });
+        assert_eq!(sender.send_batch(items), Err(SendError::Disconnected));
+        assert!(!visited.get(), "a rejected batch consumed its input");
+    }
+
+    // Test: Mix normal batches and front-priority sends, peek repeatedly, and
+    //       request zero-sized and bounded reads before draining the queue.
+    // Expected: Peeking and zero-sized reads preserve messages, priority sends
+    //       precede the normal FIFO, and bounded reads retain the remaining tail.
+    #[test]
+    fn priority_and_bounded_batches_preserve_the_remaining_queue() {
+        let (sender, receiver) = Channel::new().split();
+        sender.send_batch([1, 2, 3]).unwrap();
+        sender.send_priority(8).unwrap();
+        sender.send_priority(9).unwrap();
+        assert_eq!(receiver.peek(), Some(9));
+        assert_eq!(receiver.peek(), Some(9));
+        assert!(receiver.try_recv_batch(0).is_empty());
+        assert_eq!(receiver.len(), 5);
+        assert_eq!(sender.len(), 5);
+        assert!(!receiver.is_empty());
+        assert!(!sender.is_empty());
+        assert_eq!(receiver.try_recv_batch(3), vec![9, 8, 1]);
+        assert_eq!(receiver.peek(), Some(2));
+        assert_eq!(receiver.try_recv_batch(usize::MAX), vec![2, 3]);
+        assert_eq!(receiver.peek(), None);
+        assert!(receiver.is_empty());
+        assert!(sender.is_empty());
+        assert_eq!(receiver.try_recv(), Err(RecvError::Empty));
+    }
+
+    // Test: Attempt nonblocking receives while a batch iterator is supplying
+    //       its messages, then receive the completed batch.
+    // Expected: Contention is reported as Unavailable, not Empty or Disconnected,
+    //       and the complete batch remains ordered and available afterward.
+    #[test]
+    fn nonblocking_receive_reports_contention_without_consuming_the_batch() {
+        let (sender, receiver) = Channel::new().split();
+        let items = [1, 2, 3].into_iter().inspect(|_| {
+            assert_eq!(receiver.try_recv(), Err(RecvError::Unavailable));
+        });
+        assert_eq!(sender.send_batch(items), Ok(3));
+        assert_eq!(receiver.try_recv_batch(3), vec![1, 2, 3]);
+        assert_eq!(receiver.try_recv(), Err(RecvError::Empty));
     }
 }
