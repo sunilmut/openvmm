@@ -806,3 +806,57 @@ fn malformed_saved_state_is_rejected() {
     state.next_record_id = 0;
     assert_invalid_state(state);
 }
+
+// Test: Restart a partially consumed response after an abort.
+// Expected: The new response contains only the new command and preserves its LUN.
+#[test]
+fn aborted_response_does_not_leak_into_next_transaction() {
+    let (_, mut device) = device(100);
+    submit_request(&mut device, &[APPLICATION_REQUEST, COMMAND_GET_DEVICE_ID]);
+    assert_eq!(device.read_data(), APPLICATION_REQUEST | 4);
+    device.write_data(KCS_DATA_READ_NEXT);
+    assert_eq!(device.read_data(), COMMAND_GET_DEVICE_ID);
+    device.write_command(KCS_COMMAND_GET_STATUS_ABORT);
+    assert_eq!(device.read_data(), 0);
+
+    for lun in 0..4 {
+        let request = STORAGE_REQUEST | lun;
+        let response = transact(&mut device, &[request, COMMAND_GET_SEL_TIME]);
+        assert_eq!(
+            response,
+            [
+                request | 4,
+                COMMAND_GET_SEL_TIME,
+                COMPLETION_SUCCESS,
+                100,
+                0,
+                0,
+                0
+            ]
+        );
+    }
+}
+
+// Test: Abort using the IPMI KCS error-recovery handshake used by native guests.
+// Expected: Writing zero after the abort dummy exposes the error status in READ.
+// IGNORED: Reproduced on the unchanged implementation: the zero byte enters
+//         ERROR (0xc0), rather than exposing the error status in READ (0x40).
+//         Windows KCS, Linux ipmi_kcs_sm, and FreeBSD ipmi_kcs consumers use this
+//         zero-byte handshake. Keep the regression until the device supports it.
+#[test]
+#[ignore = "KCS abort zero-byte handshake enters ERROR instead of READ"]
+fn abort_handshake_accepts_zero_before_error_status() {
+    let (_, mut device) = device(0);
+    device.write_command(KCS_COMMAND_WRITE_START);
+    device.read_data();
+    device.write_data(APPLICATION_REQUEST);
+    device.read_data();
+    device.write_command(KCS_COMMAND_GET_STATUS_ABORT);
+    assert_eq!(device.read_data(), 0);
+    device.write_data(0);
+    assert_eq!(device.read_status() & STATUS_STATE_MASK, KCS_STATE_READ);
+    assert_eq!(device.read_data(), 0xff);
+    device.write_data(KCS_DATA_READ_NEXT);
+    assert_eq!(device.read_status() & STATUS_STATE_MASK, KCS_STATE_IDLE);
+    assert_eq!(device.read_data(), 0);
+}
