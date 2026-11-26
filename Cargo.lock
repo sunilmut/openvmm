@@ -9272,6 +9272,8 @@ name = "tracing_helpers"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "parking_lot",
+ "test_with_tracing",
  "tracing",
  "tracing-subscriber",
 ]

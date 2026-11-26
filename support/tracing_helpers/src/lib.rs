@@ -40,3 +40,33 @@ where
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Convert typed and contextual anyhow errors into traceable error references.
+    // Expected: The original message, concrete error kind, and complete source chain are preserved.
+    #[test]
+    fn error_adapters_preserve_type_and_context_chain() {
+        let typed = std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid packet");
+        let error = typed.as_error();
+        assert_eq!(error.to_string(), "invalid packet");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(error.source().is_none());
+        let contextual = anyhow::Error::new(typed).context("decode response");
+        let error = contextual.as_error();
+        assert_eq!(error.to_string(), "decode response");
+        let source = error.source().unwrap();
+        assert_eq!(source.to_string(), "invalid packet");
+        assert_eq!(
+            source.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(source.source().is_none());
+    }
+}
