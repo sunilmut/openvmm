@@ -438,3 +438,60 @@ mod measured_policy_tests {
         assert_eq!(json.as_deref(), Some(&b"hi"[..]));
     }
 }
+
+mod transport_tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Transport Cwcow secure-boot and device policy through the measured codec.
+    // Expected: Policy fields survive and secure-boot enforcement retains both its
+    //       mandatory and optional behavior without invoking another product's rule.
+    #[test]
+    fn cwcow_measured_transport_preserves_secure_boot_enforcement() {
+        for required in [false, true] {
+            let mut policy = ProductPolicy::Cwcow(cwcow::CwcowPolicy {
+                require_secure_boot: required,
+                require_secure_avic: true,
+                custom_uefi_json: b"{\"policy\":\"cwcow\"}".to_vec(),
+                ..Default::default()
+            });
+            policy.set_vpci_relay(VpciRelayPolicy {
+                mode: VpciRelayMode::MustBeOn,
+                allowed_pci_devices: vec![AllowedPciDevice {
+                    vendor_id: Some(0x1414),
+                    device_id: Some(0xbeef),
+                    revision_id: Some(3),
+                    base_class: Some(1),
+                    sub_class: Some(8),
+                    prog_if: Some(2),
+                }],
+            });
+            let decoded = decode_product_policy(&encode_product_policy(&policy)).unwrap();
+            assert_eq!(decoded, policy);
+            let measured = MeasuredProductPolicy::new(Some(decoded));
+            assert_eq!(
+                measured
+                    .cwcow(|p| p.validate_secure_boot_enabled(true))
+                    .unwrap(),
+                Some(())
+            );
+            let disabled = measured.cwcow(|p| p.validate_secure_boot_enabled(false));
+            if required {
+                assert!(
+                    disabled
+                        .unwrap_err()
+                        .to_string()
+                        .contains("requires secure boot")
+                );
+            } else {
+                assert_eq!(disabled.unwrap(), Some(()));
+            }
+            assert_eq!(
+                measured
+                    .sivm::<()>(|_| panic!("Cwcow policy invoked Sivm validation"))
+                    .unwrap(),
+                None
+            );
+        }
+    }
+}
