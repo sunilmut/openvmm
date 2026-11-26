@@ -163,7 +163,7 @@ struct TestHarness {
 
 impl TestHarness {
     fn new(driver: &DefaultDriver) -> Self {
-        let tmpdir = tempfile::tempdir().unwrap();
+        let tmpdir = tempfile::tempdir_in(".").unwrap();
 
         let mem = GuestMemory::allocate(TOTAL_MEM_SIZE);
         init_avail_ring(&mem, AVAIL_ADDR);
@@ -586,4 +586,60 @@ async fn malformed_request_completes(driver: DefaultDriver) {
         &mut harness.used_idx,
     )
     .await;
+}
+
+// Test: Read UTF-8 mount tags through the guest configuration registers.
+// Expected: The byte length and tag round-trip, padding is zero, and writes
+//       cannot change the read-only tag.
+#[async_test]
+async fn mount_tag_registers_preserve_utf8_and_padding(driver: DefaultDriver) {
+    let source = VmTaskDriverSource::new(SingleDriverBackend::new(driver));
+    for tag in ["", "abc", "共享", "mount-tag"] {
+        let fs = Plan9FileSystem::new(".", false).unwrap();
+        let mut device = VirtioPlan9Device::new(&source, tag, fs);
+        let mut bytes = Vec::new();
+        for offset in (0..device.traits().device_register_length as u16).step_by(4) {
+            let value = device.read_registers_u32(offset).await;
+            bytes.extend_from_slice(&value.to_le_bytes());
+            device.write_registers_u32(offset, u32::MAX).await;
+            assert_eq!(device.read_registers_u32(offset).await, value);
+        }
+        assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]) as usize, tag.len());
+        assert_eq!(&bytes[2..2 + tag.len()], tag.as_bytes());
+        assert!(bytes[2 + tag.len()..].iter().all(|b| *b == 0));
+        assert_eq!(
+            device
+                .read_registers_u32(device.traits().device_register_length as u16)
+                .await,
+            0
+        );
+    }
+}
+
+// Test: Stop, reset and restart a 9P queue after attaching a fid.
+// Expected: Stop is idempotent, reset invalidates the old fid, and a fresh
+//       attach succeeds on the restarted queue.
+#[async_test]
+async fn reset_invalidates_fids_after_queue_restart(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    assert!(harness.device.stop_queue(0).await.is_none());
+    harness.enable().await;
+    harness.version(0).await;
+    assert_eq!(harness.attach(2, 42).await, QID_TYPE_DIRECTORY);
+    assert!(harness.device.stop_queue(0).await.is_some());
+    assert!(harness.device.stop_queue(0).await.is_none());
+    harness.device.reset().await;
+    init_avail_ring(&harness.mem, AVAIL_ADDR);
+    init_used_ring(&harness.mem, USED_ADDR);
+    harness.avail_idx = 0;
+    harness.used_idx = 0;
+    harness.enable().await;
+    let request = P9MessageBuilder::new(TGETATTR, 123)
+        .u32(42)
+        .u64(u64::MAX)
+        .build();
+    let response = harness.transact(0, &request, 256).await;
+    assert_eq!(parse_response_header(&response), (RLERROR, 123));
+    assert_eq!(harness.attach(2, 42).await, QID_TYPE_DIRECTORY);
+    harness.device.stop_queue(0).await;
 }
