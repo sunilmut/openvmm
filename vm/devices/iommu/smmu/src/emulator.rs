@@ -5105,4 +5105,31 @@ mod tests {
             "CMDQ_CONS.ERR must be CERROR_ILL"
         );
     }
+
+    // Test: Keep an assigned-device registration after destroying its SMMU.
+    // Expected: The guard does not keep the SMMU or backend alive, and later
+    //       guard destruction remains safe after the shared state is gone.
+    #[test]
+    fn registration_does_not_keep_destroyed_smmu_alive() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        let dev = make_accel_device();
+        let shared = Arc::downgrade(dev.shared_state());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let registration = dev
+            .shared_state()
+            .register_accel_device(
+                0x100,
+                Arc::new(DropTrackingBackend {
+                    dropped: dropped.clone(),
+                }),
+            )
+            .unwrap();
+        assert!(!dropped.load(Ordering::Relaxed));
+        drop(dev);
+        assert!(shared.upgrade().is_none());
+        assert!(dropped.load(Ordering::Relaxed));
+        drop(registration);
+    }
 }
