@@ -225,6 +225,7 @@ impl<T: ?Sized, S> From<OversizedBox<T, S>> for Pin<OversizedBox<T, S>> {
 mod tests {
     use crate::OversizedBox;
     use std::fmt::Display;
+    use test_with_tracing::test;
 
     #[test]
     fn basic_test() {
@@ -237,5 +238,48 @@ mod tests {
         println!("{}", x.as_ref());
         let x: OversizedBox<dyn Display, _> = coerce!(x);
         println!("dyn {}", x.as_ref());
+    }
+
+    // Test: Replace and empty a dynamically dispatched value with owned resources.
+    // Expected: Each resource is released exactly once, including pinned contents.
+    #[test]
+    fn erased_and_pinned_contents_drop_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let value = OversizedBox::<_, [usize; 8]>::new(Counted(drops.clone()));
+        let erased: OversizedBox<dyn Send, _> = coerce!(value);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let empty = OversizedBox::empty(erased);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let next = OversizedBox::refill(empty, Counted(drops.clone()));
+        let pinned = OversizedBox::into_pin(next);
+        let empty = OversizedBox::empty_pinned(pinned);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        drop(empty);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    // Test: Mutate an unsized slice, refill with a different-sized value and pin it.
+    // Expected: Public mutable views affect the owned value and pinned views agree.
+    #[test]
+    fn unsized_mutation_and_pin_conversion_preserve_values() {
+        let value = OversizedBox::<_, [u64; 8]>::new([1u32, 2, 3]);
+        let mut slice: OversizedBox<[u32], _> = coerce!(value);
+        slice.as_mut()[1] = 9;
+        slice[2] = 7;
+        assert_eq!(slice.as_ref(), [1, 9, 7]);
+        let value = OversizedBox::refill(slice, String::from("new"));
+        let mut pinned: std::pin::Pin<_> = value.into();
+        pinned.as_mut().get_mut().push_str(" value");
+        assert_eq!(pinned.as_ref().get_ref(), "new value");
+        let pinned = OversizedBox::<_, [u64; 8]>::pin(17u64);
+        assert_eq!(*pinned, 17);
     }
 }
