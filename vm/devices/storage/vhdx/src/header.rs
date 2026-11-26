@@ -566,4 +566,48 @@ mod tests {
             )))
         ));
     }
+
+    // Test: Select between two valid headers near the unsigned sequence limit, then corrupt only the selected header's trailing padding.
+    // Expected: The higher sequence wins in either slot with its own GUIDs, and a whole-header checksum failure selects the other intact header.
+    #[async_test]
+    async fn dual_headers_preserve_unsigned_order_and_checksum_fallback_identity() {
+        let identities = [
+            guid::guid!("00112233-4455-6677-8899-aabbccddeeff"),
+            guid::guid!("ffeeddcc-bbaa-9988-7766-554433221100"),
+        ];
+        let offsets = [format::HEADER_OFFSET_1, format::HEADER_OFFSET_2];
+        for winner in 0..2 {
+            let (file, _) = InMemoryFile::create_test_vhdx(format::GB1).await;
+            let file_length = file.file_size().await.unwrap();
+            for slot in 0..2 {
+                let mut bytes = vec![0; format::HEADER_SIZE as usize];
+                file.read_at(offsets[slot], &mut bytes).await.unwrap();
+                let mut header = Header::read_from_prefix(&bytes).unwrap().0.clone();
+                header.sequence_number = u64::MAX - u64::from(slot != winner);
+                header.file_write_guid = identities[slot];
+                header.data_write_guid = identities[1 - slot];
+                header.checksum = 0;
+                bytes[..header.as_bytes().len()].copy_from_slice(header.as_bytes());
+                let checksum = format::compute_checksum(&bytes, 4);
+                bytes[4..8].copy_from_slice(&checksum.to_le_bytes());
+                file.write_at(offsets[slot], &bytes).await.unwrap();
+            }
+            let parsed = parse_headers(&file, file_length).await.unwrap();
+            assert_eq!(parsed.sequence_number, u64::MAX);
+            assert_eq!(parsed.first_header_current, winner == 0);
+            assert_eq!(parsed.file_write_guid, identities[winner]);
+            assert_eq!(parsed.data_write_guid, identities[1 - winner]);
+
+            let mut bytes = vec![0; format::HEADER_SIZE as usize];
+            file.read_at(offsets[winner], &mut bytes).await.unwrap();
+            let last = bytes.len() - 1;
+            bytes[last] ^= 1;
+            file.write_at(offsets[winner], &bytes).await.unwrap();
+            let parsed = parse_headers(&file, file_length).await.unwrap();
+            assert_eq!(parsed.sequence_number, u64::MAX - 1);
+            assert_eq!(parsed.first_header_current, winner != 0);
+            assert_eq!(parsed.file_write_guid, identities[1 - winner]);
+            assert_eq!(parsed.data_write_guid, identities[winner]);
+        }
+    }
 }
