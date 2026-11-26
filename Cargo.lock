@@ -5164,6 +5164,7 @@ name = "net_backend_core"
 version = "0.0.0"
 dependencies = [
  "bitfield-struct 0.11.0",
+ "test_with_tracing",
 ]
 
 [[package]]

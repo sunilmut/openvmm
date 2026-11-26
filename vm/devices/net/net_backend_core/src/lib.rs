@@ -410,3 +410,132 @@ pub enum EndpointAction {
     RestartRequired,
     LinkStatusNotify(bool),
 }
+
+#[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Represent standalone checksums and both TCP GSO protocols with and without partial checksum metadata.
+    // Expected: Independent optional fields retain exact boundary values; TCP checksum completion always uses transport offset 16.
+    #[test]
+    fn receive_offloads_preserve_protocol_and_optional_checksum_metadata() {
+        assert_eq!(RxOffload::default().checksum_metadata(), None);
+        assert_eq!(RxOffload::default().gso(), None);
+        let checksum = RxOffload::checksum(0, u16::MAX);
+        assert_eq!(
+            checksum.checksum_metadata(),
+            Some(RxChecksumOffload {
+                start: 0,
+                offset: u16::MAX
+            })
+        );
+        assert_eq!(checksum.gso(), None);
+        for protocol in [RxGsoProtocol::TcpV4, RxGsoProtocol::TcpV6] {
+            for start in [None, Some(0), Some(54), Some(u16::MAX)] {
+                let offload = RxOffload::tcp_gso(protocol, 74, 1440, start);
+                assert_eq!(
+                    offload.gso(),
+                    Some(RxGso {
+                        protocol,
+                        header_len: 74,
+                        max_segment_size: 1440
+                    })
+                );
+                assert_eq!(
+                    offload.checksum_metadata(),
+                    start.map(|start| RxChecksumOffload { start, offset: 16 })
+                );
+            }
+        }
+    }
+
+    // Test: Construct default RX/TX metadata and query every receive checksum state.
+    // Expected: Defaults advertise no offload or known checksum and only validated states report valid, including coalesced packets with stale checksum bytes.
+    #[test]
+    fn metadata_defaults_and_checksum_validity_are_conservative() {
+        let rx = RxMetadata::default();
+        assert_eq!((rx.offset, rx.len), (0, 0));
+        assert_eq!(rx.ip_checksum, RxChecksumState::Unknown);
+        assert_eq!(rx.l4_checksum, RxChecksumState::Unknown);
+        assert_eq!(rx.l4_protocol, L4Protocol::Unknown);
+        assert!(rx.vlan.is_none());
+        assert_eq!(rx.offload, RxOffload::default());
+        let tx = TxMetadata::default();
+        assert_eq!((tx.id.0, tx.segment_count, tx.len), (0, 0, 0));
+        assert_eq!(
+            (
+                tx.l2_len,
+                tx.l3_len,
+                tx.l4_len,
+                tx.transport_header_offset,
+                tx.max_segment_size
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(u8::from(tx.flags), 0);
+        assert!(tx.vlan.is_none());
+        for (state, expected) in [
+            (RxChecksumState::Unknown, false),
+            (RxChecksumState::Bad, false),
+            (RxChecksumState::Good, true),
+            (RxChecksumState::ValidatedButWrong, true),
+        ] {
+            assert_eq!(state.is_valid(), expected);
+        }
+    }
+
+    // Test: Walk a three-segment packet followed by a single-segment packet, including a zero-length scatter entry.
+    // Expected: Counts follow packet heads rather than lengths or IDs, returned slices borrow exact input ranges, and the final remainder is empty.
+    #[test]
+    fn packet_helpers_preserve_scatter_boundaries_and_borrowed_metadata() {
+        let segments = [
+            TxSegment {
+                ty: TxSegmentType::Head(TxMetadata {
+                    id: TxId(7),
+                    segment_count: 3,
+                    len: 1500,
+                    ..Default::default()
+                }),
+                gpa: 0x1003,
+                len: 40,
+            },
+            TxSegment {
+                ty: TxSegmentType::Tail,
+                gpa: 0x2000,
+                len: 0,
+            },
+            TxSegment {
+                ty: TxSegmentType::Tail,
+                gpa: 0x8000,
+                len: 1460,
+            },
+            TxSegment {
+                ty: TxSegmentType::Head(TxMetadata {
+                    id: TxId(7),
+                    segment_count: 1,
+                    len: 60,
+                    ..Default::default()
+                }),
+                gpa: 0x9000,
+                len: 60,
+            },
+        ];
+        assert_eq!(packet_count(&[]), 0);
+        assert_eq!(packet_count(&segments), 2);
+        let (metadata, first, rest) = next_packet(&segments);
+        assert_eq!((metadata.id.0, metadata.len), (7, 1500));
+        assert_eq!(first.len(), 3);
+        assert!(core::ptr::eq(first.as_ptr(), segments.as_ptr()));
+        assert!(core::ptr::eq(rest.as_ptr(), segments[3..].as_ptr()));
+        assert_eq!(packet_count(rest), 1);
+        let (metadata, second, rest) = next_packet(rest);
+        assert_eq!((metadata.id.0, metadata.len), (7, 60));
+        assert_eq!(second.len(), 1);
+        assert!(core::ptr::eq(second.as_ptr(), &segments[3]));
+        assert!(rest.is_empty());
+    }
+}
