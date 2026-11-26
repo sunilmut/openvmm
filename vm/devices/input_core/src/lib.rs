@@ -91,3 +91,6 @@ impl ResourceId<KeyboardInputHandleKind> for MultiplexedInputHandle {
 impl ResourceId<MouseInputHandleKind> for MultiplexedInputHandle {
     const ID: &'static str = "mouse";
 }
+
+#[cfg(test)]
+mod tests;
