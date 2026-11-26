@@ -11257,6 +11257,7 @@ name = "vmm_cli"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "test_with_tracing",
  "vmm_cli_derive",
 ]
 
