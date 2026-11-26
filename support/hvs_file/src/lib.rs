@@ -296,3 +296,6 @@ mod tests {
         assert!(!r.contains_key("/nonexistent"));
     }
 }
+
+#[cfg(test)]
+mod contract_tests;
