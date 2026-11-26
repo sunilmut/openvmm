@@ -4767,6 +4767,7 @@ dependencies = [
  "prost-build",
  "quote",
  "syn 3.0.4",
+ "test_with_tracing",
 ]
 
 [[package]]

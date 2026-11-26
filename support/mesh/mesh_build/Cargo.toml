@@ -13,5 +13,9 @@ prost-build.workspace = true
 quote.workspace = true
 syn = { workspace = true, features = ["extra-traits"] }
 
+[dev-dependencies]
+syn = { workspace = true, features = ["full"] }
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
