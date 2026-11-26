@@ -1490,4 +1490,133 @@ mod tests {
                 .any(|device| device.name == "missing-pci")
         );
     }
+
+    // Test: Build ARM serial configurations outside the supported port/mode set.
+    // Expected: COM3/4, wait-for-RTS, x86 debugcon and PCAT architecture
+    //       mismatches fail through the public build result, not a panic.
+    #[test]
+    fn unsupported_arch_serial_configurations() {
+        for index in [2, 3] {
+            let mut serial = no_serial_backends();
+            serial[index] = Some(DisconnectedSerialBackendHandle.into_resource());
+            let error = VmManifestBuilder::new(BaseChipsetType::HclHost, MachineArch::Aarch64)
+                .with_serial(serial)
+                .build()
+                .err()
+                .unwrap();
+            assert_eq!(error.to_string(), "unsupported serial port count");
+        }
+        let error = VmManifestBuilder::new(BaseChipsetType::HclHost, MachineArch::Aarch64)
+            .with_serial(no_serial_backends())
+            .with_serial_wait_for_rts()
+            .build()
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.to_string(),
+            "wait for RTS not supported with this serial type"
+        );
+        let error = VmManifestBuilder::new(BaseChipsetType::HclHost, MachineArch::Aarch64)
+            .with_debugcon(DisconnectedSerialBackendHandle.into_resource(), 0xe9)
+            .build()
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "unsupported debugcon architecture");
+        let error = VmManifestBuilder::new(BaseChipsetType::HypervGen1, MachineArch::Aarch64)
+            .build()
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "unsupported architecture");
+    }
+
+    // Test: Build the PCAT compatibility options used by Underhill.
+    // Expected: Host VGA proxy replaces both emulated VGA and framebuffer;
+    //       stub floppy replaces the full device without removing IDE or RTC.
+    #[test]
+    fn pcat_compatibility_devices() {
+        let baseline = VmManifestBuilder::new(BaseChipsetType::HypervGen1, MachineArch::X86_64)
+            .build()
+            .unwrap();
+        assert!(baseline.chipset.with_hyperv_vga);
+        assert!(baseline.chipset.with_hyperv_framebuffer);
+        assert!(baseline.chipset.with_winbond_super_io_and_floppy_full);
+        assert!(!baseline.chipset.with_underhill_vga_proxy);
+        let compatible = VmManifestBuilder::new(BaseChipsetType::HypervGen1, MachineArch::X86_64)
+            .with_proxy_vga()
+            .with_stub_floppy()
+            .build()
+            .unwrap();
+        assert!(compatible.chipset.with_underhill_vga_proxy);
+        assert!(!compatible.chipset.with_hyperv_vga);
+        assert!(!compatible.chipset.with_hyperv_framebuffer);
+        assert!(compatible.chipset.with_winbond_super_io_and_floppy_stub);
+        assert!(!compatible.chipset.with_winbond_super_io_and_floppy_full);
+        assert!(compatible.chipset.with_hyperv_ide);
+        assert!(compatible.chipset.with_piix4_cmos_rtc);
+        assert!(compatible.isa_dma_controller.is_some());
+    }
+
+    // Test: Build direct-boot optional framebuffer, PSP and watchdog devices.
+    // Expected: Opt-in capabilities and device resources agree, while an
+    //       ordinary direct-boot manifest has none of these optional devices.
+    #[test]
+    fn direct_boot_optional_devices() {
+        let builder = || {
+            VmManifestBuilder::new(
+                BaseChipsetType::UnenlightenedLinuxDirect,
+                MachineArch::X86_64,
+            )
+        };
+        let baseline = builder().build().unwrap();
+        assert!(!baseline.chipset.with_hyperv_framebuffer);
+        assert!(!baseline.capabilities.with_psp);
+        assert!(!baseline.capabilities.with_guest_watchdog);
+        let result = builder()
+            .with_framebuffer()
+            .with_psp()
+            .with_guest_watchdog()
+            .build()
+            .unwrap();
+        assert!(result.chipset.with_hyperv_framebuffer);
+        assert!(result.chipset.with_generic_psp);
+        assert!(result.capabilities.with_psp);
+        assert!(result.capabilities.with_guest_watchdog);
+        assert_eq!(
+            result
+                .chipset_devices
+                .iter()
+                .filter(|device| device.resource.id() == "hyperv_guest_watchdog")
+                .count(),
+            1
+        );
+    }
+
+    // Test: Disable VMBus for either guest architecture and HCL hosting.
+    // Expected: Only the VMBus high-MMIO reservation disappears; the
+    //       architecture's low region and HCL's VTL2 reservation are preserved.
+    #[test]
+    fn vmbus_layout_reservations() {
+        for arch in [MachineArch::X86_64, MachineArch::Aarch64] {
+            for hcl in [false, true] {
+                let builder = || {
+                    VmManifestBuilder::new(
+                        if hcl {
+                            BaseChipsetType::HclHost
+                        } else {
+                            BaseChipsetType::HyperVGen2LinuxDirect
+                        },
+                        arch,
+                    )
+                };
+                let with = builder().layout_config();
+                let without = builder().without_vmbus().layout_config();
+                assert!(with.chipset_high_mmio_size > 0);
+                assert_eq!(without.chipset_high_mmio_size, 0);
+                assert_eq!(without.chipset_low_mmio_size, with.chipset_low_mmio_size);
+                assert!(without.chipset_low_mmio_size > 0);
+                assert_eq!(without.vtl2_chipset_mmio_size, with.vtl2_chipset_mmio_size);
+                assert_eq!(without.vtl2_chipset_mmio_size > 0, hcl);
+            }
+        }
+    }
 }
