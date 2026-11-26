@@ -629,3 +629,50 @@ async fn wrapper_forwards_resize_notifications_through_disk_adapter() {
     assert_eq!(cloned.sector_count(), 4);
     assert_eq!(cloned.wait_resize(2).await, 4);
 }
+
+// Test: Cancel a suspended data write, then release a newly issued write
+//       through the same asynchronous hook.
+// Expected: Public reads of backing storage stay unchanged while either
+//       write is suspended; only the released retry publishes its data.
+#[async_test]
+async fn cancelled_gated_write_leaves_data_unchanged_and_retry_can_commit() {
+    let backing = HookDisk::new(1024, 512).into_disk();
+    let release = Arc::new(event_listener::Event::new());
+    let hook_release = release.clone();
+    let disk = HookDisk::wrap(backing.clone())
+        .with_async_hook(move |_| {
+            let release = hook_release.clone();
+            async move {
+                release.listen().await;
+                Ok(())
+            }
+        })
+        .into_disk();
+    let mem = GuestMemory::allocate(512);
+    mem.write_at(0, &[0xa6; 512]).unwrap();
+    let write = OwnedRequestBuffers::linear(0, 512, false);
+    let read_back = || async {
+        let mem = GuestMemory::allocate(1024);
+        let read = OwnedRequestBuffers::linear(0, 1024, true);
+        backing.read_vectored(&read.buffer(&mem), 0).await.unwrap();
+        let mut bytes = [0; 1024];
+        mem.read_at(0, &mut bytes).unwrap();
+        bytes
+    };
+    {
+        let buffers = write.buffer(&mem);
+        let mut pending = pin!(disk.write_vectored(&buffers, 1, true));
+        assert!(poll!(&mut pending).is_pending());
+        assert_eq!(read_back().await, [0; 1024]);
+    }
+    assert_eq!(read_back().await, [0; 1024]);
+    let buffers = write.buffer(&mem);
+    let mut retry = pin!(disk.write_vectored(&buffers, 1, true));
+    assert!(poll!(&mut retry).is_pending());
+    assert_eq!(read_back().await, [0; 1024]);
+    release.notify(usize::MAX);
+    retry.await.unwrap();
+    let bytes = read_back().await;
+    assert_eq!(bytes[..512], [0; 512]);
+    assert_eq!(bytes[512..], [0xa6; 512]);
+}
