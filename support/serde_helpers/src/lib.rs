@@ -276,4 +276,86 @@ mod test {
         assert_eq!(guid_sample.field1, 123);
         assert!(guid_sample.field2.is_none());
     }
+
+    // Test: Deserialize absent and null optional fields, then encode the result.
+    // Expected: Neither representation invents a payload, and serialization
+    //       emits null rather than an empty GUID or base64 string.
+    #[test]
+    fn absent_and_null_optional_payloads_remain_absent() {
+        let expected = Sample {
+            bytes: vec![],
+            number: 0,
+            guid: None,
+            json: None,
+            optional_bytes: None,
+            arrays: vec![],
+        };
+        let encoded = serde_json::json!({
+            "bytes": "", "number": "0", "arrays": [],
+            "guid": null, "json": null, "optional_bytes": null
+        });
+        for input in [
+            serde_json::json!({"bytes": "", "number": "0", "arrays": []}),
+            encoded.clone(),
+        ] {
+            let decoded: Sample = serde_json::from_value(input).unwrap();
+            assert_eq!(decoded, expected);
+            assert_eq!(serde_json::to_value(&decoded).unwrap(), encoded);
+        }
+    }
+
+    // Test: Round-trip present but empty optional bytes and JSON arrays alongside
+    //       binary data containing NUL and non-UTF-8 bytes.
+    // Expected: Empty payloads stay present and the exact standard-base64 wire
+    //       strings preserve all bytes and array elements.
+    #[test]
+    fn empty_optional_payloads_are_distinct_from_null() {
+        let expected = Sample {
+            bytes: vec![0, 1, 2, 255],
+            number: u32::MAX,
+            guid: None,
+            json: Some(vec![]),
+            optional_bytes: Some(vec![]),
+            arrays: vec![vec![], vec![0, 1, 2, 255]],
+        };
+        let encoded = serde_json::json!({
+            "bytes": "AAEC/w==", "number": "4294967295", "guid": null,
+            "json": "W10=", "optional_bytes": "", "arrays": ["", "AAEC/w=="]
+        });
+        assert_eq!(serde_json::to_value(&expected).unwrap(), encoded);
+        assert_eq!(serde_json::from_value::<Sample>(encoded).unwrap(), expected);
+    }
+
+    // Test: Supply malformed base64, invalid embedded JSON, a bad later array
+    //       element, invalid GUIDs and out-of-range or malformed numeric strings.
+    // Expected: Each invalid field rejects the entire message without accepting
+    //       a decoded prefix or silently replacing the field with a default.
+    #[test]
+    fn malformed_fields_reject_the_complete_payload() {
+        for (field, invalid) in [
+            ("bytes", serde_json::json!("!!!!")),
+            ("bytes", serde_json::json!("Zh==")),
+            ("optional_bytes", serde_json::json!("!!!!")),
+            ("json", serde_json::json!("!!!!")),
+            ("json", serde_json::json!("bm90IGpzb24=")),
+            ("json", serde_json::json!("WzEsIngiXQ==")),
+            ("arrays", serde_json::json!(["aGk=", "!!!!"])),
+            ("guid", serde_json::json!("not-a-guid")),
+            ("number", serde_json::json!("4294967296")),
+            ("number", serde_json::json!("-1")),
+            ("number", serde_json::json!("42x")),
+            ("number", serde_json::json!(42)),
+        ] {
+            let mut input = serde_json::to_value(sample()).unwrap();
+            input[field] = invalid;
+            assert!(
+                serde_json::from_value::<Sample>(input).is_err(),
+                "invalid {field} was accepted"
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<Sample>(serde_json::to_value(sample()).unwrap()).unwrap(),
+            sample()
+        );
+    }
 }
