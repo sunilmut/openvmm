@@ -150,3 +150,6 @@ fn parse_rom_file(
         len,
     })
 }
+
+#[cfg(test)]
+mod contract_tests;

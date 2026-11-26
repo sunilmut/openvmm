@@ -6401,6 +6401,8 @@ dependencies = [
  "fs-err",
  "mesh",
  "resource_dll_parser",
+ "tempfile",
+ "test_with_tracing",
  "tracing",
 ]
 
