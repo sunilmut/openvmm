@@ -7788,6 +7788,7 @@ dependencies = [
  "arbitrary",
  "bitfield-struct 0.11.0",
  "open_enum",
+ "test_with_tracing",
  "zerocopy",
 ]
 

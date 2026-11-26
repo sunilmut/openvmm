@@ -2578,3 +2578,99 @@ pub struct ReportLuns {
     pub reserved2: u8,
     pub control: u8,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Construct fixed current sense data with known and unknown protocol values.
+    // Expected: The 18-byte SPC fixed response has exact key/ASC/ASCQ positions, a ten-byte additional length, and no stale information.
+    #[test]
+    fn sense_data_matches_fixed_format_wire_layout() {
+        for (key, asc, qualifier) in [(0x05, 0x24, 0), (0x06, 0x29, 0x03), (0x0f, 0xfe, 0xff)] {
+            let sense = SenseData::new(SenseKey(key), AdditionalSenseCode(asc), qualifier);
+            assert_eq!(
+                sense.as_bytes(),
+                &[
+                    0x70, 0, key, 0, 0, 0, 0, 10, 0, 0, 0, 0, asc, qualifier, 0, 0, 0, 0
+                ]
+            );
+        }
+    }
+
+    // Test: Replace packed reservation type/action, request-type, and SRB status fields.
+    // Expected: Both setters and builders affect only their documented low bits and preserve unknown in-range values and neighboring flag bits.
+    #[test]
+    fn packed_protocol_fields_preserve_neighbor_bits() {
+        let mut scope = PersistentReserveTypeScope::from(0xa6);
+        assert_eq!(scope.reserve_type(), ReservationType(6));
+        scope.set_reserve_type(ReservationType(3));
+        assert_eq!(u8::from(scope), 0xa3);
+        assert_eq!(
+            u8::from(scope.with_reserve_type(ReservationType(0x0f))),
+            0xaf
+        );
+
+        let mut input = PersistentReserveServiceActionIn::from(0xe2);
+        assert_eq!(input.service_action(), ServiceActionIn(2));
+        input.set_service_action(ServiceActionIn(1));
+        assert_eq!(u8::from(input), 0xe1);
+        assert_eq!(
+            u8::from(input.with_service_action(ServiceActionIn(0x1f))),
+            0xff
+        );
+
+        let mut output = PersistentReserveServiceActionOut::from(0xa5);
+        assert_eq!(output.service_action(), ServiceActionOut(5));
+        output.set_service_action(ServiceActionOut(0));
+        assert_eq!(u8::from(output), 0xa0);
+        assert_eq!(
+            u8::from(output.with_service_action(ServiceActionOut(0x1f))),
+            0xbf
+        );
+
+        let mut flags = GetConfigurationFlags::from(0xa9);
+        assert_eq!(flags.request_type(), RequestType(1));
+        flags.set_request_type(RequestType(2));
+        assert_eq!(u8::from(flags), 0xaa);
+        assert_eq!(u8::from(flags.with_request_type(RequestType(3))), 0xab);
+
+        let mut status = srb::SrbStatusAndFlags::from(0xc4);
+        assert_eq!(status.status(), srb::SrbStatus::ERROR);
+        status.set_status(srb::SrbStatus::SUCCESS);
+        assert_eq!(u8::from(status), 0xc1);
+        let unknown = status.with_status(srb::SrbStatus(0x3f));
+        assert_eq!(u8::from(unknown), 0xff);
+        assert_eq!(unknown.status(), srb::SrbStatus(0x3f));
+    }
+
+    // Test: Decode each supported GET CONFIGURATION feature and unrecognized boundaries.
+    // Expected: Supported wire IDs select the exact feature, while unknown IDs never alias a supported feature through truncation.
+    #[test]
+    fn configuration_features_decode_supported_ids_without_truncation() {
+        for (wire, expected) in [
+            (0x00, FeatureNumber::FeatureProfileList),
+            (0x01, FeatureNumber::FeatureCore),
+            (0x02, FeatureNumber::FeatureMorphing),
+            (0x03, FeatureNumber::FeatureRemovableMedium),
+            (0x10, FeatureNumber::FeatureRandomReadable),
+            (0x1e, FeatureNumber::FeatureCdRead),
+            (0x1f, FeatureNumber::FeatureDvdRead),
+            (0x100, FeatureNumber::FeaturePowerManagement),
+            (0x105, FeatureNumber::FeatureTimeout),
+            (0x107, FeatureNumber::FeatureRealTimeStreaming),
+        ] {
+            assert_eq!(
+                FeatureNumber::try_from(wire).unwrap() as u16,
+                expected as u16
+            );
+        }
+        for wire in [4, 0x0f, 0x20, 0xff, 0x104, 0xffff, 0x1_0001, usize::MAX] {
+            assert_eq!(
+                FeatureNumber::try_from(wire).unwrap() as u16,
+                FeatureNumber::FeatureUnknown as u16
+            );
+        }
+    }
+}
