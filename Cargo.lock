@@ -9892,6 +9892,7 @@ dependencies = [
  "parking_lot",
  "pci_core",
  "safeatomic",
+ "test_with_tracing",
  "tracing",
  "trycopy",
  "uevent",
