@@ -9514,6 +9514,9 @@ dependencies = [
 [[package]]
 name = "underhill_confidentiality"
 version = "0.0.0"
+dependencies = [
+ "test_with_tracing",
+]
 
 [[package]]
 name = "underhill_config"

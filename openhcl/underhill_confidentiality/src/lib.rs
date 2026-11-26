@@ -26,3 +26,6 @@ pub const OPENHCL_CONFIDENTIAL_DEBUG_ENV_VAR_NAME: &str = "OPENHCL_CONFIDENTIAL_
 /// The legacy name of the environment variable that indicates whether
 /// confidential debugging is enabled.
 pub const LEGACY_CONFIDENTIAL_DEBUG_ENV_VAR_NAME: &str = "UNDERHILL_CONFIDENTIAL_DEBUG";
+
+#[cfg(all(test, feature = "std"))]
+mod tests;
