@@ -289,3 +289,6 @@ pub struct VmgsProvisioningMarker {
     pub akcert_attrs: String,
     pub provisioner_version: String,
 }
+
+#[cfg(test)]
+mod contract_tests;

@@ -11187,6 +11187,7 @@ dependencies = [
  "open_enum",
  "serde",
  "static_assertions",
+ "test_with_tracing",
  "zerocopy",
 ]
 
