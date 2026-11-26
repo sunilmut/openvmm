@@ -8549,6 +8549,7 @@ dependencies = [
  "guid",
  "open_enum",
  "scsi_defs",
+ "test_with_tracing",
  "zerocopy",
 ]
 

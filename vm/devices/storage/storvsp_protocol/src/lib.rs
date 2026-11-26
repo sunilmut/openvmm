@@ -184,3 +184,6 @@ pub struct NotificationPacket {
 
 pub const SCSI_IOCTL_DATA_OUT: u8 = 0;
 pub const SCSI_IOCTL_DATA_IN: u8 = 1;
+
+#[cfg(test)]
+mod tests;
