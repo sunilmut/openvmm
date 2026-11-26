@@ -111,3 +111,62 @@ pub(crate) fn parse_bool_param(key: &str, val: &str) -> anyhow::Result<bool> {
         _ => anyhow::bail!("invalid boolean value for {key}: {val}"),
     }
 }
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    guest_is_native,
+    any(feature = "virt_kvm", feature = "virt_mshv")
+))]
+mod contract_tests {
+    use hypervisor_resources::HypervisorProbe;
+    use test_with_tracing::test;
+
+    // Test: Supply unsupported KVM parameters through the public probe.
+    // Expected: Parameter errors identify the rejected key before host device
+    //       availability can mask an invalid backend configuration.
+    #[cfg(feature = "virt_kvm")]
+    #[test]
+    fn kvm_rejects_foreign_parameters_before_opening_device() {
+        for key in ["snp_disable_cpuid_offload", "user_mode_apic", ""] {
+            let error = crate::kvm::KvmProbe
+                .new_resource(&[(key, "true")])
+                .unwrap_err();
+            assert_eq!(error.to_string(), format!("unknown kvm parameter: {key}"));
+        }
+    }
+
+    // Test: Validate complete MSHV option lists, including boolean spellings.
+    // Expected: Every accepted boolean reaches validation of the following
+    //       key; malformed values retain their own key and value in the error.
+    #[cfg(feature = "virt_mshv")]
+    #[test]
+    fn mshv_validates_options_before_host_capabilities() {
+        let key = "snp_disable_cpuid_offload";
+        for value in ["true", "1", "yes", "false", "0", "no"] {
+            let error = crate::mshv::MshvProbe
+                .new_resource(&[(key, value), ("foreign_backend_option", "true")])
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "unknown mshv parameter: foreign_backend_option"
+            );
+        }
+        for value in ["", "TRUE", "2", "true ", "λ"] {
+            let error = crate::mshv::MshvProbe
+                .new_resource(&[(key, value)])
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("invalid boolean value for {key}: {value}")
+            );
+        }
+        let error = crate::mshv::MshvProbe
+            .new_resource(&[(key, "true"), (key, "invalid")])
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("invalid boolean value for {key}: invalid")
+        );
+    }
+}
