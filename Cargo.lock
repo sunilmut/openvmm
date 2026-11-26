@@ -8699,10 +8699,12 @@ name = "tdisp_lstoraccel"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "disklayer_ram",
  "mesh_protobuf",
  "nvme_spec",
  "pal_async",
+ "parking_lot",
  "tdisp",
  "test_with_tracing",
  "thiserror 2.0.16",

@@ -15,8 +15,10 @@ vmcore.workspace = true
 zerocopy.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+async-trait.workspace = true
 disklayer_ram.workspace = true
 pal_async.workspace = true
+parking_lot.workspace = true
 tdisp.workspace = true
 test_with_tracing.workspace = true
 vmgs = { workspace = true, features = ["encryption"] }
