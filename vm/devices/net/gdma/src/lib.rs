@@ -449,3 +449,123 @@ impl PciConfigSpace for GdmaDevice {
         self.config.write_byte_enabled(offset, value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::GdmaDevice;
+    use chipset_device::io::IoResult;
+    use chipset_device::mmio::ExternallyManagedMmioIntercepts;
+    use chipset_device::mmio::MmioIntercept;
+    use chipset_device::pci::ByteEnabledDwordWrite;
+    use chipset_device::pci::PciConfigSpace;
+    use gdma_defs::RegMap;
+    use gdma_defs::SMC_MSG_TYPE_REPORT_HWC_TIMEOUT_VERSION;
+    use gdma_defs::SmcMessageType;
+    use gdma_defs::SmcProtoHdr;
+    use guestmem::GuestMemory;
+    use net_backend::null::NullEndpoint;
+    use pal_async::DefaultPool;
+    use pci_core::msi::MsiTarget;
+    use test_with_tracing::test;
+    use vmcore::vm_task::SingleDriverBackend;
+    use vmcore::vm_task::VmTaskDriverSource;
+    use zerocopy::FromZeros;
+    use zerocopy::IntoBytes;
+
+    fn device(pool: &DefaultPool) -> (GdmaDevice, u64) {
+        let mut device = GdmaDevice::new(
+            &VmTaskDriverSource::new(SingleDriverBackend::new(pool.driver())),
+            GuestMemory::allocate(0x10000),
+            &MsiTarget::disconnected(),
+            vec![super::VportConfig {
+                mac_address: [2, 0, 0, 0, 0, 1].into(),
+                endpoint: Box::new(NullEndpoint::new()),
+            }],
+            &mut ExternallyManagedMmioIntercepts,
+        );
+        let bar = 0x20000;
+        assert!(matches!(
+            device.pci_cfg_write(0x10, ByteEnabledDwordWrite::with_all_bytes_enabled(bar)),
+            IoResult::Ok
+        ));
+        assert!(matches!(
+            device.pci_cfg_write(4, ByteEnabledDwordWrite::with_all_bytes_enabled(2)),
+            IoResult::Ok
+        ));
+        let mut map = RegMap::new_zeroed();
+        assert!(matches!(
+            device.mmio_read(u64::from(bar), map.as_mut_bytes()),
+            IoResult::Ok
+        ));
+        (device, u64::from(bar) + map.vf_gdma_sriov_shared_reg_start)
+    }
+
+    fn header(device: &mut GdmaDevice, shmem: u64) -> SmcProtoHdr {
+        let mut bytes = [0; 4];
+        assert!(matches!(
+            device.mmio_read(shmem + 28, &mut bytes),
+            IoResult::Ok
+        ));
+        SmcProtoHdr::from(u32::from_le_bytes(bytes))
+    }
+
+    // Test: Submit timeout reports through the mapped PCI BAR using supported
+    //       and older protocol versions, then retry after an error response.
+    // Expected: Unsupported versions fail, supported versions succeed, and
+    //       response headers preserve the request type/version without poisoning
+    //       subsequent requests.
+    #[test]
+    fn timeout_report_versions_return_independent_mmio_responses() {
+        let pool = DefaultPool::new();
+        let (mut device, shmem) = device(&pool);
+        let supported = SMC_MSG_TYPE_REPORT_HWC_TIMEOUT_VERSION;
+        for version in [supported - 1, supported, supported + 1, supported] {
+            let request = SmcProtoHdr::new()
+                .with_msg_type(SmcMessageType::SMC_MSG_TYPE_REPORT_HWC_TIMEOUT.0)
+                .with_msg_version(version);
+            let words = [1, 2, 3, 4, 0, 0, 17, u32::from(request)];
+            for (index, word) in words.iter().enumerate() {
+                assert!(matches!(
+                    device.mmio_write(shmem + index as u64 * 4, &word.to_le_bytes()),
+                    IoResult::Ok
+                ));
+            }
+            let response = header(&mut device, shmem);
+            assert!(response.is_response());
+            assert_eq!(response.msg_type(), request.msg_type());
+            assert_eq!(response.msg_version(), version);
+            assert_eq!(response.status(), u8::from(version < supported));
+            assert!(!response.owner_is_pf());
+        }
+    }
+
+    // Test: Stage all seven payload DWORDs of a shared-memory request before
+    //       submitting its protocol header in the final DWORD.
+    // Expected: Payload writes do not generate a response before submission.
+    // IGNORED: Enabled regression reproduced premature completion when payload
+    //       DWORD 6 is written: the untouched header changes from 0 to 384.
+    //       write_shmem uses inclusive overlap at the exclusive end of this
+    //       payload write, executing the old header before the final DWORD.
+    //       The Rust driver and public Linux/FreeBSD shared-memory protocol
+    //       submit only with the final DWORD. No production fix is included;
+    //       this is distinct from the pending DESTROY_HWC ownership bug
+    //       reproduced by mana_driver's driver-reinitialization regression.
+    #[test]
+    #[ignore = "GDMA submits a request on the preceding payload DWORD"]
+    fn shared_memory_payload_does_not_submit_the_previous_header() {
+        let pool = DefaultPool::new();
+        let (mut device, shmem) = device(&pool);
+        let initial = u32::from(header(&mut device, shmem));
+        for index in 0..7 {
+            assert!(matches!(
+                device.mmio_write(shmem + index * 4, &(index as u32).to_le_bytes()),
+                IoResult::Ok
+            ));
+            assert_eq!(
+                u32::from(header(&mut device, shmem)),
+                initial,
+                "payload DWORD {index} must not submit a request"
+            );
+        }
+    }
+}
