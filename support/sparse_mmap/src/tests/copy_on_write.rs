@@ -179,3 +179,45 @@ fn copy_on_write_split_follows_write_copy_protection() {
     let err = mapping.unmap(0, page_size).unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
 }
+
+// Test: Create two writable private views at a nonzero file offset, close every source handle, and mutate each view independently.
+// Expected: Views retain the selected page and independent private writes after handle/view drops, while the backing file remains unchanged.
+#[test]
+fn nonzero_offset_private_views_outlive_handles_and_remain_independent() {
+    let page_size = SparseMapping::page_size();
+    let file_offset = page_size * 16;
+    let mut original = vec![0x11; file_offset + page_size * 2];
+    original[file_offset..file_offset + page_size].fill(0x33);
+    original[file_offset + page_size..].fill(0x77);
+    let (mut file, path) = tempfile::NamedTempFile::new().unwrap().into_parts();
+    file.write_all(&original).unwrap();
+    let mappable = new_mappable_from_file_copy_on_write(&file).unwrap();
+    let first = SparseMapping::new(page_size).unwrap();
+    let second = SparseMapping::new(page_size).unwrap();
+    for mapping in [&first, &second] {
+        mapping
+            .map_file_copy_on_write(0, page_size, &mappable, file_offset as u64, true)
+            .unwrap();
+    }
+    drop(mappable);
+    drop(file);
+
+    let mut bytes = vec![0; page_size];
+    first.read_at(0, &mut bytes).unwrap();
+    assert_eq!(bytes, vec![0x33; page_size]);
+    first.fill_at(0, 0xa5, page_size).unwrap();
+    second.read_at(0, &mut bytes).unwrap();
+    assert_eq!(bytes, vec![0x33; page_size]);
+    second.fill_at(0, 0x5a, page_size).unwrap();
+    first.read_at(0, &mut bytes).unwrap();
+    assert_eq!(bytes, vec![0xa5; page_size]);
+    drop(first);
+    second.read_at(0, &mut bytes).unwrap();
+    assert_eq!(bytes, vec![0x5a; page_size]);
+    let mut file_bytes = Vec::new();
+    std::fs::File::open(&path)
+        .unwrap()
+        .read_to_end(&mut file_bytes)
+        .unwrap();
+    assert_eq!(file_bytes, original);
+}
