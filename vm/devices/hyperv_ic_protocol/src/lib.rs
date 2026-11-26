@@ -144,3 +144,6 @@ pub struct NegotiateMessage {
     /// Reserved -- must be zero.
     pub reserved: u32,
 }
+
+#[cfg(test)]
+mod tests;

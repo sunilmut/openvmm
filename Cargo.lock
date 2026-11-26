@@ -3816,6 +3816,7 @@ dependencies = [
  "guid",
  "jiff",
  "open_enum",
+ "test_with_tracing",
  "zerocopy",
 ]
 
