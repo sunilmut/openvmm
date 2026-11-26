@@ -56,3 +56,6 @@ impl VmgsThinClient {
         self.0.save().await
     }
 }
+
+#[cfg(test)]
+mod contract_tests;
