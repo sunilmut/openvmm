@@ -11904,6 +11904,11 @@ dependencies = [
 name = "watchdog_vmgs_format"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "parking_lot",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "vmcore",
 ]

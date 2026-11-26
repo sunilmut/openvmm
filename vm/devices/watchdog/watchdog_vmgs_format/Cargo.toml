@@ -11,5 +11,12 @@ vmcore.workspace = true
 
 thiserror.workspace = true
 
+[dev-dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+parking_lot.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

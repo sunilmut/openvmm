@@ -132,3 +132,6 @@ impl WatchdogVmgsFormatStore {
         Ok(prev)
     }
 }
+
+#[cfg(test)]
+mod tests;
