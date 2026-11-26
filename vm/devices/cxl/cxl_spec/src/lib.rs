@@ -450,4 +450,195 @@ mod tests {
             + CXL_COMPONENT_REG_RANGE_TRAILING_RESERVED_SIZE_BYTES;
         assert_eq!(total, CXL_COMPONENT_REGISTERS_SIZE_BYTES);
     }
+
+    // Test: Encode every defined HDM decoder count and reject unsupported counts, including native integer limits.
+    // Expected: The capability count field represents 1, even counts through 16, then multiples of four through 32; other counts are rejected.
+    #[test]
+    fn hdm_decoder_count_accepts_only_defined_capability_codes() {
+        use crate::component_registers::hdm_decoder::encode_decoder_count;
+
+        let counts = [1, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32];
+        for count in 0..=40 {
+            let expected = counts.iter().position(|&defined| defined == count);
+            assert_eq!(encode_decoder_count(count), expected.map(|code| code as u8));
+        }
+        assert_eq!(encode_decoder_count(usize::MAX), None);
+    }
+
+    // Test: Change HDM global control and capability fields in registers whose neighboring and reserved bits are already set.
+    // Expected: Writable control bits occupy bits 0 and 1, and decoder/target/coherency fields do not modify neighboring bits.
+    #[test]
+    fn hdm_register_fields_preserve_neighboring_and_reserved_bits() {
+        use crate::component_registers::hdm_decoder as hdm;
+
+        assert_eq!(hdm::CXL_HDM_DECODER_GLOBAL_CONTROL_WRITABLE_MASK, 3);
+        for raw in [0, u32::MAX, 0xa5a5_5a5a] {
+            for poison in [false, true] {
+                for enable in [false, true] {
+                    let control = hdm::CxlHdmDecoderGlobalControlRegister::from(raw)
+                        .with_poison_on_decode_error_enable(poison)
+                        .with_hdm_decoder_enable(enable);
+                    assert_eq!(
+                        control.into_bits(),
+                        (raw & 0xffff_fffc) | u32::from(poison) | (u32::from(enable) << 1)
+                    );
+                    assert_eq!(control.poison_on_decode_error_enable(), poison);
+                    assert_eq!(control.hdm_decoder_enable(), enable);
+                }
+            }
+            let capability = hdm::CxlHdmDecoderCapabilityRegister::from(raw)
+                .with_decoder_count(5)
+                .with_target_count(12)
+                .with_supported_coherency_modes(2);
+            assert_eq!(capability.into_bits(), (raw & !0x0060_00ff) | 0x0040_00c5);
+            assert_eq!(capability.decoder_count(), 5);
+            assert_eq!(capability.target_count(), 12);
+            assert_eq!(capability.supported_coherency_modes(), 2);
+        }
+    }
+
+    // Test: Decode all raw CFMWS restriction words and combine every pair of valid restriction sets.
+    // Expected: Reserved bits are rejected, union/assignment preserve exactly the requested bits, and containment requires every requested bit.
+    #[test]
+    fn cfmws_restrictions_preserve_complete_set_algebra() {
+        for raw in 0..=u16::MAX {
+            let parsed = CfmwsWindowRestrictions::try_from_bits(raw);
+            assert_eq!(parsed.is_some(), raw < 64);
+            assert_eq!(CfmwsWindowRestrictions::is_valid_bits(raw), raw < 64);
+            if let Some(restrictions) = parsed {
+                assert_eq!(restrictions.bits(), raw);
+            }
+        }
+        for left in 0..64 {
+            for right in 0..64 {
+                let left_set = CfmwsWindowRestrictions::try_from_bits(left).unwrap();
+                let right_set = CfmwsWindowRestrictions::try_from_bits(right).unwrap();
+                let union = left_set | right_set;
+                let mut assigned = left_set;
+                assigned |= right_set;
+                assert_eq!(union.bits(), left | right);
+                assert_eq!(assigned.bits(), left | right);
+                assert_eq!(assigned, union);
+                assert_eq!(left_set == right_set, left == right);
+                assert_eq!(left_set.contains(right_set), left & right == right);
+            }
+        }
+    }
+
+    // Test: Encode every defined HDM interleave and coherency mode for register consumers.
+    // Expected: Granularity and coherency codes are sequential, while 3/6/12-way interleave uses the distinct 8/9/10 codes.
+    #[test]
+    fn hdm_interleave_and_coherency_wire_codes() {
+        use crate::component_registers::hdm_decoder::CxlHdmDecoderInterleaveGranularity as Granularity;
+        use crate::component_registers::hdm_decoder::CxlHdmDecoderInterleaveWays as Ways;
+        use crate::component_registers::hdm_decoder::CxlHdmSupportedCoherencyModes as Coherency;
+
+        for (mode, expected) in [
+            (Granularity::Bytes256, 0),
+            (Granularity::Bytes512, 1),
+            (Granularity::Bytes1024, 2),
+            (Granularity::Bytes2048, 3),
+            (Granularity::Bytes4096, 4),
+            (Granularity::Bytes8192, 5),
+            (Granularity::Bytes16384, 6),
+        ] {
+            assert_eq!(mode.bits(), expected);
+        }
+        for (mode, expected) in [
+            (Ways::Way1, 0),
+            (Ways::Way2, 1),
+            (Ways::Way4, 2),
+            (Ways::Way8, 3),
+            (Ways::Way16, 4),
+            (Ways::Way3, 8),
+            (Ways::Way6, 9),
+            (Ways::Way12, 10),
+        ] {
+            assert_eq!(mode.bits(), expected);
+        }
+        for (mode, expected) in [
+            (Coherency::Unknown, 0),
+            (Coherency::DeviceCoherent, 1),
+            (Coherency::HostOnlyCoherent, 2),
+            (Coherency::HostOnlyOrDeviceCoherent, 3),
+        ] {
+            assert_eq!(mode.bits(), expected);
+        }
+    }
+
+    // Test: Encode DVSEC media/class, interleave, timeouts, cache units and locator identifiers using their defined wire values.
+    // Expected: Each semantic value produces its specified code, including CDAT, different timeout scales and vendor-specific locator code 255.
+    #[test]
+    fn dvsec_semantic_values_preserve_wire_encodings() {
+        use crate::pci_registers::cxl_device_dvsec::CxlDeviceDvsecCacheSizeUnit as Cache;
+        use crate::pci_registers::cxl_device_dvsec::CxlDeviceDvsecDesiredInterleave as Interleave;
+        use crate::pci_registers::cxl_device_dvsec::CxlDeviceDvsecMediaType as Media;
+        use crate::pci_registers::cxl_device_dvsec::CxlDeviceDvsecMemoryActiveTimeout as Active;
+        use crate::pci_registers::cxl_device_dvsec::CxlDeviceDvsecMemoryClass as Class;
+        use crate::pci_registers::cxl_device_dvsec::CxlDeviceDvsecResetTimeout as Reset;
+        use crate::pci_registers::register_locator_dvsec::CxlRegisterLocatorRegisterBir as Bir;
+        use crate::pci_registers::register_locator_dvsec::CxlRegisterLocatorRegisterBlockIdentifier as Block;
+
+        for (actual, expected) in [
+            (Media::VolatileMemory.bits(), 0),
+            (Media::NonVolatileMemory.bits(), 1),
+            (Media::Cdat.bits(), 2),
+            (Class::Memory.bits(), 0),
+            (Class::Storage.bits(), 1),
+            (Class::Cdat.bits(), 2),
+            (Interleave::NoInterleave.bits(), 0),
+            (Interleave::Granularity256Bytes.bits(), 1),
+            (Interleave::Interleave4Kb.bits(), 2),
+            (Interleave::Bytes512.bits(), 3),
+            (Interleave::Bytes1024.bits(), 4),
+            (Interleave::Bytes2048.bits(), 5),
+            (Interleave::Bytes8192.bits(), 6),
+            (Interleave::Bytes16384.bits(), 7),
+            (Active::Seconds1.bits(), 0),
+            (Active::Seconds4.bits(), 1),
+            (Active::Seconds16.bits(), 2),
+            (Active::Seconds64.bits(), 3),
+            (Active::Seconds256.bits(), 4),
+            (Reset::Milliseconds10.bits(), 0),
+            (Reset::Milliseconds100.bits(), 1),
+            (Reset::Seconds1.bits(), 2),
+            (Reset::Seconds10.bits(), 3),
+            (Reset::Seconds100.bits(), 4),
+            (Cache::NotReported.bits(), 0),
+            (Cache::Kib64.bits(), 1),
+            (Cache::Mib1.bits(), 2),
+            (Bir::BAR_10H.bits(), 0),
+            (Bir::BAR_14H.bits(), 1),
+            (Bir::BAR_18H.bits(), 2),
+            (Bir::BAR_1CH.bits(), 3),
+            (Bir::BAR_20H.bits(), 4),
+            (Bir::BAR_24H.bits(), 5),
+            (Block::EMPTY.bits(), 0),
+            (Block::COMPONENT_REGISTERS.bits(), 1),
+            (Block::BAR_VIRTUALIZATION_ACL_REGISTERS.bits(), 2),
+            (Block::CXL_DEVICE_REGISTERS.bits(), 3),
+            (Block::CPMU_REGISTERS.bits(), 4),
+            (Block::CHMU_REGISTERS.bits(), 5),
+            (Block::DESIGNATED_VENDOR_SPECIFIC.bits(), 255),
+        ] {
+            assert_eq!(actual, expected);
+        }
+    }
+
+    // Test: Encode cache/mem capability pointers for consumers that add the extracted 12-bit field directly to the register-block base.
+    // Expected: The field retains the byte offset rather than dividing it by four, with the capability ID and version unchanged.
+    #[test]
+    #[ignore = "product bug: cache/mem capability pointer encodes one quarter of the byte offset"]
+    fn cachemem_pointer_is_a_byte_offset_for_register_consumers() {
+        for (pointer, expected) in [
+            (0x0000, 0x0003_0005),
+            (0x0080, 0x0803_0005),
+            (0x0400, 0x4003_0005),
+            (0x0ffc, 0xffc3_0005),
+        ] {
+            let encoded = CxlCacheMemCapabilityArrayEntry::encode(5, 3, pointer).unwrap();
+            assert_eq!(encoded, expected);
+            assert_eq!(encoded >> 20, u32::from(pointer));
+        }
+    }
 }
