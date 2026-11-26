@@ -15,5 +15,10 @@ async-trait.workspace = true
 tracelimit.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+mesh.workspace = true
+parking_lot.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
