@@ -99,3 +99,6 @@ pub fn build_tracelogging_notification_buffer(
 
     buffer
 }
+
+#[cfg(test)]
+mod tests;
