@@ -6827,6 +6827,7 @@ version = "0.0.0"
 dependencies = [
  "guid",
  "mesh",
+ "test_with_tracing",
  "vm_resource",
 ]
 
