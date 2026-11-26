@@ -747,4 +747,121 @@ mod tests {
         check_lock_access::<16>();
         check_lock_access::<64>();
     }
+
+    // Test: Build valid two-byte linear ranges immediately before and across a guest page boundary.
+    // Expected: Both ranges construct successfully and their readers return the exact bytes, including both physical pages for the crossing range.
+    #[test]
+    #[ignore = "product bug: linear page count omits the starting offset and crossing buffer panics"]
+    fn linear_unaligned_cross_page_range_preserves_both_bytes() {
+        let memory = GuestMemory::allocate(2 * PAGE_SIZE);
+        memory
+            .write_at((PAGE_SIZE - 2) as u64, &[0x27, 0x81, 0xff])
+            .unwrap();
+        for (offset, expected) in [(PAGE_SIZE - 2, [0x27, 0x81]), (PAGE_SIZE - 1, [0x81, 0xff])] {
+            let owned = OwnedRequestBuffers::linear(offset as u64, 2, false);
+            let buffers = owned.buffer(&memory);
+            let mut actual = [0; 2];
+            buffers.reader().read(&mut actual).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    // Test: Write a two-byte subrange spanning out-of-order guest pages and clone it as a read-only view.
+    // Expected: Bytes follow descriptor order, every byte outside the subrange is untouched, and subranges preserve read-only permissions and alignment.
+    #[test]
+    fn scatter_subrange_preserves_order_permissions_and_byte_guards() {
+        let memory = GuestMemory::allocate(3 * PAGE_SIZE);
+        let mut expected = vec![0x5a; 3 * PAGE_SIZE];
+        memory.write_at(0, &expected).unwrap();
+        let owned = OwnedRequestBuffers::new_unaligned(&[2, 0], PAGE_SIZE - 2, 4);
+        assert_eq!(owned.len(), 4);
+        let buffers = owned.buffer(&memory);
+        assert!(buffers.is_aligned(2));
+        assert!(!buffers.is_aligned(4));
+        let subrange = buffers.subrange(1, 2);
+        assert_eq!(subrange.len(), 2);
+        assert!(!subrange.is_empty());
+        assert!(std::ptr::eq(subrange.guest_memory(), &memory));
+        assert!(subrange.is_aligned(1));
+        assert!(!subrange.is_aligned(2));
+        assert!(!subrange.is_aligned(4096));
+        subrange.writer().write(&[0x81, 0xff]).unwrap();
+        expected[3 * PAGE_SIZE - 1] = 0x81;
+        expected[0] = 0xff;
+
+        let read_only = RequestBuffers::new(&memory, buffers.range(), false).subrange(1, 2);
+        assert!(matches!(read_only.lock(true), Err(AccessError::ReadOnly)));
+        assert!(matches!(
+            read_only.writer().write(&[1, 2]),
+            Err(AccessError::ReadOnly)
+        ));
+        let mut selected = [0; 2];
+        read_only.reader().read(&mut selected).unwrap();
+        assert_eq!(selected, [0x81, 0xff]);
+        let mut actual = vec![0; expected.len()];
+        memory.read_at(0, &mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert!(buffers.subrange(4, 0).is_empty());
+    }
+
+    // Test: Exhaust a two-page bounce budget with a partial second page, wait for capacity, and release buffers on separate threads.
+    // Expected: Capacity rounds up by pages, threads stay independent, only the matching release wakes the waiter, and drop restores exactly the original budget.
+    #[test]
+    fn bounce_budget_rounds_pages_and_reclaims_capacity_on_drop() {
+        use std::future::Future;
+        use std::pin::pin;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::task::Context;
+        use std::task::Poll;
+        use std::task::Wake;
+        use std::task::Waker;
+
+        #[derive(Default)]
+        struct Notified(AtomicBool);
+        impl Wake for Notified {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        fn ready(
+            tracker: &BounceBufferTracker,
+            size: usize,
+            thread: usize,
+        ) -> TrackedBounceBuffer<'_> {
+            let mut acquire = pin!(tracker.acquire_bounce_buffers(size, thread));
+            let Poll::Ready(buffer) = acquire
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+            else {
+                panic!("available bounce budget must admit the request");
+            };
+            buffer
+        }
+
+        let tracker = BounceBufferTracker::new(2, 2);
+        let mut held = ready(&tracker, PAGE_SIZE + 1, 0);
+        assert_eq!(held.buffer.as_mut_bytes().len(), PAGE_SIZE + 1);
+        assert!(held.buffer.as_mut_bytes().iter().all(|&byte| byte == 0));
+        let notified = Arc::new(Notified::default());
+        let waker = Waker::from(notified.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut waiting = pin!(tracker.acquire_bounce_buffers(1, 0));
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        let independent = ready(&tracker, 2 * PAGE_SIZE, 1);
+        drop(independent);
+        assert!(!notified.0.load(Ordering::Relaxed));
+        drop(held);
+        assert!(notified.0.load(Ordering::Relaxed));
+        let Poll::Ready(mut granted) = waiting.as_mut().poll(&mut context) else {
+            panic!("released pages must satisfy the pending request");
+        };
+        assert_eq!(granted.buffer.as_mut_bytes(), &[0]);
+        drop(granted);
+        let restored = ready(&tracker, 2 * PAGE_SIZE, 0);
+        let mut excess = pin!(tracker.acquire_bounce_buffers(1, 0));
+        assert!(excess.as_mut().poll(&mut context).is_pending());
+        drop(restored);
+        assert!(excess.as_mut().poll(&mut context).is_ready());
+    }
 }
