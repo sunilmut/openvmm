@@ -383,3 +383,87 @@ pub mod queue {
         _reserved: u16,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use queue::*;
+    use test_with_tracing::test;
+
+    // Test: Negotiate two feature banks independently, including future bits.
+    // Expected: Replacing either bank preserves the other, unknown selectors
+    //       read zero and writes to them cannot alter negotiated features.
+    #[test]
+    fn feature_bank_registers_preserve_other_bank() {
+        let mut features = VirtioDeviceFeatures::new()
+            .with_bank(0, 0xf123_4567)
+            .with_bank(1, 0xa5a5_07ff);
+        assert_eq!(features.bank(0), 0xf123_4567);
+        assert_eq!(features.bank(1), 0xa5a5_07ff);
+        assert!(features.version_1());
+        assert!(features.ring_packed());
+        features.set_bank(0, 0x8000_0000);
+        assert_eq!(features.bank(1), 0xa5a5_07ff);
+        features.set_bank(1, 0x8000_0001);
+        assert_eq!(features.bank(0), 0x8000_0000);
+        for index in [2, 31, usize::MAX] {
+            assert_eq!(features.bank(index), 0);
+            features.set_bank(index, u32::MAX);
+            assert_eq!(features.into_bits(), 0x8000_0001_8000_0000);
+        }
+    }
+
+    // Test: Decode a guest split descriptor and encode a packed completion.
+    // Expected: Addresses, lengths, links and ownership bits occupy the
+    //       specified little-endian wire offsets, without dropping reserved bits.
+    #[test]
+    fn descriptor_wire_layout_preserves_links_and_ownership() {
+        let bytes = [
+            0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, 0x78, 0x56, 0x34, 0x12, 0x87, 0xc0,
+            0x21, 0x43,
+        ];
+        let split = SplitDescriptor::read_from_bytes(&bytes).unwrap();
+        assert_eq!(split.address.get(), 0x0123_4567_89ab_cdef);
+        assert_eq!(split.length.get(), 0x1234_5678);
+        assert_eq!(split.next.get(), 0x4321);
+        let flags = split.flags();
+        assert!(flags.next() && flags.write() && flags.indirect());
+        assert!(flags.available() && flags.used());
+        assert_eq!(flags.into_bits(), 0xc087);
+
+        let packed = PackedDescriptor::new()
+            .with_buffer_id(0x4321)
+            .with_length(0x1234_5678)
+            .with_flags(flags);
+        assert_eq!(
+            packed.as_bytes(),
+            &[
+                0, 0, 0, 0, 0, 0, 0, 0, 0x78, 0x56, 0x34, 0x12, 0x21, 0x43, 0x87, 0xc0
+            ]
+        );
+        assert_eq!(packed.flags().into_bits(), 0xc087);
+    }
+
+    // Test: Exchange event suppression records with wrap and reserved flag bits.
+    // Expected: The cursor and mode decode independently; reserved mode remains
+    //       distinguishable so the consumer can use its documented enabled fallback.
+    #[test]
+    fn packed_event_wire_layout_keeps_wrap_separate_from_mode() {
+        let event = PackedEventSuppression::new()
+            .with_offset(0x7fff)
+            .with_wrap(true)
+            .with_flags(EventSuppressionFlags::DescriptorIndex);
+        assert_eq!(event.as_bytes(), &[0xff, 0xff, 2, 0]);
+        for (raw, expected) in [
+            (0, EventSuppressionFlags::Enabled),
+            (1, EventSuppressionFlags::Disabled),
+            (2, EventSuppressionFlags::DescriptorIndex),
+            (3, EventSuppressionFlags::Reserved),
+        ] {
+            let event = PackedEventSuppression::read_from_bytes(&[0x34, 0x92, raw, 0xfc]).unwrap();
+            assert_eq!(event.offset(), 0x1234);
+            assert!(event.wrap());
+            assert_eq!(event.flags(), expected);
+        }
+    }
+}
