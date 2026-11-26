@@ -52,3 +52,6 @@ pub fn emit_git_info() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
