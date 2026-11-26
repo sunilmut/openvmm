@@ -13,6 +13,7 @@ fn run_build_script(host: &str, guest: Option<&str>) -> Output {
             "--nocapture",
         ])
         .env("OPENVMM_BUILD_ARCH_TEST_CHILD", "1")
+        // xtask-fmt allow-target-arch oneoff-guest-arch-impl
         .env("CARGO_CFG_TARGET_ARCH", host)
         .env_remove("OPENVMM_GUEST_TARGET");
     if let Some(guest) = guest {
