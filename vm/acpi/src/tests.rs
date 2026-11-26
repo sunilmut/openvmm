@@ -290,3 +290,41 @@ fn routing_pin_two_uses_an_aml_integer_encoding() {
         ]
     );
 }
+
+// Test: Combine shared wake-capable, producer, and exclusive edge-triggered
+//       extended interrupts in one _CRS buffer, including 32-bit identifiers.
+// Expected: Each descriptor preserves its own flags and full identifier; the
+//       buffer has the correct length, one interrupt per descriptor, and an end tag.
+#[test]
+fn extended_interrupt_resources_preserve_independent_attributes() {
+    use crate::aml::resources::CurrentResourceSettings;
+    use crate::aml::resources::Interrupt;
+
+    let mut shared = Interrupt::new(0x1_2345);
+    shared.is_shared = true;
+    shared.is_low_polarity = true;
+    shared.is_wake_capable = true;
+    let mut producer = Interrupt::new(4);
+    producer.is_consumer = false;
+    producer.is_edge_triggered = true;
+    let mut exclusive = Interrupt::new(u32::MAX);
+    exclusive.is_edge_triggered = true;
+    exclusive.is_low_polarity = true;
+    exclusive.is_wake_capable = true;
+
+    let mut crs = CurrentResourceSettings::new();
+    for interrupt in [&shared, &producer, &exclusive] {
+        crs.add_resource(interrupt);
+    }
+    let bytes = crs.to_bytes();
+    assert_eq!(
+        &bytes[..9],
+        &[0x08, b'_', b'C', b'R', b'S', 0x11, 32, 0x0a, 29]
+    );
+    assert_eq!(bytes.len(), 38);
+    assert_eq!(
+        interrupts(&bytes),
+        [(0x1d, 0x1_2345), (0x02, 4), (0x17, u32::MAX)]
+    );
+    assert_eq!(&bytes[36..], &[0x79, 0]);
+}
