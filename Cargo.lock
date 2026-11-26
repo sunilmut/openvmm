@@ -10924,6 +10924,7 @@ dependencies = [
  "mesh_protobuf",
  "pal_async",
  "pal_event",
+ "test_with_tracing",
  "tracelimit",
  "tracing",
  "unicycle",

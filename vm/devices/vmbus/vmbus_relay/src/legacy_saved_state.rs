@@ -112,3 +112,128 @@ impl SavedState {
         self.client_saved_state.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use guid::Guid;
+    use mesh::payload::Protobuf;
+    use test_with_tracing::test;
+    use vmbus_client::saved_state::ChannelState;
+    use vmbus_client::saved_state::ClientState;
+    use vmbus_client::saved_state::Offer;
+
+    // Consumer-side wire views avoid inspecting the relay's private fields.
+    #[derive(Clone, Debug, PartialEq, Eq, Protobuf)]
+    struct RelayWire {
+        #[mesh(1)]
+        interrupt_relay: bool,
+        #[mesh(5)]
+        channels: Vec<ChannelWire>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Protobuf)]
+    struct ChannelWire {
+        #[mesh(1)]
+        id: u32,
+        #[mesh(2)]
+        event_flag: Option<u16>,
+        #[mesh(3)]
+        intercepted: bool,
+        #[mesh(4)]
+        payload: Vec<u8>,
+        #[mesh(5)]
+        open: bool,
+    }
+
+    fn client_channel(id: u32, state: ChannelState) -> vmbus_client::saved_state::Channel {
+        vmbus_client::saved_state::Channel {
+            id,
+            state,
+            offer: Offer {
+                interface_id: Guid::ZERO,
+                instance_id: Guid::ZERO,
+                flags: 0,
+                mmio_megabytes: 0,
+                user_defined: [0; 120],
+                subchannel_index: 0,
+                mmio_megabytes_optional: 0,
+                channel_id: id,
+                monitor_id: 0,
+                monitor_allocated: 0,
+                is_dedicated: 0,
+                connection_id: id + 100,
+            },
+        }
+    }
+
+    // Test: Convert servicing state with unsorted client offers and a revoked
+    //       relay channel through the public legacy compatibility APIs.
+    // Expected: Open state follows matching channel IDs, not vector positions;
+    //       missing/offered channels stay closed, and metadata survives.
+    #[test]
+    fn legacy_conversion_matches_open_channels_by_offer_id() {
+        let wire = RelayWire {
+            interrupt_relay: true,
+            channels: vec![
+                ChannelWire {
+                    id: 40,
+                    event_flag: Some(0),
+                    intercepted: false,
+                    payload: Vec::new(),
+                    open: false,
+                },
+                ChannelWire {
+                    id: 30,
+                    event_flag: Some(9),
+                    intercepted: false,
+                    payload: Vec::new(),
+                    open: true,
+                },
+                ChannelWire {
+                    id: 10,
+                    event_flag: None,
+                    intercepted: true,
+                    payload: vec![0, 255, 17],
+                    open: false,
+                },
+            ],
+        };
+        let relay: crate::SavedState =
+            mesh_protobuf::decode(&mesh_protobuf::encode(wire.clone())).unwrap();
+        let client = vmbus_client::SavedState {
+            client_state: ClientState::Connected {
+                version: vmbus_core::protocol::Version::Copper as u32,
+                feature_flags: 0,
+            },
+            channels: vec![
+                client_channel(40, ChannelState::Opened),
+                client_channel(10, ChannelState::Offered),
+                client_channel(20, ChannelState::Opened),
+            ],
+            gpadls: Vec::new(),
+            pending_messages: vec![vmbus_client::saved_state::PendingMessage {
+                data: vec![1, 2, 3],
+            }],
+        };
+        let mut legacy: super::SavedState = mesh_protobuf::decode(&mesh_protobuf::encode(
+            super::SavedState::from_relay_and_client(&relay, &client),
+        ))
+        .unwrap();
+        assert_eq!(
+            mesh_protobuf::encode(legacy.client_saved_state()),
+            mesh_protobuf::encode(client)
+        );
+        let mut expected = wire;
+        expected.channels[0].open = true;
+        expected.channels[1].open = false;
+        for _ in 0..2 {
+            let actual: RelayWire =
+                mesh_protobuf::decode(&mesh_protobuf::encode(legacy.relay_saved_state())).unwrap();
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(
+            legacy.client_saved_state().pending_messages[0].data,
+            [1, 2, 3]
+        );
+    }
+}
