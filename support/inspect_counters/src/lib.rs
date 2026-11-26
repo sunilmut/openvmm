@@ -137,6 +137,70 @@ mod tests {
     use super::*;
     use test_with_tracing::test;
 
+    // Test: Increment ordinary/shared counters through u64 overflow and clone an ordinary counter before mutation.
+    // Expected: Both counter types wrap identically, while ordinary clones retain independent values.
+    #[test]
+    fn counters_wrap_and_owned_clones_are_independent() {
+        let mut counter = Counter::new();
+        let shared = SharedCounter::new();
+        assert_eq!((counter.get(), shared.get()), (0, 0));
+        counter.add(u64::MAX);
+        shared.add(u64::MAX);
+        let snapshot = counter.clone();
+        counter.increment();
+        shared.increment();
+        assert_eq!((counter.get(), shared.get()), (0, 0));
+        assert_eq!(snapshot.get(), u64::MAX);
+        counter.add(17);
+        shared.add(17);
+        assert_eq!((counter.get(), shared.get()), (17, 17));
+    }
+
+    // Test: Concurrently increment and add weighted values through one shared counter.
+    // Expected: Joining every worker yields the exact modular total without lost updates.
+    #[test]
+    fn shared_counter_retains_every_concurrent_update() {
+        let counter = SharedCounter::default();
+        counter.add(u64::MAX - 99);
+        std::thread::scope(|scope| {
+            for weight in 1..=4 {
+                let counter = &counter;
+                scope.spawn(move || {
+                    for _ in 0..1000 {
+                        counter.increment();
+                        counter.add(weight);
+                    }
+                });
+            }
+        });
+        assert_eq!(counter.get(), 13_900);
+    }
+
+    // Test: Sample both edges of every nonzero power-of-two bucket and overflow the final bucket, then mutate a clone.
+    // Expected: Each finite bucket gets two samples, the last saturating bucket receives all larger values, and cloning preserves independent counts.
+    #[test]
+    fn histogram_boundaries_and_clone_preserve_sample_counts() {
+        let mut histogram = Histogram::<16>::default();
+        histogram.add_sample(0u64);
+        for bucket in 1..15 {
+            histogram.add_sample(1u64 << (bucket - 1));
+            histogram.add_sample((1u64 << bucket) - 1);
+        }
+        for sample in [1u64 << 14, (1u64 << 15) - 1, 1u64 << 63, u64::MAX] {
+            histogram.add_sample(sample);
+        }
+        assert_eq!(histogram.0[0], 1);
+        assert_eq!(&histogram.0[1..15], &[2; 14]);
+        assert_eq!(histogram.0[15], 4);
+        let mut clone = histogram.clone();
+        clone.add_sample(0u64);
+        assert_eq!(clone.0[0], 2);
+        assert_eq!(histogram.0[0], 1);
+        assert_eq!(&clone.0[1..], &histogram.0[1..]);
+        assert!(std::panic::catch_unwind(Histogram::<2>::new).is_err());
+        assert!(std::panic::catch_unwind(Histogram::<17>::new).is_err());
+    }
+
     #[test]
     fn histogram_bit_width_buckets() {
         let mut histogram = Histogram::<6>::new();
