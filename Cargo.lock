@@ -423,6 +423,7 @@ version = "0.0.0"
 dependencies = [
  "build_rs_git_info",
  "inspect",
+ "test_with_tracing",
 ]
 
 [[package]]

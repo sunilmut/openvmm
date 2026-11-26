@@ -212,6 +212,7 @@ pub fn get() -> &'static BuildInfo {
 #[cfg(test)]
 mod tests {
     use super::const_parse_version;
+    use test_with_tracing::test;
 
     #[test]
     fn empty_string() {
@@ -278,5 +279,65 @@ mod tests {
     #[should_panic(expected = "version segment must not be empty")]
     fn empty_segment_panics() {
         const_parse_version("1..3.4");
+    }
+
+    // Test: Parse four maximum-width components and decimal components with
+    //       leading zeroes, including values beyond Windows version-word limits.
+    // Expected: All u32 bits and component positions survive without truncation;
+    //       leading zeroes do not change the decimal values.
+    #[test]
+    fn full_width_components_and_leading_zeroes_are_preserved() {
+        assert_eq!(
+            const_parse_version("4294967295.4294967295.4294967295.4294967295"),
+            [u32::MAX; 4]
+        );
+        assert_eq!(
+            const_parse_version("00065536.0001.002.0003"),
+            [65536, 1, 2, 3]
+        );
+    }
+
+    // Test: Omit only the platform component from an otherwise numeric version.
+    // Expected: The build version is rejected rather than inventing a platform.
+    #[test]
+    #[should_panic(expected = "expected 4 dot-separated components")]
+    fn missing_platform_is_rejected() {
+        const_parse_version("1.2.3");
+    }
+
+    fn assert_invalid_numeric_segment(version: &str) {
+        let error = std::panic::catch_unwind(|| const_parse_version(version))
+            .expect_err("invalid numeric component was accepted");
+        assert_eq!(
+            *error.downcast::<&str>().expect("unexpected panic payload"),
+            "version segment is not a valid u32"
+        );
+    }
+
+    // Test: Overflow the minor, build, and platform components independently.
+    // Expected: Each over-width component is rejected rather than wrapped or
+    //       skipped because the major component was valid.
+    #[test]
+    fn overflow_in_later_components_is_rejected() {
+        for version in ["0.4294967296.0.0", "0.0.4294967296.0", "0.0.0.4294967296"] {
+            assert_invalid_numeric_segment(version);
+        }
+    }
+
+    // Test: Supply a kernel-style suffix, whitespace, a negative component,
+    //       a NUL, or a non-ASCII digit in a four-component build version.
+    // Expected: None is treated as a valid numeric component or silently trimmed.
+    #[test]
+    fn suffixes_and_non_numeric_bytes_are_rejected() {
+        for version in [
+            "1.2.3.4-generic",
+            "1.2.3.4\n",
+            "1.2.3. 4",
+            "-1.2.3.4",
+            "1.2.3.4\0",
+            "1.2.3.\u{ff14}",
+        ] {
+            assert_invalid_numeric_segment(version);
+        }
     }
 }
