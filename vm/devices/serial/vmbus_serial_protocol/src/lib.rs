@@ -422,3 +422,136 @@ impl Default for RxDataResponse {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Encode and decode each message category, including future IDs.
+    // Expected: Wire category selects exactly one ID view without losing
+    //       the full request ID or accepting a different message category.
+    #[test]
+    fn header_wire_dispatch() {
+        for (header, wire, guest, response, request, notification) in [
+            (
+                Header::new_guest_notification(GuestNotifications::TX_COMPLETED),
+                [1, 4, 3, 0],
+                Some(GuestNotifications::TX_COMPLETED),
+                None,
+                None,
+                None,
+            ),
+            (
+                Header::new_host_response(HostRequests(0x8123)),
+                [1, 3, 0x23, 0x81],
+                None,
+                Some(HostRequests(0x8123)),
+                None,
+                None,
+            ),
+            (
+                Header::new_host_request(HostRequests::GET_RX_DATA),
+                [1, 2, 2, 0],
+                None,
+                None,
+                Some(HostRequests::GET_RX_DATA),
+                None,
+            ),
+            (
+                Header::new_host_notification(HostNotifications::TX_DATA_AVAILABLE),
+                [1, 1, 2, 0],
+                None,
+                None,
+                None,
+                Some(HostNotifications::TX_DATA_AVAILABLE),
+            ),
+            (
+                Header::read_from_bytes(&[1, 0xfe, 0xab, 0xcd]).unwrap(),
+                [1, 0xfe, 0xab, 0xcd],
+                None,
+                None,
+                None,
+                None,
+            ),
+        ] {
+            assert_eq!(header.as_bytes(), wire);
+            let decoded = Header::read_from_bytes(&wire).unwrap();
+            assert_eq!(decoded.guest_notification(), guest);
+            assert_eq!(decoded.host_response(), response);
+            assert_eq!(decoded.host_request(), request);
+            assert_eq!(decoded.host_notification(), notification);
+        }
+    }
+
+    // Test: Assemble negotiation and full-capacity TX/RX packets from defaults.
+    // Expected: C-compatible bytes contain the version, exact payload and
+    //       zero padding; unused RX bytes remain zero, not stale TX data.
+    #[test]
+    fn negotiation_and_data_wire_layout() {
+        let version = VersionRequestMessage {
+            header: Header::new_host_request(HostRequests::VERSION),
+            requested_version: ProtocolVersions::MANGANESE,
+        };
+        assert_eq!(version.as_bytes(), [1, 2, 1, 0, 0, 0, 1, 0]);
+
+        let tx = TxDataAvailableMessage {
+            header: Header::new_host_notification(HostNotifications::TX_DATA_AVAILABLE),
+            buffer_length: 64,
+            buffer: std::array::from_fn(|i| (i as u8).wrapping_mul(3)),
+            ..Default::default()
+        };
+        let mut expected = vec![1, 1, 2, 0, 64];
+        expected.extend((0..64u8).map(|i| i.wrapping_mul(3)));
+        expected.push(0);
+        assert_eq!(tx.as_bytes(), expected);
+        let decoded = TxDataAvailableMessage::read_from_bytes(&expected).unwrap();
+        assert_eq!(decoded.buffer, tx.buffer);
+        assert_eq!(decoded.buffer_length, 64);
+        assert_eq!(decoded.pad, 0);
+
+        let mut rx = RxDataResponse {
+            header: Header::new_host_response(HostRequests::GET_RX_DATA),
+            buffer_length: 2,
+            more_data_available: 1,
+            ..Default::default()
+        };
+        rx.buffer[..2].copy_from_slice(&[0, 0xff]);
+        let mut expected = vec![1, 3, 2, 0, 2, 1, 0, 0xff];
+        expected.resize(70, 0);
+        assert_eq!(rx.as_bytes(), expected);
+        let decoded = RxDataResponse::read_from_bytes(&expected).unwrap();
+        assert_eq!(&decoded.buffer[..decoded.buffer_length as usize], [0, 0xff]);
+        assert_eq!(decoded.more_data_available, 1);
+    }
+
+    // Test: Decode future notification IDs and reject truncated packets.
+    // Expected: Unknown values survive wire round trips for consumer validation;
+    //       truncated negotiation, modem and RX packets cannot be decoded.
+    #[test]
+    fn forward_compatible_ids_and_truncation() {
+        let guest = Header::new_guest_notification(GuestNotifications(0xfe));
+        let host = Header::new_host_notification(HostNotifications(0xfd));
+        assert_eq!(guest.as_bytes(), [1, 4, 0xfe, 0]);
+        assert_eq!(host.as_bytes(), [1, 1, 0xfd, 0]);
+        assert_eq!(
+            Header::read_from_bytes(guest.as_bytes())
+                .unwrap()
+                .guest_notification(),
+            Some(GuestNotifications(0xfe))
+        );
+        assert_eq!(
+            Header::read_from_bytes(host.as_bytes())
+                .unwrap()
+                .host_notification(),
+            Some(HostNotifications(0xfd))
+        );
+        for length in 0..4 {
+            assert!(Header::read_from_bytes(&[0; 4][..length]).is_err());
+        }
+        assert!(VersionRequestMessage::read_from_bytes(&[0; 7]).is_err());
+        assert!(VersionRequestResponse::read_from_bytes(&[1, 3, 1, 0, 1]).is_err());
+        assert!(SetModumStatusMessage::read_from_bytes(&[1, 4, 2, 0, 0]).is_err());
+        assert!(RxDataResponse::read_from_bytes(&[0; 69]).is_err());
+    }
+}

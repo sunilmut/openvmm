@@ -11029,6 +11029,7 @@ dependencies = [
  "guid",
  "open_enum",
  "static_assertions",
+ "test_with_tracing",
  "zerocopy",
 ]
 
