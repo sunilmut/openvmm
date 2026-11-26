@@ -239,6 +239,82 @@ impl fmt::Display for Ucs2LeSlice {
 #[cfg(test)]
 mod test {
     use super::*;
+    use test_with_tracing::test;
+
+    // Test: Parse a misaligned little-endian BMP name and transfer it through owned, borrowed, and Cow forms.
+    // Expected: The first aligned NUL terminates the view, exact bytes survive ownership, and borrowing never copies the source storage.
+    #[test]
+    fn misaligned_bmp_names_preserve_bytes_across_ownership_forms() {
+        use std::borrow::{Borrow, Cow};
+        let raw = [0xcc, b'A', 0, 0xa9, 0x03, 0, 0x01, 0, 0, b'X', 0];
+        let slice = Ucs2LeSlice::from_slice_with_nul(&raw[1..]).unwrap();
+        let expected = &[b'A', 0, 0xa9, 0x03, 0, 0x01, 0, 0];
+        assert_eq!(slice.as_bytes(), expected);
+        assert_eq!(slice.as_bytes().as_ptr(), raw[1..].as_ptr());
+        assert_eq!(slice.as_bytes_without_nul(), &expected[..6]);
+        let borrowed: Cow<'_, Ucs2LeSlice> = slice.into();
+        assert!(matches!(borrowed, Cow::Borrowed(value) if std::ptr::eq(value, slice)));
+        let owned = slice.to_owned();
+        assert_eq!(owned.as_ref(), slice);
+        assert_ne!(owned.as_bytes().as_ptr(), slice.as_bytes().as_ptr());
+        let map = std::collections::BTreeMap::from([(owned.clone(), 42)]);
+        assert_eq!(map.get(slice), Some(&42));
+        assert!(std::ptr::eq(
+            <Ucs2LeVec as Borrow<Ucs2LeSlice>>::borrow(&owned),
+            owned.as_ref()
+        ));
+        let cow: Cow<'_, Ucs2LeSlice> = owned.into();
+        assert!(matches!(cow, Cow::Owned(_)));
+        assert_eq!(cow.into_owned().into_inner(), expected);
+        assert_eq!(
+            Ucs2LeVec::from_vec_with_nul(raw[1..].to_vec())
+                .unwrap()
+                .into_inner(),
+            expected
+        );
+    }
+
+    // Test: Convert BMP text and the empty default through both string constructors and formatting traits.
+    // Expected: Exact UTF-16LE bytes and one terminal NUL are retained, Display is text, and Debug uses escaped quoted text.
+    #[test]
+    fn string_defaults_and_formatting_preserve_bmp_names() {
+        let text = "A\u{03a9}\u{0100}\n\"";
+        let owned = Ucs2LeVec::from(text);
+        assert_eq!(
+            owned.as_bytes(),
+            &[65, 0, 0xa9, 3, 0, 1, 10, 0, 34, 0, 0, 0]
+        );
+        assert_eq!(Ucs2LeVec::from(text.to_owned()), owned);
+        assert_eq!(format!("{owned}"), text);
+        assert_eq!(format!("{}", owned.as_ref()), text);
+        assert_eq!(format!("{owned:?}"), format!("{text:?}"));
+        assert_eq!(format!("{:?}", owned.as_ref()), format!("{text:?}"));
+        let empty = Ucs2LeVec::default();
+        let empty_slice: &Ucs2LeSlice = Default::default();
+        assert_eq!(empty.as_bytes(), &[0, 0]);
+        assert_eq!(empty.as_ref(), empty_slice);
+        assert_eq!(empty.as_bytes_without_nul(), &[]);
+        assert_eq!(empty.to_string(), "");
+        assert_eq!(empty_slice.to_ucs2_le_vec().into_inner(), vec![0, 0]);
+    }
+
+    // Test: Feed owned parsing an empty, unterminated, or odd-length byte buffer.
+    // Expected: Owned construction preserves the precise structural error, including rejecting odd trailing bytes after an apparent terminator.
+    #[test]
+    fn owned_parsing_preserves_structural_errors() {
+        for bytes in [vec![], vec![65, 0]] {
+            assert!(matches!(
+                Ucs2LeVec::from_vec_with_nul(bytes),
+                Err(Ucs2ParseError::MissingNullTerm)
+            ));
+        }
+        for bytes in [vec![0], vec![0, 0, 1]] {
+            assert!(matches!(
+                Ucs2LeVec::from_vec_with_nul(bytes),
+                Err(Ucs2ParseError::NotMultiple2)
+            ));
+        }
+    }
 
     fn str_to_utf16_buf(s: &str) -> Vec<u8> {
         // TODO: This _technically_ incorrect, and will result in wonky behavior
