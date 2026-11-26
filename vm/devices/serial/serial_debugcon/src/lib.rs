@@ -201,3 +201,6 @@ mod save_restore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
