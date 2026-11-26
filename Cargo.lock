@@ -10039,6 +10039,7 @@ name = "vhd1_defs"
 version = "0.0.0"
 dependencies = [
  "guid",
+ "test_with_tracing",
  "zerocopy",
 ]
 
