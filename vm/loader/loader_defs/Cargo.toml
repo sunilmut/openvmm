@@ -25,5 +25,8 @@ zerocopy.workspace = true
 # Optional, feature-gated.
 inspect = { workspace = true, optional = true }
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
