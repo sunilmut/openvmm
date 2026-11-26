@@ -107,3 +107,88 @@ where
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Read byte ranges spanning each initial lane and both partial/full trailing words.
+    // Expected: Output equals the selected native-endian byte range; each intersecting aligned register is read exactly once and output guards survive.
+    #[test]
+    fn reads_select_exact_lanes_and_visit_only_intersecting_registers() {
+        let registers: [u8; 32] = std::array::from_fn(|index| (index as u8).wrapping_mul(7));
+        for offset in 0u16..8 {
+            for length in 1..=13 {
+                let mut output = [0xcc; 15];
+                let mut reads = Vec::new();
+                read_as_u32_chunks(offset, &mut output[1..1 + length], |address| {
+                    reads.push(address);
+                    let start = usize::from(address);
+                    u32::from_ne_bytes(registers[start..start + 4].try_into().unwrap())
+                });
+                let start = usize::from(offset);
+                assert_eq!(&output[1..1 + length], &registers[start..start + length]);
+                assert_eq!(output[0], 0xcc);
+                assert!(output[1 + length..].iter().all(|byte| *byte == 0xcc));
+                let expected: Vec<_> = (0u16..32)
+                    .step_by(4)
+                    .filter(|address| {
+                        usize::from(*address) < start + length && usize::from(*address) + 4 > start
+                    })
+                    .collect();
+                assert_eq!(reads, expected);
+            }
+        }
+        read_as_u32_chunks(4u16, &mut [], |_| {
+            panic!("aligned empty read accessed a register")
+        });
+    }
+
+    // Test: Write all byte lanes and lengths spanning multiple registers.
+    // Expected: Only the requested bytes change, partial words use read-then-write, and complete words are written without a read.
+    #[test]
+    fn writes_preserve_neighbor_bytes_and_avoid_reads_for_full_words() {
+        for offset in 0u32..8 {
+            for length in 1..=13 {
+                let mut registers: [u8; 32] = std::array::from_fn(|index| index as u8);
+                let mut expected = registers;
+                let payload: Vec<u8> = (0..length).map(|index| 0xf0 - index as u8).collect();
+                let start = offset as usize;
+                expected[start..start + length].copy_from_slice(&payload);
+                let mut operations = Vec::new();
+                write_as_u32_chunks(offset, &payload, |address, request| {
+                    let start = address as usize;
+                    match request {
+                        ReadWriteRequestType::Read => {
+                            operations.push((address, false));
+                            Some(u32::from_ne_bytes(
+                                registers[start..start + 4].try_into().unwrap(),
+                            ))
+                        }
+                        ReadWriteRequestType::Write(value) => {
+                            operations.push((address, true));
+                            registers[start..start + 4].copy_from_slice(&value.to_ne_bytes());
+                            None
+                        }
+                    }
+                });
+                assert_eq!(registers, expected);
+                let mut expected_operations = Vec::new();
+                for address in (0u32..32).step_by(4) {
+                    let word_start = address as usize;
+                    if word_start < start + length && word_start + 4 > start {
+                        if word_start < start || word_start + 4 > start + length {
+                            expected_operations.push((address, false));
+                        }
+                        expected_operations.push((address, true));
+                    }
+                }
+                assert_eq!(operations, expected_operations);
+            }
+        }
+        write_as_u32_chunks(4u32, &[], |_, _| {
+            panic!("aligned empty write accessed a register")
+        });
+    }
+}
