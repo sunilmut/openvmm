@@ -86,3 +86,140 @@ pub fn init() -> bool {
     println!("cargo:rustc-cfg=minimal_rt");
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use std::process::Command;
+    use std::process::Output;
+    use test_with_tracing::test;
+
+    fn run_build(build: Option<&str>, arch: Option<&str>, target: Option<&str>) -> Output {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "tests::build_script_fixture",
+            "--ignored",
+            "--nocapture",
+        ]);
+        for (key, value) in [
+            ("MINIMAL_RT_BUILD", build),
+            // xtask-fmt allow-target-arch sys-crate
+            ("CARGO_CFG_TARGET_ARCH", arch),
+            ("TARGET", target),
+        ] {
+            command.env_remove(key);
+            if let Some(value) = value {
+                command.env(key, value);
+            }
+        }
+        command.output().unwrap()
+    }
+
+    fn directives(output: &Output) -> Vec<String> {
+        String::from_utf8(output.stdout.clone())
+            .unwrap()
+            .lines()
+            .filter(|line| line.starts_with("cargo:"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    // Test: Invoke the real build initializer in an isolated child environment.
+    // Expected: Its returned build mode and Cargo directives reach the parent;
+    //       this fixture is not independently selected during ordinary test runs.
+    #[test]
+    #[ignore = "subprocess fixture for build environment tests, not a product regression"]
+    fn build_script_fixture() {
+        println!("build-enabled={}", super::init());
+    }
+
+    // Test: Leave the build switch unset or empty without Cargo target metadata.
+    // Expected: Initialization remains a stub build and emits only cfg validation
+    //       and environment-change tracking, without consulting absent target variables.
+    #[test]
+    fn absent_or_empty_switch_is_a_stub_build() {
+        for build in [None, Some("")] {
+            let output = run_build(build, None, None);
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                directives(&output),
+                [
+                    "cargo:rustc-check-cfg=cfg(minimal_rt)",
+                    "cargo:rerun-if-env-changed=MINIMAL_RT_BUILD",
+                ]
+            );
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .contains("build-enabled=false")
+            );
+        }
+    }
+
+    // Test: Enable each supported architecture/target combination in child processes.
+    // Expected: Only the ARM64 musl target receives static-PIE/no-start-files flags;
+    //       every supported target enables minimal_rt, even with switch text "0".
+    #[test]
+    fn supported_targets_emit_only_their_required_linker_flags() {
+        for (arch, target, linker_flags) in [
+            ("x86_64", "x86_64-unknown-none", false),
+            ("aarch64", "aarch64-minimal_rt-none", false),
+            ("aarch64", "aarch64-unknown-linux-musl", true),
+        ] {
+            let output = run_build(Some("0"), Some(arch), Some(target));
+            assert!(output.status.success(), "{output:?}");
+            let mut expected = vec![
+                "cargo:rustc-check-cfg=cfg(minimal_rt)",
+                "cargo:rerun-if-env-changed=MINIMAL_RT_BUILD",
+            ];
+            if linker_flags {
+                expected.extend([
+                    "cargo:rustc-link-arg=-nostartfiles",
+                    "cargo:rustc-link-arg=-static-pie",
+                ]);
+            }
+            expected.push("cargo:rustc-cfg=minimal_rt");
+            assert_eq!(directives(&output), expected);
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .contains("build-enabled=true")
+            );
+        }
+    }
+
+    // Test: Request unsupported architectures and incompatible target triples.
+    // Expected: Build initialization fails with actionable diagnostics and does
+    //       not emit the minimal_rt cfg or linker flags for an unsupported target.
+    #[test]
+    fn unsupported_targets_fail_without_enabling_minimal_rt() {
+        for (arch, target, diagnostic) in [
+            ("x86_64", "x86_64-unknown-linux-musl", "x86_64-unknown-none"),
+            (
+                "aarch64",
+                "aarch64-unknown-none",
+                "aarch64-unknown-linux-musl",
+            ),
+            (
+                "riscv64",
+                "riscv64gc-unknown-none-elf",
+                "unsupported arch riscv64",
+            ),
+        ] {
+            let output = run_build(Some("yes"), Some(arch), Some(target));
+            assert!(!output.status.success());
+            assert!(
+                std::str::from_utf8(&output.stderr)
+                    .unwrap()
+                    .contains(diagnostic)
+            );
+            assert_eq!(
+                directives(&output),
+                [
+                    "cargo:rustc-check-cfg=cfg(minimal_rt)",
+                    "cargo:rerun-if-env-changed=MINIMAL_RT_BUILD",
+                ]
+            );
+        }
+    }
+}

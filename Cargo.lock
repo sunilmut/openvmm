@@ -4983,6 +4983,9 @@ dependencies = [
 [[package]]
 name = "minimal_rt_build"
 version = "0.0.0"
+dependencies = [
+ "test_with_tracing",
+]
 
 [[package]]
 name = "minimal_rt_reloc"
