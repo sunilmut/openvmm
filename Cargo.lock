@@ -4237,6 +4237,7 @@ name = "ipmi_protocol"
 version = "0.0.0"
 dependencies = [
  "static_assertions",
+ "test_with_tracing",
  "zerocopy",
 ]
 

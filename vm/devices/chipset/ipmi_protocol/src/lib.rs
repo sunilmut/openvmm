@@ -390,13 +390,22 @@ const_assert_eq!(size_of::<SetSelTimeRequest>(), 4);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
 
+    // Test: Serialize both public creation modes for the virtual BMC identity.
+    // Expected: Both advertise IPMI 2.0 and SEL support in the same wire response,
+    //       rather than exposing a zero-initialized unsupported identity.
     #[test]
     fn get_device_id_wire_layout() {
-        assert_eq!(
-            GetDeviceIdResponse::virtual_bmc().as_bytes(),
-            [0x00, 0x20, 0x01, 0x02, 0x00, 0x02, 0x04, 0, 0, 0, 0, 0]
-        );
+        for response in [
+            GetDeviceIdResponse::virtual_bmc(),
+            GetDeviceIdResponse::default(),
+        ] {
+            assert_eq!(
+                response.as_bytes(),
+                [0x00, 0x20, 0x01, 0x02, 0x00, 0x02, 0x04, 0, 0, 0, 0, 0]
+            );
+        }
     }
 
     #[test]
@@ -502,5 +511,28 @@ mod tests {
             .as_bytes(),
             [0x78, 0x56, 0x34, 0x12]
         );
+    }
+
+    // Test: Form error replies for requests with every LUN, including unknown
+    //       network functions and unsupported command bytes.
+    // Expected: The response network function changes without losing the LUN
+    //       or command, and the selected completion code follows the header.
+    #[test]
+    fn error_response_wire_preserves_lun_and_command() {
+        for (request_bytes, netfn, expected_reply) in [
+            ([0x18, 0xff], 0x06, [0x1c, 0xff, 0xc1]),
+            ([0x29, 0xfe], 0x0a, [0x2d, 0xfe, 0xc1]),
+            ([0xfa, 0xfd], 0x3e, [0xfe, 0xfd, 0xc1]),
+            ([0xfb, 0xfc], 0x3e, [0xff, 0xfc, 0xc1]),
+        ] {
+            let request = MessageHeader::read_from_bytes(&request_bytes).unwrap();
+            assert_eq!(request.netfn(), netfn);
+            let header = request.response();
+            let completion = CompletionResponse::new(COMPLETION_INVALID_COMMAND);
+            let mut reply = [0; 3];
+            reply[..2].copy_from_slice(header.as_bytes());
+            reply[2..].copy_from_slice(completion.as_bytes());
+            assert_eq!(reply, expected_reply);
+        }
     }
 }
