@@ -222,4 +222,44 @@ mod tests {
         assert!(tables.len() <= SNP_BOOT_SHIM_ACPI_SIZE as usize);
         assert_eq!(xsdt_entries(&rsdp, &tables).len(), 5);
     }
+
+    // Test: Build guest-visible ACPI in RAM above the 32-bit physical boundary.
+    // Expected: Both RSDP checksums and all referenced table checksums remain
+    //       valid, with full-width XSDT and FADT DSDT addresses inside the arena.
+    #[test]
+    fn relocated_acpi_keeps_full_width_guest_addresses() {
+        let dt = device_tree([true; 4], &[bridge(0)]);
+        let mut devices = crate::host_dt::read(&dt, RAM_END, C_BIT).unwrap();
+        devices.ram.push(acpi::minimal::Ram {
+            range: memory_range::MemoryRange::new(0x1_0000_0000..0x1_0100_0000),
+            vnode: 0,
+        });
+        let output = 0x1_0020_0000;
+        let (rsdp_bytes, tables) = build(&devices, output);
+        for bytes in [&rsdp_bytes[..20], rsdp_bytes.as_slice()] {
+            assert_eq!(bytes.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)), 0);
+        }
+        let guest_table = |address: u64| {
+            assert!(address > u64::from(u32::MAX));
+            let offset = usize::try_from(address.checked_sub(output).unwrap()).unwrap();
+            let bytes = &tables[offset..];
+            let (header, _) = acpi_spec::Header::read_from_prefix(bytes).unwrap();
+            let bytes = &bytes[..header.length.get() as usize];
+            assert_eq!(bytes.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)), 0);
+            bytes
+        };
+        let rsdp = acpi_spec::Rsdp::read_from_bytes(&rsdp_bytes).unwrap();
+        let xsdt = guest_table(rsdp.xsdt);
+        assert_eq!(&xsdt[..4], b"XSDT");
+        let entries = xsdt[HEADER_SIZE..]
+            .chunks_exact(8)
+            .map(|entry| guest_table(le64(entry)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries.iter().map(|table| &table[..4]).collect::<Vec<_>>(),
+            [b"FACP", b"APIC", b"SRAT", b"MCFG", b"SSDT"]
+        );
+        let dsdt = guest_table(le64(&entries[0][140..148]));
+        assert_eq!(&dsdt[..4], b"DSDT");
+    }
 }
