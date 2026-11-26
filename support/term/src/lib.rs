@@ -179,3 +179,68 @@ pub fn open_pty() -> std::io::Result<(std::fs::File, std::fs::File)> {
 
     Ok((primary, secondary))
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::io::Write;
+    use std::os::unix::io::AsRawFd;
+    use test_with_tracing::test;
+
+    // Test: Exchange lines through a newly allocated PTY pair.
+    // Expected: The unlocked secondary receives primary input; primary sees
+    //       canonical echo and secondary output with terminal newline mapping.
+    #[test]
+    fn pty_bidirectional_lines() {
+        let (mut primary, mut secondary) = open_pty().unwrap();
+        primary.write_all(b"hello from primary\n").unwrap();
+        let mut input = [0; 19];
+        secondary.read_exact(&mut input).unwrap();
+        assert_eq!(&input, b"hello from primary\n");
+        let mut echo = [0; 20];
+        primary.read_exact(&mut echo).unwrap();
+        assert_eq!(&echo, b"hello from primary\r\n");
+        secondary.write_all(b"secondary reply\n").unwrap();
+        let mut reply = [0; 17];
+        primary.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"secondary reply\r\n");
+    }
+
+    // Test: Allocate two PTY pairs while both are live, then release one.
+    // Expected: Each secondary has a distinct device identity; dropping one
+    //       pair does not close or redirect the other pair's data stream.
+    #[test]
+    fn independent_pty_lifetimes() {
+        let first = open_pty().unwrap();
+        let (mut primary, mut secondary) = open_pty().unwrap();
+        let first_path =
+            std::fs::read_link(format!("/proc/self/fd/{}", first.1.as_raw_fd())).unwrap();
+        let second_path =
+            std::fs::read_link(format!("/proc/self/fd/{}", secondary.as_raw_fd())).unwrap();
+        assert_ne!(first_path, second_path);
+        drop(first);
+        secondary.write_all(b"still connected\n").unwrap();
+        let mut output = [0; 17];
+        primary.read_exact(&mut output).unwrap();
+        assert_eq!(&output, b"still connected\r\n");
+    }
+
+    // Test: Inspect OS-visible descriptor flags of both returned PTY files.
+    // Expected: Both descriptors are close-on-exec, preserving the documented
+    //       no-leak contract for consumers launching child processes.
+    #[test]
+    fn pty_descriptors_are_close_on_exec() {
+        let (primary, secondary) = open_pty().unwrap();
+        for file in [primary, secondary] {
+            let info =
+                std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd())).unwrap();
+            let flags = info
+                .lines()
+                .find_map(|line| line.strip_prefix("flags:\t"))
+                .unwrap();
+            let flags = u32::from_str_radix(flags, 8).unwrap();
+            assert_ne!(flags & libc::O_CLOEXEC as u32, 0, "{info}");
+        }
+    }
+}

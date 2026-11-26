@@ -8764,6 +8764,7 @@ name = "term"
 version = "0.0.0"
 dependencies = [
  "libc",
+ "test_with_tracing",
  "windows-sys 0.61.0",
 ]
 
