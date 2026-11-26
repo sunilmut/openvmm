@@ -9405,6 +9405,7 @@ dependencies = [
  "inspect",
  "open_enum",
  "static_assertions",
+ "test_with_tracing",
  "ucs2 0.0.0",
  "wchar",
  "zerocopy",

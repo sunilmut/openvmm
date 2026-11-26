@@ -24,6 +24,7 @@ static_assertions.workspace = true
 wchar = { workspace = true, optional = true }
 zerocopy.workspace = true
 [dev-dependencies]
+test_with_tracing.workspace = true
 
 [lints]
 workspace = true
