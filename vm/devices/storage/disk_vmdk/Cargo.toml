@@ -30,6 +30,8 @@ pal_async.workspace = true
 storage_tests.workspace = true
 tempfile.workspace = true
 test_with_tracing.workspace = true
+mesh.workspace = true
+vmcore.workspace = true
 
 [lints]
 workspace = true
