@@ -93,3 +93,6 @@ pub fn init_with_level(log_level: &str) -> Result<(), log::SetLoggerError> {
     log::set_boxed_logger(Box::new(AdoLogger::new(Some(log_level))))
         .map(|()| log::set_max_level(log::LevelFilter::Trace))
 }
+
+#[cfg(test)]
+mod tests;

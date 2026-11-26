@@ -753,6 +753,7 @@ version = "0.0.0"
 dependencies = [
  "env_logger",
  "log",
+ "test_with_tracing",
 ]
 
 [[package]]
