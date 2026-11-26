@@ -26,5 +26,8 @@ features = [
     "Win32_Networking_WinSock",
 ]
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

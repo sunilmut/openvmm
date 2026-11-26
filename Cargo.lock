@@ -11493,6 +11493,7 @@ dependencies = [
  "mesh",
  "pal_async",
  "socket2",
+ "test_with_tracing",
  "windows-sys 0.61.0",
 ]
 

@@ -276,3 +276,156 @@ impl Write for &'_ VmStream {
         (&self.0).flush()
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::VmAddress;
+    use super::VmSocket;
+    use super::VmStream;
+    use socket2::SockAddr;
+    use socket2::Socket;
+    use std::io::Read;
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    use std::os::fd::AsRawFd;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+    use test_with_tracing::test;
+
+    // Test: Round-trip arbitrary VSOCK CID/port boundaries, host/any shortcuts, and unrelated socket families.
+    // Expected: IDs, ports, and decimal display are exact; only VSOCK addresses are accepted.
+    #[test]
+    fn vsock_address_identity_and_family_validation() {
+        for (cid, port, display) in [
+            (0, 0, "0:0"),
+            (2, 1, "2:1"),
+            (u32::MAX, u32::MAX, "4294967295:4294967295"),
+            (0x1234_5678, 0x8765_4321, "305419896:2271560481"),
+        ] {
+            let address = VmAddress::vsock(cid, port);
+            assert_eq!(address.to_string(), display);
+            assert_eq!(address.cid(), cid);
+            assert_eq!(address.port(), port);
+            let raw: SockAddr = address.into();
+            let restored = VmAddress::try_from_sock_addr(&raw).unwrap();
+            assert_eq!((restored.cid(), restored.port()), (cid, port));
+        }
+        for port in [0, 42, u32::MAX] {
+            let any = VmAddress::vsock_any(port);
+            assert_eq!((any.cid(), any.port()), (u32::MAX, port));
+            let host = VmAddress::vsock_host(port);
+            assert_eq!((host.cid(), host.port()), (2, port));
+        }
+        for address in [
+            SockAddr::from("127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap()),
+            SockAddr::from("[::1]:1234".parse::<std::net::SocketAddr>().unwrap()),
+            SockAddr::unix("/unbound-vmsocket-test").unwrap(),
+        ] {
+            assert!(VmAddress::try_from_sock_addr(&address).is_none());
+        }
+    }
+
+    // Test: Transfer binary data through shared/mutable VM stream wrappers and descriptor/clone conversions using a Unix socket pair.
+    // Expected: Read/write/flush delegation preserves exact bytes, and surviving clones remain connected after original owners are dropped.
+    #[test]
+    fn stream_io_and_descriptor_ownership_preserve_binary_data() {
+        let (local, mut peer) = UnixStream::pair().unwrap();
+        local
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let stream = VmStream::from(Socket::from(local));
+        let mut shared = &stream;
+        shared.write_all(&[0, 0x11, 0xff]).unwrap();
+        shared.flush().unwrap();
+        let mut received = [0; 3];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, [0, 0x11, 0xff]);
+        peer.write_all(&[0xaa, 0, 0x55]).unwrap();
+        shared.read_exact(&mut received).unwrap();
+        assert_eq!(received, [0xaa, 0, 0x55]);
+
+        let descriptor_number = stream.as_fd().as_raw_fd();
+        let descriptor: OwnedFd = stream.into();
+        assert_eq!(descriptor.as_raw_fd(), descriptor_number);
+        let restored = VmStream::from(descriptor);
+        let mut cloned = restored.try_clone().unwrap();
+        drop(restored);
+        cloned.write_all(&[3, 2, 1]).unwrap();
+        cloned.flush().unwrap();
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, [3, 2, 1]);
+        peer.write_all(&[6, 5, 4]).unwrap();
+        cloned.read_exact(&mut received).unwrap();
+        assert_eq!(received, [6, 5, 4]);
+        let socket: Socket = cloned.into();
+        let mut restored = VmStream::from(socket);
+        peer.write_all(&[9, 8, 7]).unwrap();
+        restored.read_exact(&mut received).unwrap();
+        assert_eq!(received, [9, 8, 7]);
+    }
+
+    // Test: Pass an unrepresentable connect timeout through an owned descriptor round-trip.
+    // Expected: Validation returns InvalidInput before the platform socket option and leaves the descriptor alive.
+    #[test]
+    fn oversized_connect_timeout_returns_error_without_losing_socket() {
+        let (local, peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let socket = VmSocket::from(Socket::from(local));
+        let descriptor_number = socket.as_fd().as_raw_fd();
+        let descriptor: OwnedFd = socket.into();
+        let socket = VmSocket::from(descriptor);
+        assert!(
+            socket
+                .set_connect_timeout(Duration::from_micros(42))
+                .is_err()
+        );
+        let error = socket.set_connect_timeout(Duration::MAX).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(socket.as_fd().as_raw_fd(), descriptor_number);
+        let mut underlying: Socket = socket.into();
+        underlying.write_all(&[0x7f]).unwrap();
+        let mut peer = peer;
+        let mut received = [0];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, [0x7f]);
+    }
+
+    // Test: Bind/listen on an ephemeral VSOCK port and round-trip listener descriptors without contacting a VM.
+    // Expected: Local address identity survives descriptor ownership transfers, and connect timeout configuration accepts a representable duration.
+    #[test]
+    #[ignore = "requires an enabled Linux AF_VSOCK transport"]
+    fn native_vsock_bind_and_listener_descriptor_ownership() {
+        use super::VmListener;
+
+        let mut socket = VmSocket::new().unwrap();
+        socket
+            .set_connect_timeout(Duration::from_millis(1500))
+            .unwrap();
+        socket.bind(VmAddress::vsock_any(u32::MAX)).unwrap();
+        let listener = socket.listen(4).unwrap();
+        let address = listener.local_addr().unwrap();
+        assert_eq!(address.cid(), u32::MAX);
+        assert_ne!(address.port(), u32::MAX);
+        let reported = pal_async::socket::Listener::local_addr(&listener).unwrap();
+        assert_eq!(
+            (reported.cid(), reported.port()),
+            (address.cid(), address.port())
+        );
+        let borrowed = listener.as_fd().try_clone_to_owned().unwrap();
+        let cloned = VmListener::from(borrowed);
+        drop(listener);
+        let descriptor: OwnedFd = cloned.into();
+        let restored = VmListener::from(descriptor);
+        let raw: Socket = restored.into();
+        let restored = VmListener::from(raw);
+        let reported = restored.local_addr().unwrap();
+        assert_eq!(
+            (reported.cid(), reported.port()),
+            (address.cid(), address.port())
+        );
+        let another = VmListener::bind(VmAddress::vsock_any(u32::MAX)).unwrap();
+        assert_ne!(another.local_addr().unwrap().port(), address.port());
+    }
+}
