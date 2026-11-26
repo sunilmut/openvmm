@@ -10,5 +10,9 @@ rust-version.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+parking_lot.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

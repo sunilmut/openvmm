@@ -1225,6 +1225,8 @@ dependencies = [
 name = "cvm_tracing"
 version = "0.0.0"
 dependencies = [
+ "parking_lot",
+ "test_with_tracing",
  "tracing",
  "tracing-subscriber",
 ]
