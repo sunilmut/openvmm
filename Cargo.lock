@@ -1662,6 +1662,7 @@ dependencies = [
  "pal_async",
  "scsi_buffers",
  "storage_tests",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "vmgs",
  "vmgs_broker",

@@ -21,6 +21,7 @@ thiserror.workspace = true
 guest_emulation_transport = { workspace = true, features = ["test_utilities"] }
 pal_async.workspace = true
 storage_tests.workspace = true
+test_with_tracing.workspace = true
 vmgs = { workspace = true, features = ["encryption"] }
 vmgs_broker.workspace = true
 

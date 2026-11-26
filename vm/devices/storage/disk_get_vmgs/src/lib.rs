@@ -282,9 +282,12 @@ mod tests {
     use guest_emulation_transport::api::ProtocolVersion;
     use guest_emulation_transport::test_utilities::TestGet;
     use guest_emulation_transport::test_utilities::new_transport_pair;
+    use guestmem::GuestMemory;
     use pal_async::DefaultDriver;
     use pal_async::async_test;
     use pal_async::task::Task;
+    use scsi_buffers::OwnedRequestBuffers;
+    use test_with_tracing::test;
     use vmgs::FileId;
     use vmgs::Vmgs;
     use vmgs_broker::VmgsClient;
@@ -452,5 +455,91 @@ mod tests {
         let read_buf = vmgs.read_file(file_id).await.unwrap();
 
         assert_eq!(buf, read_buf);
+    }
+
+    // Test: Serialize saved disk metadata, restore the disk on its original
+    //       transport, and read written sectors after an ignored unmap.
+    // Expected: Restored geometry matches the original disk and its persisted
+    //       bytes survive restore, flush and the advertised no-op unmap.
+    #[async_test]
+    async fn restored_disk_preserves_geometry_and_data(driver: DefaultDriver) {
+        let get = new_transport_pair(&driver, None, ProtocolVersion::NICKEL_REV2, None, None).await;
+        let original = GetVmgsDisk::new(get.client.clone()).await.unwrap();
+        let bytes = mesh::payload::encode(original.save_meta());
+        let original = Disk::new(original).unwrap();
+        let len = 2 * original.sector_size() as usize;
+        let mem = GuestMemory::allocate(len);
+        let data = vec![0x71; len];
+        mem.write_at(0, &data).unwrap();
+        original
+            .write_vectored(
+                &OwnedRequestBuffers::linear(0, len, false).buffer(&mem),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+        let meta = mesh::payload::decode(&bytes).unwrap();
+        let restored = GetVmgsDisk::restore_with_meta(get.client.clone(), meta).unwrap();
+        let restored = Disk::new(restored).unwrap();
+        assert_eq!(restored.sector_size(), original.sector_size());
+        assert_eq!(
+            restored.physical_sector_size(),
+            original.physical_sector_size()
+        );
+        assert_eq!(restored.sector_count(), original.sector_count());
+        restored.sync_cache().await.unwrap();
+        restored.unmap(1, 2, false).await.unwrap();
+        mem.write_at(0, &vec![0; len]).unwrap();
+        restored
+            .read_vectored(&OwnedRequestBuffers::linear(0, len, true).buffer(&mem), 1)
+            .await
+            .unwrap();
+        let mut actual = vec![0; len];
+        mem.read_at(0, &mut actual).unwrap();
+        assert_eq!(actual, data);
+    }
+
+    // Test: Restore metadata with invalid logical/physical sector sizes,
+    //       overflowing capacity, a partial physical sector or a short transfer.
+    // Expected: Each malformed geometry is rejected with its specific public
+    //       error instead of creating an unusable disk.
+    #[async_test]
+    async fn restore_rejects_invalid_geometry(driver: DefaultDriver) {
+        use NewGetVmgsDiskError::*;
+
+        let get = new_transport_pair(&driver, None, ProtocolVersion::NICKEL_REV2, None, None).await;
+        let base = GetVmgsDisk::new(get.client.clone())
+            .await
+            .unwrap()
+            .save_meta();
+        for (logical, physical, count, maximum, expected) in [
+            (0, 512, 8, 4096, InvalidSectorSize),
+            (513, 512, 8, 4096, InvalidSectorSize),
+            (512, 256, 8, 4096, InvalidPhysicalSectorSize),
+            (512, 768, 8, 4096, InvalidPhysicalSectorSize),
+            (512, 512, u64::MAX, 4096, InvalidSectorCount),
+            (512, 4096, 9, 4096, IncompletePhysicalSector),
+            (512, 4096, 8, 4095, InvalidMaxTransferSize),
+        ] {
+            let mut meta = base.clone();
+            meta.sector_size = logical;
+            meta.logical_sector_size = logical;
+            meta.physical_sector_size = physical;
+            meta.sector_count = count;
+            meta.max_transfer_size_bytes = maximum;
+            let error = GetVmgsDisk::restore_with_meta(get.client.clone(), meta).unwrap_err();
+            assert!(
+                matches!(
+                    (&error, &expected),
+                    (InvalidSectorSize, InvalidSectorSize)
+                        | (InvalidPhysicalSectorSize, InvalidPhysicalSectorSize)
+                        | (InvalidSectorCount, InvalidSectorCount)
+                        | (IncompletePhysicalSector, IncompletePhysicalSector)
+                        | (InvalidMaxTransferSize, InvalidMaxTransferSize)
+                ),
+                "actual: {error:?}, expected: {expected:?}"
+            );
+        }
     }
 }
