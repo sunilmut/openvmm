@@ -12,5 +12,9 @@ guid.workspace = true
 fs-err.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

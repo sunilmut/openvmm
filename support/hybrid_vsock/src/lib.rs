@@ -242,3 +242,113 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Parse boundary ports and GUID requests, then write bounded replies.
+    // Expected: The request's numeric/GUID form survives the handshake, with
+    //       canonical reply bytes and no writes outside the response.
+    #[test]
+    fn handshake_preserves_address_form_and_reply_bounds() {
+        for (request, expected, port) in [
+            ("CoNnEcT 0", "OK 0\n", Some(0)),
+            ("CONNECT 4294967295", "OK 4294967295\n", Some(u32::MAX)),
+            (
+                "CONNECT ffffffff-facb-11e6-bd58-64006a7986d3",
+                "OK ffffffff-facb-11e6-bd58-64006a7986d3\n",
+                Some(u32::MAX),
+            ),
+            (
+                "CONNECT 12345678-9abc-def0-1234-56789abcdef0",
+                "OK 12345678-9abc-def0-1234-56789abcdef0\n",
+                None,
+            ),
+        ] {
+            let parsed = VsockPortOrId::parse_connect_request(request.as_bytes()).unwrap();
+            assert_eq!(parsed.port(), port);
+            assert_eq!(parsed.get_ok_response(), expected);
+            let mut output = [0xa5; 64];
+            let len = parsed.write_ok_response(&mut output[3..3 + expected.len()]);
+            assert_eq!(len, expected.len());
+            assert_eq!(&output[3..3 + len], expected.as_bytes());
+            assert!(
+                output[..3]
+                    .iter()
+                    .chain(&output[3 + len..])
+                    .all(|byte| *byte == 0xa5)
+            );
+        }
+    }
+
+    // Test: Select host listener paths with both numeric and GUID candidates.
+    // Expected: Embedded ports prefer the numeric listener, fall back to the
+    //       full ID, and report the exact missing candidate when neither exists.
+    #[test]
+    fn listener_selection_preserves_port_priority_and_guid_fallback() {
+        let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let base = directory.path().join("relay");
+        let port_path = directory.path().join("relay_291");
+        let guid_path = directory
+            .path()
+            .join("relay_00000123-facb-11e6-bd58-64006a7986d3");
+        std::fs::write(&guid_path, []).unwrap();
+        for request in [
+            VsockPortOrId::Port(291),
+            VsockPortOrId::Id(guid::guid!("00000123-facb-11e6-bd58-64006a7986d3")),
+        ] {
+            assert_eq!(request.host_uds_path(&base).unwrap(), guid_path);
+            std::fs::write(&port_path, []).unwrap();
+            assert_eq!(request.host_uds_path(&base).unwrap(), port_path);
+            std::fs::remove_file(&port_path).unwrap();
+        }
+        std::fs::remove_file(&guid_path).unwrap();
+        assert!(matches!(VsockPortOrId::Port(291).host_uds_path(&base),
+            Err(UdsPathError::NoListener(path)) if path == guid_path));
+        let custom = VsockPortOrId::Id(guid::guid!("01234567-89ab-cdef-0123-456789abcdef"));
+        let custom_path = directory
+            .path()
+            .join("relay_01234567-89ab-cdef-0123-456789abcdef");
+        std::fs::write(&custom_path, []).unwrap();
+        std::fs::write(&port_path, []).unwrap();
+        assert_eq!(custom.host_uds_path(&base).unwrap(), custom_path);
+    }
+
+    // Test: Reject incomplete prefixes, malformed numbers/IDs and invalid UTF-8.
+    // Expected: Protocol errors retain their category rather than admitting
+    //       truncated, overflowing or non-address payloads.
+    #[test]
+    fn malformed_handshakes_return_typed_errors() {
+        for request in [
+            b"".as_slice(),
+            b"CONNEC",
+            b"CONNECT",
+            b"OTHER 7",
+            b"CONNECT\t7",
+        ] {
+            assert!(matches!(
+                VsockPortOrId::parse_connect_request(request),
+                Err(ParseError::MissingPrefix)
+            ));
+        }
+        for request in [
+            "CONNECT ",
+            "CONNECT -1",
+            "CONNECT 4294967296",
+            "CONNECT 12x",
+            "CONNECT not-a-guid",
+            "CONNECT 7 8",
+        ] {
+            assert!(matches!(
+                VsockPortOrId::parse_connect_request(request.as_bytes()),
+                Err(ParseError::InvalidFormat(_))
+            ));
+        }
+        assert!(matches!(
+            VsockPortOrId::parse_connect_request(b"CONNECT \xff"),
+            Err(ParseError::InvalidString(_))
+        ));
+    }
+}
