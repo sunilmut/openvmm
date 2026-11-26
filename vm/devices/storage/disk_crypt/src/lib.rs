@@ -196,8 +196,10 @@ mod tests {
     use crate::CryptDisk;
     use disk_backend::Disk;
     use guestmem::GuestMemory;
+    use guestmem::MemoryWrite;
     use pal_async::async_test;
     use scsi_buffers::OwnedRequestBuffers;
+    use test_with_tracing::test;
 
     const CONFORMANCE_DISK_SIZE: u64 = 1024 * 1024;
 
@@ -245,5 +247,117 @@ mod tests {
         mem.inner_buf_mut().unwrap().fill(0);
         disk.read_vectored(&buffers.buffer(&mem), 10).await.unwrap();
         assert_eq!(mem.inner_buf_mut().unwrap(), &pattern);
+    }
+
+    // Test: Encrypt repeated plaintext sectors through discontiguous guest
+    //       pages, then read the ciphertext and each plaintext sector separately.
+    // Expected: Writes preserve guest data/guards, equal plaintext at different
+    //       LBAs has distinct ciphertext, and separate reads use matching tweaks.
+    #[async_test]
+    async fn scattered_writes_preserve_source_and_sector_tweaks() {
+        let inner = disklayer_ram::ram_disk(0x200000, false).unwrap();
+        let key = [[0x17; 32], [0x93; 32]];
+        let disk = Disk::new(
+            CryptDisk::new(
+                disk_crypt_resources::Cipher::XtsAes256,
+                key.as_flattened(),
+                inner.clone(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut memory = GuestMemory::allocate(4 * 4096);
+        memory.inner_buf_mut().unwrap().fill(0xa6);
+        let buffers = OwnedRequestBuffers::new_unaligned(&[2, 0], 4096 - 256, 1024);
+        buffers
+            .buffer(&memory)
+            .writer()
+            .write(&[0x5d; 1024])
+            .unwrap();
+        let before = memory.inner_buf_mut().unwrap().to_vec();
+        disk.write_vectored(&buffers.buffer(&memory), 37, true)
+            .await
+            .unwrap();
+        assert_eq!(memory.inner_buf_mut().unwrap(), before);
+        disk.sync_cache().await.unwrap();
+
+        let mut raw = GuestMemory::allocate(1024);
+        let raw_buffers = OwnedRequestBuffers::linear(0, 1024, true);
+        inner
+            .read_vectored(&raw_buffers.buffer(&raw), 37)
+            .await
+            .unwrap();
+        let ciphertext = raw.inner_buf_mut().unwrap();
+        assert_ne!(&ciphertext[..512], &[0x5d; 512]);
+        assert_ne!(&ciphertext[..512], &ciphertext[512..]);
+
+        for sector in [37, 38] {
+            let one_sector = OwnedRequestBuffers::linear(0, 512, true);
+            disk.read_vectored(&one_sector.buffer(&raw), sector)
+                .await
+                .unwrap();
+            assert_eq!(&raw.inner_buf_mut().unwrap()[..512], &[0x5d; 512]);
+        }
+    }
+
+    // Test: Discard one encrypted sector between two retained encrypted sectors.
+    // Expected: Discard reaches the backing disk without touching neighbors;
+    //       the encrypted view does not advertise zero-filled plaintext.
+    #[async_test]
+    async fn discard_preserves_neighboring_ciphertext() {
+        let inner = disklayer_ram::ram_disk(0x200000, false).unwrap();
+        let key = [[0x29; 32], [0xe3; 32]];
+        let disk = Disk::new(
+            CryptDisk::new(
+                disk_crypt_resources::Cipher::XtsAes256,
+                key.as_flattened(),
+                inner.clone(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut memory = GuestMemory::allocate(1536);
+        memory.inner_buf_mut().unwrap().fill(0x7b);
+        let buffers = OwnedRequestBuffers::linear(0, 1536, true);
+        disk.write_vectored(&buffers.buffer(&memory), 10, false)
+            .await
+            .unwrap();
+        inner
+            .read_vectored(&buffers.buffer(&memory), 10)
+            .await
+            .unwrap();
+        let before = memory.inner_buf_mut().unwrap().to_vec();
+        disk.unmap(11, 1, false).await.unwrap();
+        disk.sync_cache().await.unwrap();
+        inner
+            .read_vectored(&buffers.buffer(&memory), 10)
+            .await
+            .unwrap();
+        let after = memory.inner_buf_mut().unwrap();
+        assert_eq!(&after[..512], &before[..512]);
+        assert_eq!(&after[512..1024], &[0; 512]);
+        assert_eq!(&after[1024..], &before[1024..]);
+        assert_eq!(
+            disk.unmap_behavior(),
+            disk_backend::UnmapBehavior::Unspecified
+        );
+    }
+
+    // Test: Construct encrypted disks with truncated or oversized XTS key data.
+    // Expected: Invalid lengths return a typed error before using the backing
+    //       disk, including lengths adjacent to the required 64 bytes.
+    #[test]
+    fn rejects_invalid_key_lengths() {
+        let inner = disklayer_ram::ram_disk(0x200000, false).unwrap();
+        for length in [0, 1, 32, 63, 65, 128] {
+            assert!(matches!(
+                CryptDisk::new(
+                    disk_crypt_resources::Cipher::XtsAes256,
+                    &vec![0x31; length],
+                    inner.clone(),
+                ),
+                Err(crate::NewDiskError::InvalidKeySize)
+            ));
+        }
     }
 }

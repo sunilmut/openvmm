@@ -23,6 +23,7 @@ thiserror.workspace = true
 disklayer_ram.workspace = true
 pal_async.workspace = true
 storage_tests.workspace = true
+test_with_tracing.workspace = true
 
 [lints]
 workspace = true
