@@ -101,3 +101,6 @@ impl<const N: usize> FromStr for AsciiString<N> {
         Self::new(s)
     }
 }
+
+#[cfg(test)]
+mod tests;
