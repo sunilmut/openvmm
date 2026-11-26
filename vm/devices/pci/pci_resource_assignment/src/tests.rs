@@ -10,6 +10,7 @@ use memory_range::MemoryRange;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use test_with_tracing::test;
 
 /// Mock PCI config space: a flat map from (bus, device, function, offset) → u32.
 ///
@@ -2788,4 +2789,36 @@ async fn ari_cap_without_forwarding_does_not_skip_real_devices() {
         (0x1000_0000..0x2000_0000).contains(&dev1_bar),
         "device 1 BAR should be programmed into the aperture, got {dev1_bar:#x}"
     );
+}
+// Test: Enumerate a PF whose VF routing IDs collide with a sibling bridge bus.
+// Expected: Assignment rejects the conflict with the PF identity instead of
+//       publishing overlapping routes or enabling its memory decode.
+#[test]
+fn vf_bus_conflict_with_preceding_bridge_is_rejected() {
+    pal_async::DefaultPool::run_with(async |_| {
+        let mock = MockConfigSpace::new();
+        mock.add_bridge(0, 0, 0);
+        mock.add_endpoint(0, 1, 0, &[(0, 0x1000, false, false)]);
+        mock.add_sriov(0, 1, 0, 1, 0x100, 1);
+        let params = AssignmentParams {
+            start_bus: 0,
+            end_bus: 255,
+            low_mmio: MemoryRange::new(0x1000_0000..0x2000_0000),
+            high_mmio: MemoryRange::EMPTY,
+            preserve_bars: false,
+        };
+        let result = assign_pci_resources(&mut mock.clone(), &params).await;
+        assert!(matches!(
+            result,
+            Err(crate::AssignmentError::SriovBusConflict {
+                bus: 0,
+                device: 1,
+                function: 0,
+                max_vf_bus: 1,
+                next_bus: 2,
+            })
+        ));
+        assert_eq!(read_bus_numbers(&mock, 0, 0, 0), (0, 1, 1));
+        assert_eq!(mock.read_reg(0, 1, 0, 0x04) & 2, 0);
+    });
 }
