@@ -203,3 +203,6 @@ impl From<Resource<DiskLayerHandleKind>> for DiskLayerDescription {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

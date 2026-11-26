@@ -1520,6 +1520,8 @@ name = "disk_backend_resources"
 version = "0.0.0"
 dependencies = [
  "mesh",
+ "pal_async",
+ "test_with_tracing",
  "vm_resource",
 ]
 
