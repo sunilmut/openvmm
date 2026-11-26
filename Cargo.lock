@@ -64,6 +64,7 @@ name = "address_filter"
 version = "0.0.0"
 dependencies = [
  "inspect",
+ "test_with_tracing",
  "thiserror 2.0.16",
 ]
 

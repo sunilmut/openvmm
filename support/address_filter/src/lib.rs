@@ -308,3 +308,89 @@ mod tests {
         assert!(!filter.filtered(&0, false));
     }
 }
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Compare unsorted interrupt-vector intervals against every u8 value.
+    // Expected: Both inclusive endpoints and isolated vectors match, holes do
+    //       not, and the unknown-device selector is additive to explicit ranges.
+    #[test]
+    fn exhaustive_vector_membership_and_unknown_classification() {
+        for unknown in [false, true] {
+            let text = if unknown {
+                "0xfe-0xff,0x21,0x40-0x4f,0x0,?"
+            } else {
+                "0xfe-0xff,0x21,0x40-0x4f,0x0"
+            };
+            let filter: AddressFilter<u8> = text.parse().unwrap();
+            let restored: AddressFilter<u8> = filter.to_string().parse().unwrap();
+            for value in 0..=u8::MAX {
+                let expected =
+                    value == 0 || value == 0x21 || (0x40..=0x4f).contains(&value) || value >= 0xfe;
+                for known in [false, true] {
+                    assert_eq!(
+                        filter.filtered(&value, known),
+                        expected || (!known && unknown)
+                    );
+                    assert_eq!(
+                        restored.filtered(&value, known),
+                        expected || (!known && unknown)
+                    );
+                }
+            }
+        }
+    }
+
+    // Test: Parse PIO and MMIO limits without truncating full-width endpoints.
+    // Expected: Maximum addresses and adjacent ranges survive formatting, while
+    //       width overflow, duplicate endpoints and reversed ranges are rejected.
+    #[test]
+    fn pio_and_high_mmio_boundaries_preserve_width_and_holes() {
+        let pio: AddressFilter<u16> = "0xfff0-0xffff,0x0".parse().unwrap();
+        assert!(pio.filtered(&0, true));
+        assert!(!pio.filtered(&0xffef, true));
+        assert!(pio.filtered(&0xffff, true));
+        let mmio: AddressFilter<u64> = "0xffffffffffffffff,0x100000001-0x100000002,0x100000000"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            mmio.to_string(),
+            "0x100000000,0x100000001-0x100000002,0xffffffffffffffff"
+        );
+        let restored: AddressFilter<u64> = mmio.to_string().parse().unwrap();
+        for value in [
+            0,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0x1_0000_0001,
+            0x1_0000_0002,
+            0x1_0000_0003,
+            u64::MAX - 1,
+            u64::MAX,
+        ] {
+            let expected = (0x1_0000_0000..=0x1_0000_0002).contains(&value) || value == u64::MAX;
+            assert_eq!(mmio.filtered(&value, true), expected);
+            assert_eq!(restored.filtered(&value, true), expected);
+        }
+        assert!("0x100".parse::<AddressFilter<u8>>().is_err());
+        assert!("0x10000".parse::<AddressFilter<u16>>().is_err());
+        assert!("0x100000000".parse::<AddressFilter<u32>>().is_err());
+        assert!("0x10000000000000000".parse::<AddressFilter<u64>>().is_err());
+        for text in [
+            "0x0-0x10,0x10-0x20",
+            "0xffffffffffffffff,0xffffffffffffffff",
+        ] {
+            assert!(matches!(
+                text.parse::<AddressFilter<u64>>(),
+                Err(InvalidRangeSet::Overlapping)
+            ));
+        }
+        assert!(matches!(
+            "0xffffffffffffffff-0x0".parse::<AddressFilter<u64>>(),
+            Err(InvalidRangeSet::EndBeforeStart)
+        ));
+    }
+}
