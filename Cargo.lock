@@ -7987,6 +7987,7 @@ name = "serial_16550_resources"
 version = "0.0.0"
 dependencies = [
  "mesh",
+ "test_with_tracing",
  "vm_resource",
  "x86defs",
 ]

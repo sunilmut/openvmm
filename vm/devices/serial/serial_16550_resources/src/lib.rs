@@ -108,3 +108,54 @@ pub enum MmioOrIoPort {
     /// The IO port.
     IoPort(u16),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    macro_rules! backend {
+        ($name:ident, $id:literal) => {
+            #[derive(MeshPayload)]
+            struct $name;
+            impl ResourceId<SerialBackendHandle> for $name {
+                const ID: &'static str = $id;
+            }
+        };
+    }
+
+    backend!(First, "test-first");
+    backend!(Second, "test-second");
+    backend!(Third, "test-third");
+    backend!(Fourth, "test-fourth");
+
+    // Test: Build and serialize four standard PC UARTs with distinct backends.
+    // Expected: Each backend stays paired with its conventional COM port/IRQ;
+    //       byte-wide registers and ungated, non-debugger transport defaults survive.
+    #[test]
+    fn standard_pc_ports_keep_backend_and_interrupt_pairings() {
+        let handles = Serial16550DeviceHandle::com_ports([
+            Resource::new(First),
+            Resource::new(Second),
+            Resource::new(Third),
+            Resource::new(Fourth),
+        ]);
+        for (handle, (port, irq, backend)) in handles.into_iter().zip([
+            (0x3f8, 4, "test-first"),
+            (0x2f8, 3, "test-second"),
+            (0x3e8, 4, "test-third"),
+            (0x2e8, 3, "test-fourth"),
+        ]) {
+            let (bytes, resources) = mesh::Message::new(handle).serialize();
+            let handle: Serial16550DeviceHandle = mesh::Message::serialized(&bytes, resources)
+                .parse()
+                .unwrap();
+            assert!(matches!(handle.base, MmioOrIoPort::IoPort(value) if value == port));
+            assert_eq!(handle.irq, irq);
+            assert_eq!(handle.io.id(), backend);
+            assert_eq!(handle.register_width, 1);
+            assert!(!handle.wait_for_rts);
+            assert!(!handle.debugger_mode);
+        }
+    }
+}
