@@ -320,6 +320,7 @@ mod tests {
     use std::cell::Cell;
     use std::cell::RefCell;
     use std::convert::Infallible;
+    use test_with_tracing::test;
     use vm_topology::memory::MemoryLayout;
     use vm_topology::memory::MemoryRangeWithNode;
 
@@ -645,5 +646,77 @@ mod tests {
         assert!(registrar.register(0, 1).is_err());
         assert!(registrar.register(0, 1).is_err());
         assert_eq!(calls.get(), 2);
+    }
+
+    // Test: Fail registration through an alias while registering another chunk.
+    // Expected: Errors identify guest addresses, failed chunks are not retried,
+    //       and successful chunks remain usable without duplicate registration.
+    #[test]
+    fn registration_failure_is_local_and_reports_guest_address() {
+        let layout = MemoryLayout::new_from_ranges(
+            &[MemoryRangeWithNode {
+                range: MemoryRange::new(0..3 * GRANULARITY),
+                vnode: 0,
+            }],
+            &[],
+        )
+        .unwrap();
+        let offset = 1 << 40;
+        let calls = RefCell::new(Vec::new());
+        let registrar = MemoryRegistrar::new(&layout, offset, GRANULARITY, |range: MemoryRange| {
+            calls.borrow_mut().push(range);
+            if range.start() == offset + GRANULARITY {
+                Err(std::io::Error::other("registration rejected"))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert_eq!(registrar.register(GRANULARITY + 123, 1), Err(GRANULARITY));
+        assert_eq!(registrar.register(GRANULARITY + 456, 1), Err(GRANULARITY));
+        assert_eq!(registrar.register(2 * GRANULARITY + 123, 1), Ok(()));
+        assert_eq!(registrar.register(2 * GRANULARITY + 456, 1), Ok(()));
+        assert_eq!(
+            calls.into_inner(),
+            [
+                MemoryRange::new(offset + GRANULARITY..offset + 2 * GRANULARITY),
+                MemoryRange::new(offset + 2 * GRANULARITY..offset + 3 * GRANULARITY),
+            ]
+        );
+    }
+
+    // Test: Bulk-register memory after lazily registering interior chunks.
+    // Expected: Only the three remaining runs reach the registration callback,
+    //       with the alias applied once; repeated bulk registration does no IO.
+    #[test]
+    fn bulk_registration_preserves_existing_interior_chunks() {
+        let layout = MemoryLayout::new_from_ranges(
+            &[MemoryRangeWithNode {
+                range: MemoryRange::new(0..5 * GRANULARITY),
+                vnode: 0,
+            }],
+            &[],
+        )
+        .unwrap();
+        let offset = 1 << 40;
+        let calls = RefCell::new(Vec::new());
+        let registrar = MemoryRegistrar::new(&layout, offset, GRANULARITY, |range| {
+            calls.borrow_mut().push(range);
+            Ok::<_, Infallible>(())
+        });
+        registrar.register(GRANULARITY, 1).unwrap();
+        registrar.register(3 * GRANULARITY, 1).unwrap();
+        calls.borrow_mut().clear();
+
+        registrar.register_all_aligned(GRANULARITY, false).unwrap();
+        registrar.register_all_aligned(GRANULARITY, false).unwrap();
+        assert_eq!(
+            calls.into_inner(),
+            [
+                MemoryRange::new(offset..offset + GRANULARITY),
+                MemoryRange::new(offset + 2 * GRANULARITY..offset + 3 * GRANULARITY),
+                MemoryRange::new(offset + 4 * GRANULARITY..offset + 5 * GRANULARITY),
+            ]
+        );
     }
 }
