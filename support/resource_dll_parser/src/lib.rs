@@ -125,3 +125,6 @@ impl DllResourceDescriptor {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
