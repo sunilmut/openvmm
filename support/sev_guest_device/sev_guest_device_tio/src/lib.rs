@@ -336,3 +336,6 @@ pub struct TioMsgSdteWriteRsp {
 }
 
 static_assertions::const_assert_eq!(size_of::<TioMsgSdteWriteRsp>(), 16);
+
+#[cfg(test)]
+mod tests;
