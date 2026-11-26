@@ -658,7 +658,10 @@ dependencies = [
  "chipset_device",
  "guestmem",
  "inspect",
+ "pal_async",
+ "parking_lot",
  "tdisp",
+ "test_with_tracing",
  "vm_resource",
  "vmcore",
 ]
