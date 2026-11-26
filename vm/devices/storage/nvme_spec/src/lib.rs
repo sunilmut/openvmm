@@ -949,3 +949,6 @@ open_enum! {
         ENDURANCE_GROUP_EVENT_AGGREGATE_LOG_PAGE_CHANGE = 6,
     }
 }
+
+#[cfg(test)]
+mod tests;
