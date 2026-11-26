@@ -932,3 +932,6 @@ pub struct VpciIsolatedResourcesReply {
 }
 
 const _: () = assert!(size_of::<VpciIsolatedResourcesReply>() == 32);
+
+#[cfg(test)]
+mod tests;
