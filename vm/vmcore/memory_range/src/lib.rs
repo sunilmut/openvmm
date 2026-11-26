@@ -930,3 +930,6 @@ mod tests {
             .for_each(|_| ());
     }
 }
+
+#[cfg(test)]
+mod behavior_tests;
