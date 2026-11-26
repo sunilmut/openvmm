@@ -23,5 +23,8 @@ windows-sys.workspace = true
 windows.workspace = true
 win_etw_provider.workspace = true
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

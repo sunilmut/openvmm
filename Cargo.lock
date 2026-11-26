@@ -3355,6 +3355,7 @@ dependencies = [
  "getrandom 0.4.2",
  "inspect",
  "mesh_protobuf",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "win_etw_provider",
  "windows 0.62.0",

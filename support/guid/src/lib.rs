@@ -340,6 +340,8 @@ mod windows {
 #[cfg(test)]
 mod tests {
     use super::Guid;
+    use super::ParseError;
+    use test_with_tracing::test;
 
     #[test]
     fn test_display_guid() {
@@ -389,5 +391,95 @@ mod tests {
 
         const TEST_GUID: Guid = guid!("00010203-0405-0607-0809-0a0b0c0d0e0f");
         assert_eq!(guid, TEST_GUID);
+    }
+
+    // Test: Parse mixed-case GUID strings and convert the result to Windows mixed-endian bytes.
+    // Expected: Every format exposes the same literal fields/bytes, uppercase and lowercase output differ only in hex case, and only the null GUID is zero.
+    #[test]
+    fn textual_identity_and_mixed_endian_bytes_agree() {
+        let expected = Guid {
+            data1: 0x0123_4567,
+            data2: 0x89ab,
+            data3: 0xcdef,
+            data4: [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef],
+        };
+        let bytes = [
+            0x67, 0x45, 0x23, 0x01, 0xab, 0x89, 0xef, 0xcd, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef,
+        ];
+        for text in [
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "{01234567-89AB-CDEF-0123-456789ABCDEF}",
+            "01234567-89aB-cDeF-0123-456789AbCdEf",
+        ] {
+            assert_eq!(text.parse::<Guid>().unwrap(), expected);
+        }
+        assert_eq!(Guid::from_slice(&bytes), expected);
+        assert_eq!(<[u8; 16]>::from(expected), bytes);
+        assert_eq!(
+            format!("{expected:x}"),
+            "01234567-89ab-cdef-0123-456789abcdef"
+        );
+        assert_eq!(
+            format!("{expected:X}"),
+            "01234567-89AB-CDEF-0123-456789ABCDEF"
+        );
+        assert_eq!(
+            format!("{expected:?}"),
+            "01234567-89ab-cdef-0123-456789abcdef"
+        );
+        assert_eq!(Guid::default(), Guid::ZERO);
+        assert_eq!(<[u8; 16]>::from(Guid::ZERO), [0; 16]);
+        assert!(Guid::ZERO.is_zero());
+        assert!(!expected.is_zero());
+    }
+
+    // Test: Corrupt each digit/separator and each brace of otherwise valid GUIDs, and supply wrong lengths.
+    // Expected: Invalid digits, invalid structure, and invalid lengths are rejected with their distinct typed errors without panicking.
+    #[test]
+    fn malformed_guid_inputs_return_precise_errors() {
+        let valid = *b"01234567-89ab-cdef-0123-456789abcdef";
+        for length in [0, 1, 35, 37, 39, 128] {
+            assert!(matches!(
+                Guid::parse(&vec![b'0'; length]),
+                Err(ParseError::Length)
+            ));
+        }
+        for offset in 0..36 {
+            let separator = [8, 13, 18, 23].contains(&offset);
+            for invalid in [b'g', b'/', 0, 0xff] {
+                let mut input = valid;
+                input[offset] = invalid;
+                let result = Guid::parse(&input);
+                if separator {
+                    assert!(matches!(result, Err(ParseError::Format)), "offset {offset}");
+                } else {
+                    assert!(matches!(result, Err(ParseError::Digit)), "offset {offset}");
+                }
+            }
+        }
+        for offset in [0, 37] {
+            let mut input = *b"{01234567-89ab-cdef-0123-456789abcdef}";
+            input[offset] = b' ';
+            assert!(matches!(Guid::parse(&input), Err(ParseError::Format)));
+        }
+        assert_eq!(ParseError::Length.to_string(), "invalid GUID length");
+        assert_eq!(ParseError::Format.to_string(), "invalid GUID format");
+        assert_eq!(ParseError::Digit.to_string(), "invalid GUID digit");
+    }
+
+    // Test: Generate random GUIDs with the optional random source enabled.
+    // Expected: Every result encodes UUID version 4 and the RFC variant in the correct Windows-layout fields.
+    #[cfg(feature = "getrandom")]
+    #[test]
+    fn random_guids_have_version_four_and_rfc_variant() {
+        for _ in 0..16 {
+            let guid = Guid::new_random();
+            assert_eq!(guid.data3 >> 12, 4);
+            assert_eq!(guid.data4[0] >> 6, 2);
+            let bytes = <[u8; 16]>::from(guid);
+            assert_eq!(bytes[7] >> 4, 4);
+            assert_eq!(bytes[8] >> 6, 2);
+        }
     }
 }
