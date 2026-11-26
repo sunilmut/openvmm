@@ -133,4 +133,29 @@ mod test {
             assert_eq!(set.into_iter().next(), None);
         }
     }
+
+    // Test: Decode a sparse generic set with an empty interior bank and highest-bank processors, and reject malformed lengths/formats.
+    // Expected: IDs/count/wire words are exact, empty masks stay empty, and malformed inputs return None without panicking.
+    #[test]
+    fn generic_processor_set_preserves_sparse_wire_identity() {
+        let words = [0x8000_0000_0000_0005, 0x81, 0, 0x8000_0000_0000_0001];
+        let format = hvdef::hypercall::HV_GENERIC_SET_SPARSE_4K;
+        let set = ProcessorSet::from_generic_set(format, &words).unwrap();
+        assert_eq!(set.iter().collect::<Vec<_>>(), [0, 7, 4032, 4095]);
+        assert_eq!(set.count(), 4);
+        assert!(!set.is_empty());
+        assert_eq!(set.as_generic_set().collect::<Vec<_>>(), words);
+        assert!(ProcessorSet::from_generic_set(u64::MAX, &words).is_none());
+        assert!(ProcessorSet::from_generic_set(format, &[]).is_none());
+        assert!(ProcessorSet::from_generic_set(format, &words[..3]).is_none());
+        assert!(ProcessorSet::from_processor_masks(0, &[1]).is_none());
+        assert!(ProcessorSet::from_processor_masks(3, &[1]).is_none());
+        for words in [&[0][..], &[1, 0][..]] {
+            let set = ProcessorSet::from_generic_set(format, words).unwrap();
+            assert!(set.is_empty());
+            assert_eq!(set.count(), 0);
+            assert_eq!(set.iter().next(), None);
+            assert_eq!(set.as_generic_set().collect::<Vec<_>>(), words);
+        }
+    }
 }

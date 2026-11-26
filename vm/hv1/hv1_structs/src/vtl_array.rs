@@ -231,6 +231,7 @@ impl From<VtlSet> for u16 {
 
 #[cfg(test)]
 mod tests {
+    use super::VtlArray;
     use super::VtlSet;
     use hvdef::Vtl;
     use test_with_tracing::test;
@@ -265,5 +266,74 @@ mod tests {
 
         set.clear(Vtl::Vtl2);
         assert!(!set.is_higher_vtl_set_than(Vtl::Vtl0));
+    }
+
+    // Test: Mutate separate VTL slots through indexing, array borrowing, and per-element references, then map their values.
+    // Expected: Slot identity and order survive every operation, with no mutation leaking into another VTL.
+    #[test]
+    fn vtl_array_preserves_slot_identity_through_borrows_and_mapping() {
+        let mut values = VtlArray::<u32, 3>::new(9);
+        values[Vtl::Vtl1] = 17;
+        *values.get_mut(2).unwrap() = 21;
+        let borrowed: &[u32; 3] = &values;
+        assert_eq!(borrowed, &[9, 17, 21]);
+        assert_eq!(
+            values.each_ref().map(|value| *value).into_inner(),
+            [9, 17, 21]
+        );
+        let mut references = values.each_mut();
+        *references[Vtl::Vtl0] = 30;
+        *references[Vtl::Vtl2] = 42;
+        assert_eq!(values[Vtl::Vtl1], 17);
+        assert_eq!(values.map(|value| value + 1).into_inner(), [31, 18, 43]);
+
+        let mut visited = Vec::new();
+        let values = VtlArray::<String, 3>::from_fn(|vtl| {
+            visited.push(vtl);
+            format!("slot{}", vtl as u8)
+        });
+        assert_eq!(visited, [Vtl::Vtl0, Vtl::Vtl1, Vtl::Vtl2]);
+        assert_eq!(values.into_inner(), ["slot0", "slot1", "slot2"]);
+        assert_eq!(VtlArray::from([11]).into_inner(), [11]);
+        assert_eq!(VtlArray::from([11, 22]).into_inner(), [11, 22]);
+        assert_eq!(VtlArray::from([11, 22, 33]).into_inner(), [11, 22, 33]);
+        let mut defaults = VtlArray::<String, 2>::default();
+        defaults[Vtl::Vtl0].push_str("first");
+        assert_eq!(defaults.into_inner(), ["first", ""]);
+    }
+
+    // Test: Enumerate every valid three-VTL membership mask and clear each VTL independently.
+    // Expected: Membership, highest-first order, higher-VTL queries, raw masks, and idempotent updates match the explicit state table.
+    #[test]
+    fn vtl_membership_matches_all_eight_states() {
+        let states: [(u16, &[Vtl]); 8] = [
+            (0, &[]),
+            (1, &[Vtl::Vtl0]),
+            (2, &[Vtl::Vtl1]),
+            (3, &[Vtl::Vtl1, Vtl::Vtl0]),
+            (4, &[Vtl::Vtl2]),
+            (5, &[Vtl::Vtl2, Vtl::Vtl0]),
+            (6, &[Vtl::Vtl2, Vtl::Vtl1]),
+            (7, &[Vtl::Vtl2, Vtl::Vtl1, Vtl::Vtl0]),
+        ];
+        for (bits, expected) in states {
+            let set = VtlSet::from(bits);
+            assert_eq!(u16::from(set), bits);
+            assert_eq!(set.iter_highest_first().collect::<Vec<_>>(), expected);
+            assert_eq!(set.highest_set(), expected.first().copied());
+            for vtl in [Vtl::Vtl0, Vtl::Vtl1, Vtl::Vtl2] {
+                assert_eq!(set.is_set(vtl), expected.contains(&vtl));
+                assert_eq!(set.is_clear(vtl), !expected.contains(&vtl));
+                assert_eq!(
+                    set.is_higher_vtl_set_than(vtl),
+                    expected.iter().any(|&member| member > vtl)
+                );
+                let mut changed = set.with_vtl(vtl).with_vtl(vtl);
+                assert_eq!(u16::from(changed), bits | (1 << vtl as u8));
+                changed.clear(vtl);
+                changed.clear(vtl);
+                assert_eq!(u16::from(changed), bits & !(1 << vtl as u8));
+            }
+        }
     }
 }
