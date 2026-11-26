@@ -88,3 +88,6 @@ pub fn emit_guest_arch() {
     );
     println!("cargo:rustc-check-cfg=cfg(guest_is_native)");
 }
+
+#[cfg(test)]
+mod tests;

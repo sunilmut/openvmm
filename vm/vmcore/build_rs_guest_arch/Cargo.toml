@@ -6,5 +6,8 @@ name = "build_rs_guest_arch"
 edition.workspace = true
 rust-version.workspace = true
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
