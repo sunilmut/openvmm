@@ -108,6 +108,7 @@ impl<T: ?Sized> LoanCell<T> {
 #[cfg(test)]
 mod tests {
     use super::LoanCell;
+    use test_with_tracing::test;
 
     extern crate std;
 
@@ -164,5 +165,39 @@ mod tests {
         });
         assert!(result.is_err());
         cell.borrow(|v| assert!(v.is_none()));
+    }
+
+    // Test: Panic in a nested slice loan while the outer slice is still borrowed,
+    //       then lend another slice before leaving the outer scope.
+    // Expected: Unwinding restores the outer loan, existing borrows stay valid,
+    //       subsequent loans work, and no loan remains after the outer return.
+    #[test]
+    fn nested_unwind_restores_the_borrowed_outer_slice() {
+        let cell = LoanCell::<[u8]>::new();
+        assert!(!cell.is_lent());
+        cell.lend(&[1, 2, 3], || {
+            assert!(cell.is_lent());
+            cell.borrow(|outer| {
+                let outer = outer.unwrap();
+                let result = std::panic::catch_unwind(|| {
+                    cell.lend(&[4, 5], || {
+                        assert!(cell.is_lent());
+                        cell.borrow(|inner| assert_eq!(inner.unwrap(), &[4, 5]));
+                        assert_eq!(outer, &[1, 2, 3]);
+                        panic!("unwind the inner loan");
+                    });
+                });
+                assert!(result.is_err());
+                assert!(cell.is_lent());
+                cell.borrow(|value| assert_eq!(value.unwrap(), outer));
+                cell.lend(&[6], || {
+                    cell.borrow(|value| assert_eq!(value.unwrap(), &[6]));
+                    assert_eq!(outer, &[1, 2, 3]);
+                });
+                cell.borrow(|value| assert_eq!(value.unwrap(), &[1, 2, 3]));
+            });
+        });
+        assert!(!cell.is_lent());
+        cell.borrow(|value| assert!(value.is_none()));
     }
 }
