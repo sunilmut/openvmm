@@ -184,6 +184,7 @@ name = "arc_cyclic_builder"
 version = "0.0.0"
 dependencies = [
  "futures",
+ "test_with_tracing",
 ]
 
 [[package]]
