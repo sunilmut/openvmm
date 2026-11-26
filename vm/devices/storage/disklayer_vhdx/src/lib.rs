@@ -509,3 +509,6 @@ mod tests {
         assert_eq!(buf, pattern);
     }
 }
+
+#[cfg(test)]
+mod contract_tests;
