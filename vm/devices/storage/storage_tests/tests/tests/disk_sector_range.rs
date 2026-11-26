@@ -94,3 +94,49 @@ async fn nvme_sector_range_conformance(driver: DefaultDriver) {
     let disk = nvme.disk().await;
     test_disk_sector_range_conformance(&disk).await;
 }
+
+// Test: Run the direct layer suite with 512-byte and 4K sectors and seeded data.
+// Expected: Normal writes, no-overwrite writes and both unmap representations
+//       reject out-of-range requests without corrupting existing valid sectors.
+#[async_test]
+async fn direct_layer_suite_preserves_existing_data() {
+    use disk_layered::LayerIo;
+    use guestmem::GuestMemory;
+    use scsi_buffers::OwnedRequestBuffers;
+    use storage_tests::sector_range::test_layer_sector_range;
+
+    for sector_size in [512u32, 4096] {
+        let layer =
+            RamDiskLayer::new_with_sector_size(u64::from(sector_size) * 16, sector_size).unwrap();
+        let memory = GuestMemory::allocate(sector_size as usize);
+        let range = OwnedRequestBuffers::linear(0, sector_size as usize, true);
+        let buffers = range.buffer(&memory);
+        let expected = vec![0x6d; sector_size as usize];
+        memory.write_at(0, &expected).unwrap();
+        layer.write(&buffers, 0, false).await.unwrap();
+        layer.write(&buffers, 14, false).await.unwrap();
+
+        test_layer_sector_range(&layer).await;
+
+        let disk = Disk::new(
+            LayeredDisk::new(
+                false,
+                vec![LayerConfiguration {
+                    layer: DiskLayer::new(layer),
+                    write_through: false,
+                    read_cache: false,
+                }],
+            )
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        for sector in [0, 14] {
+            memory.write_at(0, &vec![0; sector_size as usize]).unwrap();
+            disk.read_vectored(&buffers, sector).await.unwrap();
+            let mut actual = vec![0; sector_size as usize];
+            memory.read_at(0, &mut actual).unwrap();
+            assert_eq!(actual, expected, "sector {sector}, size {sector_size}");
+        }
+    }
+}
