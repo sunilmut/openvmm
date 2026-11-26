@@ -279,3 +279,6 @@ mod tests {
         assert!(buf.iter().copied().eq(1000_u32 * 128..1001 * 128));
     }
 }
+
+#[cfg(test)]
+mod contract_tests;
