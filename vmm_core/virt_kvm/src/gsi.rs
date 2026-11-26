@@ -247,3 +247,65 @@ impl<T: MsiRouteBuilder> IrqFdRoute for KvmIrqFdRoute<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::GsiRouting;
+    use std::collections::BTreeSet;
+    use test_with_tracing::test;
+
+    // Test: Exhaust route allocation, free one route, and allocate again.
+    // Expected: Live routes never alias, exhaustion remains stable, and only
+    //       the released route becomes available.
+    #[test]
+    fn allocation_exhaustion_and_reuse_preserve_live_routes() {
+        let mut routing = GsiRouting::new();
+        let mut allocated = BTreeSet::new();
+        while let Some(gsi) = routing.alloc() {
+            assert!(allocated.insert(gsi), "allocated a live route twice");
+            assert!(allocated.len() < 65536, "route allocation never exhausted");
+        }
+        assert!(!allocated.is_empty());
+        assert_eq!(routing.alloc(), None);
+        let released = *allocated.iter().nth(allocated.len() / 2).unwrap();
+        routing.free(released);
+        assert_eq!(routing.alloc(), Some(released));
+        assert_eq!(routing.alloc(), None);
+        for gsi in allocated {
+            routing.free(gsi);
+        }
+        assert!(routing.alloc().is_some());
+    }
+
+    // Test: Reprogram an MSI route, disable it, and reuse its allocation.
+    // Expected: Only actual routing changes request a kernel-table update;
+    //       disabling twice is harmless and a reused route starts disabled.
+    #[test]
+    fn route_updates_report_changes_and_reset_on_reuse() {
+        let mut routing = GsiRouting::new();
+        let gsi = routing.alloc().unwrap();
+        let original = kvm::RoutingEntry::Msi {
+            address_lo: 0xfee0_0000,
+            address_hi: 0,
+            data: 0x40,
+            devid: None,
+        };
+        assert!(!routing.set(gsi, None));
+        assert!(routing.set(gsi, Some(original)));
+        assert!(!routing.set(gsi, Some(original)));
+        let redirected = kvm::RoutingEntry::Msi {
+            address_lo: 0xfee0_1000,
+            address_hi: 0,
+            data: 0x41,
+            devid: Some(7),
+        };
+        assert!(routing.set(gsi, Some(redirected)));
+        assert!(!routing.set(gsi, Some(redirected)));
+        assert!(routing.set(gsi, None));
+        assert!(!routing.set(gsi, None));
+        routing.free(gsi);
+        assert_eq!(routing.alloc(), Some(gsi));
+        assert!(!routing.set(gsi, None));
+        assert!(routing.set(gsi, Some(original)));
+    }
+}
