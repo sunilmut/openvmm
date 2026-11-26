@@ -436,11 +436,79 @@ impl MemoryLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
 
     const KB: u64 = 1024;
     const MB: u64 = 1024 * KB;
     const GB: u64 = 1024 * MB;
     const TB: u64 = 1024 * GB;
+
+    // Test: Build resolved RAM/MMIO/ECAM/PCI MMIO ranges with a positional empty MMIO placeholder and an isolated VTL2 range.
+    // Expected: Stored indices remain intact; half-open address boundaries classify exactly, VTL2 is excluded from probing/RAM totals, and the highest fixed range determines layout end.
+    #[test]
+    fn resolved_placeholders_preserve_indices_and_half_open_address_classes() {
+        let empty = MemoryRange::new(0..0);
+        let layout = MemoryLayout::new_from_resolved_ranges(
+            vec![MemoryRangeWithNode {
+                range: MemoryRange::new(MB..2 * MB),
+                vnode: 7,
+            }],
+            vec![empty, MemoryRange::new(3 * MB..4 * MB)],
+            vec![MemoryRange::new(5 * MB..6 * MB)],
+            vec![MemoryRange::new(7 * MB..8 * MB)],
+            Some(MemoryRange::new(9 * MB..10 * MB)),
+        )
+        .unwrap();
+        assert_eq!(layout.mmio(), &[empty, MemoryRange::new(3 * MB..4 * MB)]);
+        assert_eq!(layout.ram()[0].vnode, 7);
+        assert_eq!(layout.ram_size(), MB);
+        assert_eq!(layout.end_of_ram(), 2 * MB);
+        assert_eq!(layout.max_ram_below_4gb(), Some(2 * MB));
+        assert_eq!(layout.end_of_layout(), 8 * MB);
+        assert_eq!(layout.vtl2_range(), Some(MemoryRange::new(9 * MB..10 * MB)));
+        for (start, kind) in [
+            (MB, AddressType::Ram),
+            (3 * MB, AddressType::Mmio),
+            (5 * MB, AddressType::PciEcam),
+            (7 * MB, AddressType::PciMmio),
+        ] {
+            assert_eq!(layout.probe_address(start - 1), None);
+            assert_eq!(layout.probe_address(start), Some(kind));
+            assert_eq!(layout.probe_address(start + MB - 1), Some(kind));
+            assert_eq!(layout.probe_address(start + MB), None);
+        }
+        assert_eq!(layout.probe_address(0), None);
+        assert_eq!(layout.probe_address(9 * MB), None);
+        let high_only = MemoryLayout::new_from_ranges(
+            &[MemoryRangeWithNode {
+                range: MemoryRange::new(4 * GB..5 * GB),
+                vnode: 1,
+            }],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(high_only.max_ram_below_4gb(), None);
+    }
+
+    // Test: Compare RAM ending one page below 4 GiB with RAM ending exactly at that exclusive boundary.
+    // Expected: Every byte in both half-open ranges is below 4 GiB, so their reported ending addresses are retained.
+    #[test]
+    #[ignore = "product bug: max_ram_below_4gb excludes RAM ending exactly at 4 GiB"]
+    fn ram_ending_at_four_gib_is_still_ram_below_four_gib() {
+        for end in [4 * GB - 4096, 4 * GB] {
+            let layout = MemoryLayout::new_from_ranges(
+                &[MemoryRangeWithNode {
+                    range: MemoryRange::new(0..end),
+                    vnode: 0,
+                }],
+                &[],
+            )
+            .unwrap();
+            assert_eq!(layout.probe_address(end - 1), Some(AddressType::Ram));
+            assert_eq!(layout.probe_address(end), None);
+            assert_eq!(layout.max_ram_below_4gb(), Some(end));
+        }
+    }
 
     #[test]
     fn layout() {

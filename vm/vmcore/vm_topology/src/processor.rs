@@ -332,3 +332,40 @@ impl VpIndex {
         *self == Self::BSP
     }
 }
+
+#[cfg(all(test, guest_arch = "x86_64"))]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Reassign virtual NUMA nodes in a topology whose three-CPU logical sockets reserve four APIC-ID slots.
+    // Expected: Node labels change exactly by VP index while VP/APIC identities, BSP selection, socket reservation and iterator lengths stay stable.
+    #[test]
+    fn numa_reassignment_preserves_vp_and_architectural_identity() {
+        let mut builder = TopologyBuilder::new_x86();
+        builder.vps_per_socket(3);
+        let mut topology = builder.build(6).unwrap();
+        assert_eq!(topology.vp_count(), 6);
+        assert_eq!(topology.vps_per_socket(), 3);
+        assert_eq!(topology.reserved_vps_per_socket(), 4);
+        let apic_ids: Vec<_> = topology.vps_arch().map(|vp| vp.apic_id).collect();
+        assert_eq!(apic_ids, [0, 1, 2, 4, 5, 6]);
+        let nodes = [9, 8, 7, 9, 8, 7];
+        topology.set_vnodes(&nodes);
+        assert_eq!(topology.vps().len(), 6);
+        assert_eq!(topology.vps_arch().len(), 6);
+        for (index, vp) in topology.vps().enumerate() {
+            let vp_index = VpIndex::new(index as u32);
+            assert_eq!(vp.vp_index, vp_index);
+            assert_eq!(vp.vnode, nodes[index]);
+            assert_eq!(vp.is_bsp(), index == 0);
+            assert_eq!(vp.vp_index.is_bsp(), index == 0);
+            assert_eq!(topology.vp(vp_index).vnode, nodes[index]);
+            assert_eq!(topology.vp_arch(vp_index).apic_id, apic_ids[index]);
+        }
+        assert_eq!(
+            topology.vps_arch().map(|vp| vp.apic_id).collect::<Vec<_>>(),
+            apic_ids
+        );
+    }
+}
