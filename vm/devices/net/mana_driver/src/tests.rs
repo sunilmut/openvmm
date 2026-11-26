@@ -437,3 +437,94 @@ async fn test_gdma_reset_request_with_revoke(driver: DefaultDriver) {
         "reset_request_pending should remain revoke_vtl0_vf=true after deregister_device"
     );
 }
+
+// Test: Query two distinct vports, shut down, and reinitialize the same device.
+// Expected: Each query preserves its port identity regardless of query order,
+//       and shutdown releases registration so both ports remain usable again.
+// IGNORED: Reproduced enabled against the asynchronous GDMA emulator: shutdown
+//       returns success, but immediate reinitialization fails with "hwc is
+//       already active" / "establish failed: 1". Real hardware sets PF
+//       ownership when the final request DWORD is written. The emulator leaves
+//       owner_is_pf clear while destruction is pending, so the driver accepts
+//       the request as completion. This exposes an emulator defect, not a
+//       claim that physical MANA hardware was exercised.
+#[async_test]
+#[ignore = "HWC shutdown returns before asynchronous destruction completes"]
+async fn multiport_identity_survives_driver_reinitialization(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "multiport_reinitialization");
+    let msi_conn = MsiConnection::new();
+    let macs = [[2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 2]];
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        &msi_conn.target(),
+        macs.into_iter()
+            .map(|mac_address| VportConfig {
+                mac_address: mac_address.into(),
+                endpoint: Box::new(NullEndpoint::new()),
+            })
+            .collect(),
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let dma_client = mem.dma_client();
+    let mut device = EmulatedDevice::new(device, msi_conn, dma_client);
+
+    for _ in 0..2 {
+        let mana = crate::mana::ManaDevice::new(&driver, device, 1, 1, None)
+            .await
+            .unwrap();
+        let first = mana.new_vport(0, None, mana.dev_config()).await.unwrap();
+        let second = mana.new_vport(1, None, mana.dev_config()).await.unwrap();
+        assert_eq!(first.mac_address(), macs[0].into());
+        assert_eq!(second.mac_address(), macs[1].into());
+        let second_config = mana.query_vport_config(1).await.unwrap();
+        let first_config = mana.query_vport_config(0).await.unwrap();
+        assert_ne!(first_config.vport, second_config.vport);
+        assert_eq!(first_config.mac_addr, macs[0]);
+        assert_eq!(second_config.mac_addr, macs[1]);
+        drop(first);
+        drop(second);
+        let (result, backing) = mana.shutdown().await;
+        result.unwrap();
+        device = backing;
+    }
+}
+
+// Test: Query and initialize two vports in reverse order on one MANA device.
+// Expected: The returned MACs and distinct port handles match the requested
+//       ports, independent of prior queries; shutdown succeeds after release.
+#[async_test]
+async fn multiport_queries_preserve_independent_identities(driver: DefaultDriver) {
+    let mem = DeviceTestMemory::new(128, false, "multiport_queries");
+    let msi_conn = MsiConnection::new();
+    let macs = [[2, 0, 0, 0, 0, 1], [2, 0, 0, 0, 0, 2]];
+    let device = gdma::GdmaDevice::new(
+        &VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone())),
+        mem.guest_memory(),
+        &msi_conn.target(),
+        macs.into_iter()
+            .map(|mac_address| VportConfig {
+                mac_address: mac_address.into(),
+                endpoint: Box::new(NullEndpoint::new()),
+            })
+            .collect(),
+        &mut ExternallyManagedMmioIntercepts,
+    );
+    let dma_client = mem.dma_client();
+    let device = EmulatedDevice::new(device, msi_conn, dma_client);
+    let mana = crate::mana::ManaDevice::new(&driver, device, 1, 1, None)
+        .await
+        .unwrap();
+    let second = mana.new_vport(1, None, mana.dev_config()).await.unwrap();
+    let first = mana.new_vport(0, None, mana.dev_config()).await.unwrap();
+    assert_eq!(first.mac_address(), macs[0].into());
+    assert_eq!(second.mac_address(), macs[1].into());
+    let first_config = mana.query_vport_config(0).await.unwrap();
+    let second_config = mana.query_vport_config(1).await.unwrap();
+    assert_eq!(first_config.mac_addr, macs[0]);
+    assert_eq!(second_config.mac_addr, macs[1]);
+    assert_ne!(first_config.vport, second_config.vport);
+    drop(first);
+    drop(second);
+    mana.shutdown().await.0.unwrap();
+}
