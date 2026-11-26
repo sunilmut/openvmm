@@ -4697,6 +4697,8 @@ name = "mem_profile_tracing"
 version = "0.0.0"
 dependencies = [
  "dhat",
+ "serde_json",
+ "test_with_tracing",
 ]
 
 [[package]]

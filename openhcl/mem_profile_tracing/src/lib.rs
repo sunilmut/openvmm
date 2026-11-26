@@ -32,3 +32,6 @@ impl HeapProfiler {
         summary.into()
     }
 }
+
+#[cfg(test)]
+mod tests;

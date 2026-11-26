@@ -9,5 +9,9 @@ rust-version.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 dhat.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
