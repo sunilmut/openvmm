@@ -17,5 +17,10 @@ tracelimit.workspace = true
 getrandom.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+inspect = { workspace = true, features = ["initiate"] }
+parking_lot.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

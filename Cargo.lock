@@ -3002,6 +3002,8 @@ dependencies = [
  "guestmem",
  "inspect",
  "mesh",
+ "parking_lot",
+ "test_with_tracing",
  "tracelimit",
  "tracing",
  "vmcore",
