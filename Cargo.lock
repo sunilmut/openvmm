@@ -4180,6 +4180,7 @@ dependencies = [
  "inspect",
  "iommu_common",
  "open_enum",
+ "pal_async",
  "parking_lot",
  "pci_core",
  "test_with_tracing",

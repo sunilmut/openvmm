@@ -2386,6 +2386,7 @@ impl InspectMut for IntelVtdDevice {
 mod tests {
     mod accessed_dirty;
     mod queued_invalidation;
+    mod reset_contract;
     mod scalable_fixture;
     mod scalable_translation;
 
