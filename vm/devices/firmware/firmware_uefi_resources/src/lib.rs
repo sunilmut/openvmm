@@ -238,3 +238,50 @@ pub struct UefiDeviceHandle {
 impl ResourceId<ChipsetDeviceHandleKind> for UefiDeviceHandle {
     const ID: &'static str = "hyperv_firmware_uefi";
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+    use uefi_specs::hyperv::debug_level::DEBUG_INIT;
+    use uefi_specs::hyperv::debug_level::DEBUG_VERBOSE;
+
+    // Test: Filter mixed firmware diagnostic categories under each host policy.
+    // Expected: A selected category suffices; full logging also admits zero and
+    //       future categories, while default and info do not.
+    #[test]
+    fn diagnostic_policy_filters_combined_and_future_categories() {
+        let future = 0x0200_0000;
+        for policy in [LogLevel::default(), LogLevel::make_default()] {
+            assert!(policy.should_log(DEBUG_ERROR));
+            assert!(policy.should_log(DEBUG_WARN | DEBUG_VERBOSE));
+            assert!(!policy.should_log(DEBUG_INFO | DEBUG_VERBOSE | future));
+            assert!(!policy.should_log(0));
+        }
+        let info = LogLevel::make_info();
+        assert!(info.should_log(DEBUG_INFO | future));
+        assert!(info.should_log(DEBUG_ERROR | DEBUG_WARN));
+        assert!(!info.should_log(DEBUG_INIT | DEBUG_VERBOSE | future));
+        assert!(!info.should_log(0));
+        for mask in [0, DEBUG_INIT, DEBUG_VERBOSE, future, u32::MAX] {
+            assert!(LogLevel::make_full().should_log(mask));
+        }
+    }
+
+    // Test: Render single, combined, empty, and future firmware debug masks.
+    // Expected: Known labels have stable category order, unknown bits do not
+    //       erase known categories, and masks without known categories say UNKNOWN.
+    #[test]
+    fn diagnostic_labels_preserve_known_categories() {
+        assert_eq!(debug_level_to_string(DEBUG_WARN), "WARNING");
+        assert_eq!(debug_level_to_string(DEBUG_ERROR), "ERROR");
+        assert_eq!(
+            debug_level_to_string(DEBUG_ERROR | DEBUG_INFO | DEBUG_INIT | DEBUG_WARN),
+            "INIT+WARNING+INFO+ERROR"
+        );
+        assert_eq!(debug_level_to_string(0), "UNKNOWN");
+        assert_eq!(debug_level_to_string(0x0200_0000), "UNKNOWN");
+        assert_eq!(debug_level_to_string(0x0600_0000), "UNKNOWN");
+        assert_eq!(debug_level_to_string(DEBUG_WARN | 0x0200_0000), "WARNING");
+    }
+}
