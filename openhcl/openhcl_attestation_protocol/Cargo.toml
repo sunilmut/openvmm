@@ -22,5 +22,8 @@ serde_helpers.workspace = true
 serde_json = { workspace = true, features = ["std"] }
 zerocopy.workspace = true
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

@@ -5745,6 +5745,7 @@ dependencies = [
  "serde",
  "serde_helpers",
  "serde_json",
+ "test_with_tracing",
  "x86defs",
  "zerocopy",
 ]

@@ -8,3 +8,6 @@
 
 pub mod igvm_attest;
 pub mod vmgs;
+
+#[cfg(test)]
+mod tests;
