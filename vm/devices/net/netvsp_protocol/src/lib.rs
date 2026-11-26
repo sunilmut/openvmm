@@ -19,3 +19,6 @@
 
 pub mod protocol;
 pub mod rndisprot;
+
+#[cfg(test)]
+mod tests;

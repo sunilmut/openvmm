@@ -5336,6 +5336,7 @@ dependencies = [
  "net_backend_core",
  "open_enum",
  "static_assertions",
+ "test_with_tracing",
  "vmbus_core",
  "zerocopy",
 ]
