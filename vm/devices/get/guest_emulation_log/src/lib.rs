@@ -350,4 +350,140 @@ mod tests {
         assert!(task.start());
         stop_with_timeout(&mut task, &driver).await;
     }
+
+    fn log_frame(json: &[u8], offset: u16) -> Vec<u8> {
+        let header = get_protocol::TraceLoggingNotificationHeader {
+            message: get_protocol::TraceLoggingBufferOffset {
+                size: json.len() as u16,
+                offset,
+            },
+            ..FromZeros::new_zeroed()
+        };
+        let mut frame = header.as_bytes().to_vec();
+        frame.extend(std::iter::repeat_n(0xee, offset as usize));
+        frame.extend_from_slice(json);
+        frame.extend_from_slice(b"not part of the selected JSON");
+        frame
+    }
+
+    async fn process_frames(frames: &[Vec<u8>]) -> Result<(), Error> {
+        let (host, mut guest) = vmbus_async::pipe::connected_message_pipes(16384);
+        for frame in frames {
+            guest.try_send(frame).unwrap();
+        }
+        guest.try_send(&[]).unwrap();
+        let mut channel = GelChannel::new(host);
+        StopTask::run_unstoppable(async |stop| {
+            let check = stop.check_handle()?;
+            channel.process(&mut GuestEmulationLog::new(), &check).await
+        })
+        .await
+    }
+
+    struct LogWriter(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // Test: Forward every severity, an unknown severity and malformed JSON followed
+    //       by a valid frame whose message has nonzero offset and trailing bytes.
+    // Expected: Log events preserve target/message/extra fields, fallback severity
+    //       and parse diagnostics; bad JSON does not suppress the following event.
+    #[test]
+    fn forward_levels_fields_and_recover_after_bad_json() {
+        use tracing::instrument::WithSubscriber;
+
+        let output = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || LogWriter(writer.clone()))
+            .finish();
+        let mut frames = Vec::new();
+        for level in ["ERROR", "WARN", "INFO", "DEBUG", "TRACE", "CUSTOM"] {
+            let json = format!(
+                r#"{{"target":"guest-{level}","level":"{level}","fields":{{"message":"hello\nworld","count":17}},"source":"vm"}}"#
+            );
+            frames.push(log_frame(json.as_bytes(), 3));
+        }
+        frames.push(log_frame(b"\xff{bad json", 0));
+        frames.push(log_frame(br#"{"target":"after-error","level":"INFO"}"#, 0));
+        futures::executor::block_on(process_frames(&frames).with_subscriber(subscriber)).unwrap();
+        let log = String::from_utf8(output.lock().clone()).unwrap();
+        for level in ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"] {
+            let line = log
+                .lines()
+                .find(|line| line.contains(&format!("guest-{level}")))
+                .unwrap();
+            assert!(line.trim_start().starts_with(level), "{line}");
+            let start = log
+                .find(&format!("inner_target=\"guest-{level}\""))
+                .unwrap();
+            let event = log[start..].split("paravisor_log:").next().unwrap();
+            assert!(event.contains("hello\nworld"), "{event}");
+            assert!(
+                event.contains("count")
+                    && event.contains("17")
+                    && event.contains("source")
+                    && event.contains("vm"),
+                "{event}"
+            );
+        }
+        let fallback = log
+            .lines()
+            .find(|line| line.contains("guest-CUSTOM"))
+            .unwrap();
+        assert!(fallback.contains("INFO") && fallback.contains("inner_level=\"CUSTOM\""));
+        let bad = log.find("failed to parse trace").unwrap();
+        assert!(log.find("after-error").unwrap() > bad);
+        assert!(!log.contains("not part of the selected JSON"));
+    }
+
+    // Test: Receive a truncated header or a message region outside the payload.
+    // Expected: Processing returns a framing error, never a successful EOF.
+    #[test]
+    fn invalid_frame_boundaries_are_rejected() {
+        let out_of_bounds = get_protocol::TraceLoggingNotificationHeader {
+            message: get_protocol::TraceLoggingBufferOffset {
+                size: 1,
+                offset: 10,
+            },
+            ..FromZeros::new_zeroed()
+        };
+        for frame in [vec![1], out_of_bounds.as_bytes().to_vec()] {
+            assert!(futures::executor::block_on(process_frames(&[frame])).is_err());
+        }
+    }
+
+    // Test: Receive a message region whose offset plus length overflows u16.
+    // Expected: The untrusted frame returns a framing error without panicking.
+    //
+    // IGNORED: Reproduced with offset=65535 and size=2: processing panics at
+    //       the u16 addition in the message range before bounds validation.
+    //       Widening or checked addition should return a framing error instead.
+    //       Retained without a production fix under the test-only campaign.
+    #[test]
+    #[ignore = "product bug: GEL message offset plus size overflows before validation"]
+    fn overflowing_message_region_is_rejected() {
+        let header = get_protocol::TraceLoggingNotificationHeader {
+            message: get_protocol::TraceLoggingBufferOffset {
+                size: 2,
+                offset: u16::MAX,
+            },
+            ..FromZeros::new_zeroed()
+        };
+        assert!(
+            futures::executor::block_on(process_frames(&[header.as_bytes().to_vec()])).is_err()
+        );
+    }
 }

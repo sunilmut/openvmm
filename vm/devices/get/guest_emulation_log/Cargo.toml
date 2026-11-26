@@ -28,7 +28,9 @@ zerocopy.workspace = true
 [dev-dependencies]
 futures.workspace = true
 pal_async.workspace = true
+parking_lot.workspace = true
 test_with_tracing.workspace = true
+tracing-subscriber.workspace = true
 vmbus_channel = { workspace = true, features = ["test_helpers"] }
 
 [lints]
