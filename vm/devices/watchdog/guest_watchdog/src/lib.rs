@@ -451,4 +451,184 @@ mod tests {
         assert_eq!(completed.load(Ordering::SeqCst), 2);
         restored.stop().await;
     }
+
+    // Test: Access watchdog ports with unsupported widths and unmapped offsets.
+    // Expected: Reads leave buffers unchanged and rejected writes preserve the
+    //       selected register and its countdown.
+    #[async_test]
+    async fn invalid_port_accesses_preserve_guest_state(driver: DefaultDriver) {
+        let (_permit, receiver) = mesh::channel();
+        let (mut device, _keeper) = new_device(
+            &driver,
+            Box::new(GatedPlatform {
+                permit: receiver,
+                completed: Arc::new(AtomicUsize::new(0)),
+            }),
+            false,
+        )
+        .await;
+        write_register(&mut device, WatchdogRegister::WATCHDOG_COUNT, 17);
+        for size in [0, 1, 2, 3, 5, 8] {
+            for port in [0x1000, 0x1004] {
+                let mut data = vec![0xa5; size];
+                assert!(matches!(
+                    device.io_read(port, &mut data),
+                    chipset_device::io::IoResult::Err(
+                        chipset_device::io::IoError::InvalidAccessSize
+                    )
+                ));
+                assert_eq!(data, vec![0xa5; size]);
+                assert!(matches!(
+                    device.io_write(port, &data),
+                    chipset_device::io::IoResult::Err(
+                        chipset_device::io::IoError::InvalidAccessSize
+                    )
+                ));
+            }
+        }
+        for port in [
+            0x0fff, 0x1001, 0x1002, 0x1003, 0x1005, 0x1006, 0x1007, 0x1008,
+        ] {
+            let mut data = [0xa5; 4];
+            assert!(matches!(
+                device.io_read(port, &mut data),
+                chipset_device::io::IoResult::Err(chipset_device::io::IoError::InvalidRegister)
+            ));
+            assert_eq!(data, [0xa5; 4]);
+            assert!(matches!(
+                device.io_write(port, &0u32.to_ne_bytes()),
+                chipset_device::io::IoResult::Err(chipset_device::io::IoError::InvalidRegister)
+            ));
+        }
+        let mut address = [0; 4];
+        device.io_read(0x1000, &mut address).unwrap();
+        assert_eq!(
+            u32::from_ne_bytes(address),
+            WatchdogRegister::WATCHDOG_COUNT.0
+        );
+        assert_eq!(
+            read_register(&mut device, WatchdogRegister::WATCHDOG_COUNT),
+            17
+        );
+    }
+
+    // Test: Write read-only resolution, unsupported config bits and an unknown
+    //       watchdog selector before accessing valid registers again.
+    // Expected: Invalid operations do not change valid register values; unknown
+    //       reads return the protocol's all-ones sentinel.
+    #[async_test]
+    async fn rejected_register_writes_leave_valid_registers_usable(driver: DefaultDriver) {
+        let (_permit, receiver) = mesh::channel();
+        let (mut device, _keeper) = new_device(
+            &driver,
+            Box::new(GatedPlatform {
+                permit: receiver,
+                completed: Arc::new(AtomicUsize::new(0)),
+            }),
+            false,
+        )
+        .await;
+        write_register(&mut device, WatchdogRegister::WATCHDOG_COUNT, 17);
+        write_register(&mut device, WatchdogRegister::WATCHDOG_RESOLUTION, 99);
+        assert_eq!(
+            read_register(&mut device, WatchdogRegister::WATCHDOG_RESOLUTION),
+            1
+        );
+        write_register(&mut device, WatchdogRegister::WATCHDOG_CONFIG, 0x8000_0003);
+        assert_eq!(
+            read_register(&mut device, WatchdogRegister::WATCHDOG_CONFIG),
+            0
+        );
+        write_register(&mut device, WatchdogRegister(u32::MAX), 99);
+        assert_eq!(
+            read_register(&mut device, WatchdogRegister(u32::MAX)),
+            u32::MAX
+        );
+        assert_eq!(
+            read_register(&mut device, WatchdogRegister::WATCHDOG_COUNT),
+            17
+        );
+        write_register(&mut device, WatchdogRegister::WATCHDOG_COUNT, 23);
+        assert_eq!(
+            read_register(&mut device, WatchdogRegister::WATCHDOG_COUNT),
+            23
+        );
+    }
+
+    // Test: Save a selected countdown, overwrite it, reset and restore the snapshot.
+    // Expected: Reset clears the selector, while restore recovers both the
+    //       selected address and the saved countdown through guest port reads.
+    #[async_test]
+    async fn reset_and_restore_preserve_the_saved_register_selection(driver: DefaultDriver) {
+        let (_permit, receiver) = mesh::channel();
+        let (mut device, _keeper) = new_device(
+            &driver,
+            Box::new(GatedPlatform {
+                permit: receiver,
+                completed: Arc::new(AtomicUsize::new(0)),
+            }),
+            false,
+        )
+        .await;
+        write_register(&mut device, WatchdogRegister::WATCHDOG_COUNT, 19);
+        let saved = device.save().unwrap();
+        write_register(&mut device, WatchdogRegister::WATCHDOG_COUNT, 70);
+        read_register(&mut device, WatchdogRegister::WATCHDOG_RESOLUTION);
+        device.reset().await;
+        let mut data = [0; 4];
+        device.io_read(0x1000, &mut data).unwrap();
+        assert_eq!(u32::from_ne_bytes(data), 0);
+
+        device.restore(saved).unwrap();
+        device.io_read(0x1000, &mut data).unwrap();
+        assert_eq!(u32::from_ne_bytes(data), WatchdogRegister::WATCHDOG_COUNT.0);
+        device.io_read(0x1004, &mut data).unwrap();
+        assert_eq!(u32::from_ne_bytes(data), 19);
+    }
+
+    // Test: Arm the watchdog through its advertised chipset port interface and
+    //       dispatch its deadline through the advertised polling interface.
+    // Expected: The platform action runs once after, but not before, the deadline.
+    #[async_test]
+    async fn chipset_interfaces_deliver_the_guest_programmed_timeout(driver: DefaultDriver) {
+        use chipset_device::ChipsetDevice;
+
+        let (permit, receiver) = mesh::channel();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let (mut device, mut keeper) = new_device(
+            &driver,
+            Box::new(GatedPlatform {
+                permit: receiver,
+                completed: completed.clone(),
+            }),
+            false,
+        )
+        .await;
+        let pio = device.supports_pio().unwrap();
+        pio.io_write(0x1000, &WatchdogRegister::WATCHDOG_COUNT.0.to_ne_bytes())
+            .unwrap();
+        pio.io_write(0x1004, &3u32.to_ne_bytes()).unwrap();
+        pio.io_write(0x1000, &WatchdogRegister::WATCHDOG_CONFIG.0.to_ne_bytes())
+            .unwrap();
+        pio.io_write(0x1004, &3u32.to_ne_bytes()).unwrap();
+        permit.send(());
+        advance_to(&mut keeper, 2).await;
+        device
+            .supports_poll_device()
+            .unwrap()
+            .poll_device(&mut Context::from_waker(Waker::noop()));
+        assert_eq!(completed.load(Ordering::SeqCst), 0);
+        advance_to(&mut keeper, 4).await;
+        device
+            .supports_poll_device()
+            .unwrap()
+            .poll_device(&mut Context::from_waker(Waker::noop()));
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+        advance_to(&mut keeper, 10).await;
+        device
+            .supports_poll_device()
+            .unwrap()
+            .poll_device(&mut Context::from_waker(Waker::noop()));
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+    }
 }
