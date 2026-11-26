@@ -624,3 +624,239 @@ impl IoQueueFaultConfig {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesh::rpc::RpcSend;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    use test_with_tracing::test;
+    use zerocopy::FromZeros;
+    use zerocopy::IntoBytes;
+
+    fn opcode_pattern(opcode: u8) -> CommandMatch {
+        let mut command = Command::new_zeroed();
+        command.cdw0 = command.cdw0.with_opcode(opcode);
+        let mut mask = [0; 64];
+        mask[0] = u8::MAX;
+        CommandMatch { command, mask }
+    }
+
+    // Test: Configure overlapping wildcard/opcode patterns and reuse the opcode rule in another queue.
+    // Expected: First-defined priority is retained in the submission list, and completion rules have independent patterns and behaviors.
+    #[test]
+    fn admin_rule_order_preserves_overlaps_and_queue_independence() {
+        let wildcard = CommandMatch {
+            command: Command::new_zeroed(),
+            mask: [0; 64],
+        };
+        let identify = opcode_pattern(0x06);
+        let config = AdminQueueFaultConfig::new()
+            .with_submission_queue_fault(wildcard.clone(), AdminQueueFaultBehavior::Drop)
+            .with_submission_queue_fault(
+                identify.clone(),
+                AdminQueueFaultBehavior::Delay(Duration::from_millis(17)),
+            )
+            .with_completion_queue_fault(
+                identify.clone(),
+                AdminQueueFaultBehavior::Update(Completion::new_zeroed()),
+            );
+        let [(first, first_behavior), (second, second_behavior)] =
+            config.admin_submission_queue_faults.as_slice()
+        else {
+            panic!("submission rules changed")
+        };
+        assert!(first == &wildcard);
+        assert!(second == &identify);
+        assert!(matches!(first_behavior, AdminQueueFaultBehavior::Drop));
+        assert!(
+            matches!(second_behavior, AdminQueueFaultBehavior::Delay(delay) if *delay == Duration::from_millis(17))
+        );
+        let [(completion, behavior)] = config.admin_completion_queue_faults.as_slice() else {
+            panic!("completion rules changed")
+        };
+        assert!(completion == &identify);
+        assert!(
+            matches!(behavior, AdminQueueFaultBehavior::Update(value) if value.as_bytes() == [0; 16])
+        );
+    }
+
+    // Test: Add an identical pattern twice to each independently configured admin or IO queue.
+    // Expected: Each queue rejects its own duplicate with the documented queue-specific diagnostic, not an unrelated setup panic.
+    #[test]
+    fn duplicate_rules_are_rejected_by_the_owning_queue() {
+        for (queue, expected) in [
+            (0, "Duplicate submission queue fault"),
+            (1, "Duplicate completion queue fault"),
+            (2, "Duplicate completion queue fault"),
+        ] {
+            let panic = std::panic::catch_unwind(move || {
+                let pattern = opcode_pattern(0x06);
+                match queue {
+                    0 => {
+                        let _ = AdminQueueFaultConfig::new()
+                            .with_submission_queue_fault(
+                                pattern.clone(),
+                                AdminQueueFaultBehavior::Drop,
+                            )
+                            .with_submission_queue_fault(pattern, AdminQueueFaultBehavior::Drop);
+                    }
+                    1 => {
+                        let _ = AdminQueueFaultConfig::new()
+                            .with_completion_queue_fault(
+                                pattern.clone(),
+                                AdminQueueFaultBehavior::Drop,
+                            )
+                            .with_completion_queue_fault(pattern, AdminQueueFaultBehavior::Drop);
+                    }
+                    2 => {
+                        let mut active = mesh::CellUpdater::new(false);
+                        let _ = IoQueueFaultConfig::new(active.cell())
+                            .with_completion_queue_fault(
+                                pattern.clone(),
+                                IoQueueFaultBehavior::CustomPayload(vec![0x81]),
+                            )
+                            .with_completion_queue_fault(
+                                pattern,
+                                IoQueueFaultBehavior::Delay(Duration::from_secs(1)),
+                            );
+                    }
+                    _ => unreachable!(),
+                }
+            })
+            .unwrap_err();
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap();
+            assert!(message.starts_with(expected), "{message}");
+        }
+    }
+
+    // Test: Compose all fault builders, update the shared activation cell, and send a namespace RPC over the replacement channel.
+    // Expected: Defaults are no-op, independent builder values remain exact, IO clones observe live activation, and the installed channel preserves notification identity and reply routing.
+    #[test]
+    fn composed_faults_preserve_overrides_live_activation_and_namespace_channel() {
+        let mut active = mesh::CellUpdater::new(false);
+        let defaults = FaultConfiguration::new(active.cell());
+        assert!(!defaults.fault_active.get());
+        assert!(!defaults.io_fault.fault_active.get());
+        assert!(
+            defaults
+                .admin_fault
+                .admin_submission_queue_faults
+                .is_empty()
+        );
+        assert!(
+            defaults
+                .admin_fault
+                .admin_completion_queue_faults
+                .is_empty()
+        );
+        assert!(defaults.io_fault.io_completion_queue_faults.is_empty());
+        assert!(matches!(
+            defaults
+                .pci_fault
+                .as_ref()
+                .unwrap()
+                .controller_management_fault_enable,
+            PciFaultBehavior::Default
+        ));
+        assert_eq!(defaults.pci_fault.as_ref().unwrap().max_queue_size, None);
+        assert!(defaults.hardware_config_fault.is_none());
+        let hardware_defaults = HardwareConfigFaultConfig::new();
+        assert_eq!(
+            (hardware_defaults.vendor_id, hardware_defaults.device_id),
+            (None, None)
+        );
+        let pattern = opcode_pattern(0x01);
+        let (namespace_send, namespace_recv) = mesh::channel();
+        let mut config = defaults
+            .with_admin_queue_fault(AdminQueueFaultConfig::new().with_submission_queue_fault(
+                pattern.clone(),
+                AdminQueueFaultBehavior::Panic("admin sentinel".into()),
+            ))
+            .with_pci_fault(
+                PciFaultConfig::new()
+                    .with_cc_enable_fault(PciFaultBehavior::Delay(Duration::from_millis(37)))
+                    .with_max_queue_size(u16::MAX),
+            )
+            .with_io_queue_fault(
+                IoQueueFaultConfig::new(active.cell()).with_completion_queue_fault(
+                    pattern.clone(),
+                    IoQueueFaultBehavior::CustomPayload(vec![0x81, 0x00, 0xff, 0x27]),
+                ),
+            )
+            .with_namespace_fault(NamespaceFaultConfig::new(namespace_recv))
+            .with_hardware_config_fault(
+                HardwareConfigFaultConfig::new()
+                    .with_vendor_id(0x1414)
+                    .with_device_id(0xc03e)
+                    .with_vendor_id(0),
+            );
+        let pci = config.pci_fault.as_ref().unwrap();
+        assert_eq!(pci.max_queue_size, Some(u16::MAX));
+        assert!(
+            matches!(pci.controller_management_fault_enable, PciFaultBehavior::Delay(delay) if delay == Duration::from_millis(37))
+        );
+        let hardware = config.hardware_config_fault.unwrap();
+        assert_eq!(
+            (hardware.vendor_id, hardware.device_id),
+            (Some(0), Some(0xc03e))
+        );
+        let [(admin_pattern, admin_behavior)] =
+            config.admin_fault.admin_submission_queue_faults.as_slice()
+        else {
+            panic!("admin override lost")
+        };
+        assert!(admin_pattern == &pattern);
+        assert!(
+            matches!(admin_behavior, AdminQueueFaultBehavior::Panic(message) if message == "admin sentinel")
+        );
+        let io_clone = config.io_fault.as_ref().clone();
+        let [(io_pattern, io_behavior)] = io_clone.io_completion_queue_faults.as_slice() else {
+            panic!("IO override lost")
+        };
+        assert!(io_pattern == &pattern);
+        assert!(
+            matches!(io_behavior, IoQueueFaultBehavior::CustomPayload(bytes) if bytes == &[0x81, 0x00, 0xff, 0x27])
+        );
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(
+            std::pin::Pin::new(&mut active.set(true))
+                .poll(&mut context)
+                .is_ready()
+        );
+        assert!(
+            config.fault_active.get()
+                && config.io_fault.fault_active.get()
+                && io_clone.fault_active.get()
+        );
+        assert!(
+            std::pin::Pin::new(&mut active.set(false))
+                .poll(&mut context)
+                .is_ready()
+        );
+        assert!(
+            !config.fault_active.get()
+                && !config.io_fault.fault_active.get()
+                && !io_clone.fault_active.get()
+        );
+        let mut response =
+            std::pin::pin!(namespace_send.call(NamespaceChange::ChangeNotification, 0x8123));
+        assert!(response.as_mut().poll(&mut context).is_pending());
+        let NamespaceChange::ChangeNotification(request) = config
+            .namespace_fault
+            .recv_changed_namespace
+            .try_recv()
+            .unwrap();
+        assert_eq!(request.input(), &0x8123);
+        request.complete(());
+        assert!(matches!(
+            response.as_mut().poll(&mut context),
+            Poll::Ready(Ok(()))
+        ));
+    }
+}

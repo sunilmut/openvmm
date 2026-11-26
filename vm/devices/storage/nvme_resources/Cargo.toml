@@ -13,6 +13,7 @@ mesh.workspace = true
 guid = { workspace = true, features = ["getrandom", "mesh"] }
 
 [dev-dependencies]
+test_with_tracing.workspace = true
 zerocopy.workspace = true
 
 [lints]

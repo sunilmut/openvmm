@@ -5532,6 +5532,7 @@ dependencies = [
  "guid",
  "mesh",
  "nvme_spec",
+ "test_with_tracing",
  "vm_resource",
  "zerocopy",
 ]
