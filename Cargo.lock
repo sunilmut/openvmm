@@ -735,6 +735,8 @@ dependencies = [
  "local_clock",
  "memory_range",
  "mesh",
+ "pal_async",
+ "test_with_tracing",
  "vm_resource",
 ]
 

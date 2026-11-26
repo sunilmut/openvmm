@@ -580,3 +580,92 @@ pub mod i440bx_host_pci_bridge {
         const ID: &'static str = "i440bx-host-pci-bridge";
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use local_clock::LocalClock;
+    use local_clock::LocalClockDelta;
+    use local_clock::LocalClockTime;
+    use local_clock::SystemTimeClock;
+    use pal_async::async_test;
+    use test_with_tracing::test;
+    use vm_resource::ResolveResource;
+
+    // Test: Resolve independent real-time sources with signed millisecond offsets.
+    // Expected: Each offset is applied with the correct sign and units, and
+    //       programming one resolved clock cannot change the other.
+    #[test]
+    fn resolved_clocks_apply_signed_offsets_and_remain_independent() {
+        let mut host = SystemTimeClock::new(LocalClockDelta::ZERO);
+        for delta in [-86_400_123, 86_400_123] {
+            let mut first = cmos_rtc_time_source::SystemTimeClockResolver
+                .resolve(
+                    cmos_rtc_time_source::SystemTimeClockHandle {
+                        delta_milliseconds: delta,
+                    },
+                    (),
+                )
+                .unwrap()
+                .0;
+            let mut second = cmos_rtc_time_source::SystemTimeClockResolver
+                .resolve(
+                    cmos_rtc_time_source::SystemTimeClockHandle {
+                        delta_milliseconds: 0,
+                    },
+                    (),
+                )
+                .unwrap()
+                .0;
+            let before = host.get_time();
+            let observed = first.get_time() - LocalClockDelta::from_millis(delta);
+            let after = host.get_time();
+            assert!((before..=after).contains(&observed));
+            let epoch = LocalClockTime::from_millis_since_unix_epoch(0);
+            first.set_time(epoch);
+            let reset = first.get_time();
+            let elapsed = host.get_time() - after;
+            assert!((epoch..=epoch + elapsed).contains(&reset));
+            assert!(second.get_time() >= after);
+        }
+    }
+
+    // Test: Transfer a battery update receiver while its sender remains active.
+    // Expected: A valid present/charging default and subsequent discharging
+    //       update arrive in order with capacities intact after resource transfer.
+    #[async_test]
+    async fn battery_channel_survives_resource_transfer() {
+        use battery::BatteryDeviceHandleX64;
+        use battery::HostBatteryUpdate;
+
+        let (send, recv) = mesh::channel();
+        let initial = HostBatteryUpdate::default_present();
+        assert!(
+            initial.battery_present
+                && initial.charging
+                && !initial.discharging
+                && initial.ac_online
+        );
+        assert!(
+            initial.remaining_capacity > 0 && initial.remaining_capacity <= initial.max_capacity
+        );
+        let mut update = initial;
+        update.charging = false;
+        update.discharging = true;
+        update.ac_online = false;
+        update.remaining_capacity -= 1;
+        send.send(initial);
+        let (bytes, resources) = mesh::Message::new(BatteryDeviceHandleX64 {
+            battery_status_recv: recv,
+        })
+        .serialize();
+        let mut handle: BatteryDeviceHandleX64 = mesh::Message::serialized(&bytes, resources)
+            .parse()
+            .unwrap();
+        send.send(update);
+        drop(send);
+        assert_eq!(handle.battery_status_recv.recv().await.unwrap(), initial);
+        assert_eq!(handle.battery_status_recv.recv().await.unwrap(), update);
+        assert!(handle.battery_status_recv.recv().await.is_err());
+    }
+}

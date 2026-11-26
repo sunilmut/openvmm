@@ -18,5 +18,9 @@ mesh.workspace = true
 
 arbitrary = { workspace = true, optional = true, features = ["derive"] }
 
+[dev-dependencies]
+pal_async.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
