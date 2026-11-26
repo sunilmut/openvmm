@@ -585,4 +585,31 @@ mod tests {
         v.push_tail(());
         v.extend_tail_from_slice(&[(); usize::MAX]);
     }
+
+    // Test: Reserve more entries after changing a populated request header.
+    // Expected: Reservation preserves submitted bytes and entries; only a
+    //       subsequent append adds entries to the visible request.
+    #[test]
+    fn reserving_a_populated_tail_preserves_the_request() {
+        for capacity in [2, 8] {
+            let mut request = HeaderVec::<u32, u64, 2>::with_capacity(17, capacity);
+            request.extend_tail_from_slice(&[0x1122, 0x3344]);
+            request.head = 23;
+            let submitted_size = request.total_byte_len();
+
+            request.reserve_tail(0);
+            request.reserve_tail(17);
+            assert_eq!(request.head, 23);
+            assert_eq!(&request.tail, &[0x1122, 0x3344]);
+            assert_eq!(request.total_byte_len(), submitted_size);
+            assert!(request.tail_capacity() >= 19);
+
+            let added: Vec<_> = (100..117).collect();
+            request.extend_tail_from_slice(&added);
+            assert_eq!(request.head, 23);
+            assert_eq!(&request.tail[..2], &[0x1122, 0x3344]);
+            assert_eq!(&request.tail[2..], added.as_slice());
+            assert_eq!(request.tail.len(), 19);
+        }
+    }
 }
