@@ -128,3 +128,6 @@ pub fn from_nvme_reservation_report(
 
     Ok(report)
 }
+
+#[cfg(test)]
+mod tests;

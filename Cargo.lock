@@ -5482,8 +5482,10 @@ version = "0.0.0"
 dependencies = [
  "disk_backend",
  "nvme_spec",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
+ "zerocopy",
 ]
 
 [[package]]
