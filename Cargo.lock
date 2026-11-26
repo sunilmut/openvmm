@@ -847,6 +847,7 @@ name = "closeable_mutex"
 version = "0.0.0"
 dependencies = [
  "parking_lot",
+ "test_with_tracing",
 ]
 
 [[package]]

@@ -257,6 +257,66 @@ impl<T: ?Sized> DerefMut for ClosedGuard<T> {
 mod tests {
     use crate::CloseableMutex;
     use std::sync::Arc;
+    use test_with_tracing::test;
+
+    // Test: Explicitly reopen an exclusively modified value for another thread.
+    // Expected: The next user receives every modification and can close it again.
+    #[test]
+    fn explicit_reopen_publishes_exclusive_changes() {
+        let mutex = Arc::new(CloseableMutex::new(String::from("before")));
+        let mut closed = mutex.close();
+        closed.push_str("-closed");
+        assert_eq!(&*closed, "before-closed");
+        let reopened = closed.open();
+        let returned = std::thread::spawn(move || {
+            assert_eq!(&*reopened.lock(), "before-closed");
+            let mut closed = reopened.close();
+            closed.push_str("-worker");
+            closed.open()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(&*returned.lock(), "before-closed-worker");
+    }
+
+    // Test: Release the last external reference while exclusive ownership lives.
+    // Expected: The value stays alive until either kind of closed guard is dropped,
+    //       and its destructor observes the exclusive mutation exactly once.
+    #[test]
+    fn closed_guard_retains_value_until_owner_release() {
+        struct NotifyDrop {
+            value: String,
+            output: Arc<parking_lot::Mutex<Vec<String>>>,
+        }
+        impl Drop for NotifyDrop {
+            fn drop(&mut self) {
+                self.output.lock().push(self.value.clone());
+            }
+        }
+        for permanent in [false, true] {
+            let output = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let mutex = Arc::new(CloseableMutex::new(NotifyDrop {
+                value: "owned".into(),
+                output: output.clone(),
+            }));
+            if permanent {
+                let mut guard = mutex.clone().close_permanently();
+                guard.value.push_str("-permanent");
+                assert_eq!(guard.value, "owned-permanent");
+                drop(mutex);
+                assert!(output.lock().is_empty());
+                drop(guard);
+                assert_eq!(*output.lock(), ["owned-permanent"]);
+            } else {
+                let mut guard = mutex.clone().close();
+                guard.value.push_str("-temporary");
+                drop(mutex);
+                assert!(output.lock().is_empty());
+                drop(guard);
+                assert_eq!(*output.lock(), ["owned-temporary"]);
+            }
+        }
+    }
 
     #[test]
     fn test_mutex() {
