@@ -3943,6 +3943,7 @@ version = "0.0.0"
 dependencies = [
  "inspect",
  "mesh",
+ "test_with_tracing",
  "vm_resource",
 ]
 
