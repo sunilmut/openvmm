@@ -16,3 +16,6 @@ pub mod socket;
 pub use protocol::*;
 pub use socket::SocketError;
 pub use socket::VhostUserSocket;
+
+#[cfg(test)]
+mod tests;

@@ -15,5 +15,9 @@ thiserror.workspace = true
 unix_socket.workspace = true
 zerocopy.workspace = true
 
+[dev-dependencies]
+futures.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
