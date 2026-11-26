@@ -10,3 +10,6 @@ pub mod config;
 pub mod entrypoint;
 pub mod rpc;
 pub mod worker;
+
+#[cfg(test)]
+mod contract_tests;
