@@ -7312,6 +7312,7 @@ dependencies = [
  "mesh_worker",
  "pal_async",
  "socket2",
+ "test_with_tracing",
  "tracing",
 ]
 

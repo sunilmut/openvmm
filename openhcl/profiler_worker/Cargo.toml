@@ -17,5 +17,8 @@ futures.workspace = true
 tracing.workspace = true
 socket2.workspace = true
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

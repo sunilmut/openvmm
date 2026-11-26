@@ -262,6 +262,62 @@ mod tests {
         );
     }
 
+    #[cfg(test)]
+    mod contract_tests {
+        use crate::*;
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use test_with_tracing::test;
+
+        // Test: Transfer profiling arguments and its live output socket to a worker.
+        // Expected: Argument boundaries and bidirectional socket identity survive
+        //       serialization; the worker keeps the endpoint alive until dropped.
+        #[test]
+        fn request_transfer_and_worker_own_output_connection() {
+            let (output, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let args = vec!["".to_owned(), "events:cpu cycles".into(), "name:λ".into()];
+            let parameters = ProfilerWorkerParameters {
+                profiler_request: ProfilerRequest {
+                    duration: 13,
+                    profiler_args: args.clone(),
+                    conn: output.into(),
+                },
+            };
+            let (bytes, resources) = mesh::Message::new(parameters).serialize();
+            let mut decoded: ProfilerWorkerParameters =
+                mesh::Message::serialized(&bytes, resources)
+                    .parse()
+                    .unwrap();
+            assert_eq!(decoded.profiler_request.duration, 13);
+            assert_eq!(decoded.profiler_request.profiler_args, args);
+            decoded
+                .profiler_request
+                .conn
+                .write_all(&[0x01, 0x00, 0xff])
+                .unwrap();
+            let mut observed = [0; 3];
+            peer.read_exact(&mut observed).unwrap();
+            assert_eq!(observed, [0x01, 0x00, 0xff]);
+            peer.write_all(&[0x76, 0x80]).unwrap();
+            decoded
+                .profiler_request
+                .conn
+                .read_exact(&mut observed[..2])
+                .unwrap();
+            assert_eq!(&observed[..2], &[0x76, 0x80]);
+            let worker = ProfilerWorker::new(decoded).unwrap();
+            peer.set_nonblocking(true).unwrap();
+            assert_eq!(
+                peer.read(&mut observed).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            peer.set_nonblocking(false).unwrap();
+            drop(worker);
+            assert_eq!(peer.read(&mut observed).unwrap(), 0);
+        }
+    }
+
     #[test]
     fn test_parse_meminfo_free_real_data() {
         let contents = "MemTotal:       32658576 kB\nMemFree:        11105884 kB\nMemAvailable:   26792856 kB\nBuffers:          828448 kB\nCached:         14789464 kB";
