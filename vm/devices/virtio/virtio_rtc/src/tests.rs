@@ -57,6 +57,10 @@ impl TestHarness {
     }
 
     async fn enable(&mut self) {
+        self.enable_with_state(None).await;
+    }
+
+    async fn enable_with_state(&mut self, initial_state: Option<QueueState>) {
         self.device
             .start_queue(
                 0,
@@ -73,7 +77,7 @@ impl TestHarness {
                     guest_memory: self.mem.clone(),
                 },
                 &VirtioDeviceFeatures::new(),
-                None,
+                initial_state,
             )
             .await
             .unwrap();
@@ -346,32 +350,35 @@ async fn rtc_rejects_unknown_clock(driver: DefaultDriver) {
 async fn rtc_handles_short_response_buffers(driver: DefaultDriver) {
     let mut harness = TestHarness::new(&driver);
     harness.enable().await;
-    let request = clock_request(spec::REQ_READ, 0);
-    harness.mem.write_at(REQUEST_ADDR, &request).unwrap();
-
-    for writable_len in 0..size_of::<spec::RespRead>() as u32 {
-        let (written, response) = harness
-            .submit_and_wait(REQUEST_ADDR, request.len() as u32, writable_len)
-            .await;
-        assert_eq!(
-            written,
-            writable_len.min(size_of::<spec::RespHead>() as u32)
-        );
-        if writable_len != 0 {
-            assert_eq!(response[0], spec::S_EINVAL);
-            assert!(response[1..written as usize].iter().all(|&byte| byte == 0));
-            assert!(
-                response[written as usize..]
-                    .iter()
-                    .all(|&byte| byte == 0xaa)
+    for request in [
+        clock_request(spec::REQ_READ, 0),
+        head(spec::REQ_CFG).as_bytes().to_vec(),
+    ] {
+        harness.mem.write_at(REQUEST_ADDR, &request).unwrap();
+        for writable_len in 0..16 {
+            let (written, response) = harness
+                .submit_and_wait(REQUEST_ADDR, request.len() as u32, writable_len)
+                .await;
+            assert_eq!(
+                written,
+                writable_len.min(size_of::<spec::RespHead>() as u32)
             );
+            if writable_len != 0 {
+                assert_eq!(response[0], spec::S_EINVAL);
+                assert!(response[1..written as usize].iter().all(|&byte| byte == 0));
+                assert!(
+                    response[written as usize..]
+                        .iter()
+                        .all(|&byte| byte == 0xaa)
+                );
+            }
+            let mut after_buffer = [0; 1];
+            harness
+                .mem
+                .read_at(RESPONSE_ADDR + u64::from(writable_len), &mut after_buffer)
+                .unwrap();
+            assert_eq!(after_buffer, [0xaa]);
         }
-        let mut after_buffer = [0; 1];
-        harness
-            .mem
-            .read_at(RESPONSE_ADDR + u64::from(writable_len), &mut after_buffer)
-            .unwrap();
-        assert_eq!(after_buffer, [0xaa]);
     }
 
     harness.device.stop_queue(0).await.unwrap();
@@ -397,4 +404,256 @@ async fn rtc_ignores_trailing_request_bytes(driver: DefaultDriver) {
         );
     }
     harness.device.stop_queue(0).await.unwrap();
+}
+
+// Test: Set reserved bytes in otherwise valid configuration, capability and
+//       clock-read requests, then resubmit each request with those bytes clear.
+// Expected: Invalid requests return zero-filled EINVAL replies without touching
+//       the buffer tail, and corrected requests succeed on the same queue.
+#[async_test]
+async fn rtc_rejects_reserved_bytes_and_recovers(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    harness.enable().await;
+    for (msg_type, reserved_offsets) in [
+        (spec::REQ_CFG, &[2, 7][..]),
+        (spec::REQ_CLOCK_CAP, &[2, 7, 10, 15][..]),
+        (spec::REQ_READ, &[2, 7, 10, 15][..]),
+        (spec::REQ_CROSS_CAP, &[2, 7, 11, 15][..]),
+    ] {
+        let mut request = if msg_type == spec::REQ_CFG {
+            head(msg_type).as_bytes().to_vec()
+        } else {
+            clock_request(msg_type, 0)
+        };
+        for &offset in reserved_offsets {
+            request[offset] = 1;
+            harness.mem.write_at(REQUEST_ADDR, &request).unwrap();
+            let (written, response) = harness
+                .submit_and_wait(REQUEST_ADDR, request.len() as u32, 32)
+                .await;
+            assert_eq!(written, 16, "message {msg_type:#06x}, offset {offset}");
+            assert_eq!(response[0], spec::S_EINVAL);
+            assert_eq!(&response[1..16], &[0; 15]);
+            assert_eq!(&response[16..], &[0xaa; 16]);
+            request[offset] = 0;
+        }
+        harness.mem.write_at(REQUEST_ADDR, &request).unwrap();
+        let (written, response) = harness
+            .submit_and_wait(REQUEST_ADDR, request.len() as u32, 32)
+            .await;
+        assert_eq!(written, 16);
+        assert_eq!(response[0], spec::S_OK);
+        assert_eq!(&response[16..], &[0xaa; 16]);
+    }
+    harness.device.stop_queue(0).await.unwrap();
+}
+
+// Test: Submit each truncated request-header length and an unmapped header,
+//       followed by a valid configuration query.
+// Expected: Truncation returns EINVAL, inaccessible memory returns EIO, and
+//       neither error overwrites the tail or prevents the subsequent query.
+#[async_test]
+async fn rtc_rejects_short_and_unmapped_headers(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    harness.enable().await;
+    let request = head(spec::REQ_CFG);
+    harness
+        .mem
+        .write_at(REQUEST_ADDR, request.as_bytes())
+        .unwrap();
+    for (addr, len, status) in (0..8)
+        .map(|len| (REQUEST_ADDR, len, spec::S_EINVAL))
+        .chain([(TOTAL_MEM_SIZE as u64, 8, spec::S_EIO)])
+    {
+        let (written, response) = harness.submit_and_wait(addr, len, 16).await;
+        assert_eq!(written, 8);
+        assert_eq!(response[0], status);
+        assert_eq!(&response[1..8], &[0; 7]);
+        assert_eq!(&response[8..], &[0xaa; 8]);
+    }
+    let (written, response) = harness.submit_and_wait(REQUEST_ADDR, 8, 16).await;
+    assert_eq!(written, 16);
+    let response = spec::RespCfg::read_from_bytes(&response).unwrap();
+    assert_eq!(response.head.status, spec::S_OK);
+    assert_eq!(response.num_clocks.get(), 1);
+    harness.device.stop_queue(0).await.unwrap();
+}
+
+// Test: Submit clock, cross-counter and alarm requests with missing bodies
+//       and bodies beyond mapped guest memory, then query the configuration.
+// Expected: Missing bodies return EINVAL, inaccessible bodies return EIO with
+//       the command's full response size, and the queue remains usable.
+#[async_test]
+async fn rtc_rejects_missing_and_unmapped_bodies(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    harness.enable().await;
+    let request_addr = (TOTAL_MEM_SIZE - 8) as u64;
+    for (msg_type, response_size) in [
+        (spec::REQ_CLOCK_CAP, 16),
+        (spec::REQ_READ, 16),
+        (spec::REQ_CROSS_CAP, 16),
+        (spec::REQ_READ_CROSS, 24),
+        (spec::REQ_READ_ALARM, 24),
+        (spec::REQ_SET_ALARM, 8),
+        (spec::REQ_SET_ALARM_ENABLED, 8),
+    ] {
+        let request = head(msg_type);
+        harness
+            .mem
+            .write_at(request_addr, request.as_bytes())
+            .unwrap();
+        for (readable_len, status) in [(8, spec::S_EINVAL), (32, spec::S_EIO)] {
+            let (written, response) = harness
+                .submit_and_wait(request_addr, readable_len, response_size)
+                .await;
+            assert_eq!(written, response_size, "message {msg_type:#06x}");
+            assert_eq!(response[0], status, "message {msg_type:#06x}");
+            assert!(response[1..].iter().all(|&byte| byte == 0));
+        }
+    }
+    let request = head(spec::REQ_CFG);
+    harness
+        .mem
+        .write_at(REQUEST_ADDR, request.as_bytes())
+        .unwrap();
+    let (written, response) = harness.submit_and_wait(REQUEST_ADDR, 8, 16).await;
+    assert_eq!(written, 16);
+    let response = spec::RespCfg::read_from_bytes(&response).unwrap();
+    assert_eq!(response.head.status, spec::S_OK);
+    assert_eq!(response.num_clocks.get(), 1);
+    harness.device.stop_queue(0).await.unwrap();
+}
+
+// Test: Point a configuration response descriptor outside guest memory,
+//       then submit another query with a mapped response buffer.
+// Expected: The failed write completes with zero bytes, and the next query
+//       returns the complete one-clock configuration rather than stalling.
+#[async_test]
+async fn rtc_recovers_after_an_unmapped_response(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    harness.enable().await;
+    let request = head(spec::REQ_CFG);
+    harness
+        .mem
+        .write_at(REQUEST_ADDR, request.as_bytes())
+        .unwrap();
+    write_descriptor(
+        &harness.mem,
+        DESC_ADDR,
+        0,
+        REQUEST_ADDR,
+        8,
+        DescriptorFlags::new().with_next(true),
+        1,
+    );
+    write_descriptor(
+        &harness.mem,
+        DESC_ADDR,
+        1,
+        TOTAL_MEM_SIZE as u64,
+        16,
+        DescriptorFlags::new().with_write(true),
+        0,
+    );
+    make_available(
+        &harness.mem,
+        AVAIL_ADDR,
+        QUEUE_SIZE,
+        0,
+        &mut harness.avail_idx,
+    );
+    harness.queue_event.signal();
+    let (id, written) = wait_for_used(
+        &harness.driver,
+        &harness.interrupt_event,
+        &harness.mem,
+        USED_ADDR,
+        QUEUE_SIZE,
+        &mut harness.used_idx,
+    )
+    .await;
+    assert_eq!((id, written), (0, 0));
+    let (written, response) = harness.submit_and_wait(REQUEST_ADDR, 8, 16).await;
+    assert_eq!(written, 16);
+    let response = spec::RespCfg::read_from_bytes(&response).unwrap();
+    assert_eq!(response.head.status, spec::S_OK);
+    assert_eq!(response.num_clocks.get(), 1);
+    harness.device.stop_queue(0).await.unwrap();
+}
+
+// Test: Convert timestamps before the Unix epoch and on either side of the
+//       u64 nanosecond limit, using 100ns-aligned times on all supported hosts.
+// Expected: Negative and overflowing timestamps fail; the last aligned value
+//       below the limit retains its exact nanosecond value.
+#[test]
+fn rtc_clock_conversion_rejects_out_of_range_timestamps() {
+    use std::time::Duration;
+
+    let last = u64::MAX - u64::MAX % 100;
+    let time = UNIX_EPOCH.checked_add(Duration::from_nanos(last)).unwrap();
+    assert_eq!(clock_reading_ns(time).unwrap(), last);
+    assert!(clock_reading_ns(time + Duration::from_nanos(100)).is_err());
+    assert!(clock_reading_ns(UNIX_EPOCH - Duration::from_secs(1)).is_err());
+}
+
+// Test: Query capabilities for nonexistent clocks and submit an unknown
+//       request type on the same queue.
+// Expected: Missing clocks return ENODEV in the command's full response shape,
+//       whereas an unsupported command returns only an EOPNOTSUPP header.
+#[async_test]
+async fn rtc_distinguishes_unknown_clocks_from_unknown_requests(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    harness.enable().await;
+    for (msg_type, clock_id, response_size, status) in [
+        (spec::REQ_CLOCK_CAP, u16::MAX, 16, spec::S_ENODEV),
+        (spec::REQ_CROSS_CAP, 1, 16, spec::S_ENODEV),
+        (spec::REQ_READ_CROSS, 1, 24, spec::S_ENODEV),
+        (u16::MAX, 0, 8, spec::S_EOPNOTSUPP),
+    ] {
+        let request = clock_request(msg_type, clock_id);
+        harness.mem.write_at(REQUEST_ADDR, &request).unwrap();
+        let (written, response) = harness
+            .submit_and_wait(REQUEST_ADDR, request.len() as u32, response_size)
+            .await;
+        assert_eq!(written, response_size);
+        assert_eq!(response[0], status);
+        assert!(response[1..].iter().all(|&byte| byte == 0));
+    }
+    harness.device.stop_queue(0).await.unwrap();
+}
+
+// Test: Stop an inactive queue, then complete requests on either side of a
+//       queue stop and restore using its exported state.
+// Expected: Inactive stop is harmless, restored requests return valid data,
+//       and the guest used ring contains exactly two completions, not replays.
+#[async_test]
+async fn rtc_restores_queue_progress_without_replaying_requests(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver);
+    assert!(harness.device.stop_queue(0).await.is_none());
+    harness.enable().await;
+    let request = head(spec::REQ_CFG);
+    harness
+        .mem
+        .write_at(REQUEST_ADDR, request.as_bytes())
+        .unwrap();
+    let (written, response) = harness.submit_and_wait(REQUEST_ADDR, 8, 16).await;
+    assert_eq!(written, 16);
+    let response = spec::RespCfg::read_from_bytes(&response).unwrap();
+    assert_eq!(response.head.status, spec::S_OK);
+    assert_eq!(response.num_clocks.get(), 1);
+
+    let state = harness.device.stop_queue(0).await.unwrap();
+    assert!(harness.device.supports_save_restore());
+    harness.enable_with_state(Some(state)).await;
+    let request = clock_request(spec::REQ_CLOCK_CAP, 0);
+    harness.mem.write_at(REQUEST_ADDR, &request).unwrap();
+    let (written, response) = harness.submit_and_wait(REQUEST_ADDR, 16, 16).await;
+    assert_eq!(written, 16);
+    let response = spec::RespClockCap::read_from_bytes(&response).unwrap();
+    assert_eq!(response.head.status, spec::S_OK);
+    assert_eq!(response.clock_type, spec::CLOCK_UTC_MAYBE_SMEARED);
+    harness.device.stop_queue(0).await.unwrap();
+    let mut used_index = [0; 2];
+    harness.mem.read_at(USED_ADDR + 2, &mut used_index).unwrap();
+    assert_eq!(u16::from_le_bytes(used_index), 2);
 }
