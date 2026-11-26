@@ -4569,6 +4569,7 @@ dependencies = [
  "inspect",
  "jiff",
  "parking_lot",
+ "test_with_tracing",
 ]
 
 [[package]]

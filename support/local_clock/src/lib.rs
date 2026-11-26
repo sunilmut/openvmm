@@ -344,3 +344,108 @@ mod inspect_ext {
     pub trait InspectableLocalClock: LocalClock + Inspect {}
     impl<T: LocalClock + Inspect> InspectableLocalClock for T {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+    use test_with_tracing::test;
+
+    // Test: Convert epoch-relative times and compute signed deltas across the epoch.
+    // Expected: Millisecond values round-trip exactly, submillisecond inputs truncate toward zero, and signed arithmetic retains direction.
+    #[test]
+    fn epoch_conversions_and_signed_arithmetic_preserve_milliseconds() {
+        for millis in [-86_400_001, -1001, -1, 0, 1, 1001, 86_400_001] {
+            let time = LocalClockTime::from_millis_since_unix_epoch(millis);
+            let system = if millis < 0 {
+                std::time::UNIX_EPOCH - Duration::from_millis(millis.unsigned_abs())
+            } else {
+                std::time::UNIX_EPOCH + Duration::from_millis(millis as u64)
+            };
+            assert_eq!(
+                LocalClockTime::from(system).as_millis_since_unix_epoch(),
+                millis
+            );
+            assert_eq!(SystemTime::from(time), system);
+            assert_eq!(
+                (time + LocalClockDelta::from_millis(37) - LocalClockDelta::from_millis(37))
+                    .as_millis_since_unix_epoch(),
+                millis
+            );
+        }
+        assert_eq!(
+            LocalClockTime::from(std::time::UNIX_EPOCH - Duration::from_nanos(999_999))
+                .as_millis_since_unix_epoch(),
+            0
+        );
+        assert_eq!(
+            LocalClockTime::from(std::time::UNIX_EPOCH + Duration::from_nanos(999_999))
+                .as_millis_since_unix_epoch(),
+            0
+        );
+        let earlier = LocalClockTime::from_millis_since_unix_epoch(-1250);
+        let later = LocalClockTime::from_millis_since_unix_epoch(750);
+        assert_eq!((later - earlier).as_millis(), 2000);
+        assert_eq!((earlier - later).as_millis(), -2000);
+        assert_eq!(
+            (LocalClockDelta::from_millis(-3) + LocalClockDelta::from_millis(8)).as_millis(),
+            5
+        );
+        assert_eq!(
+            (LocalClockDelta::from_millis(-3) - LocalClockDelta::from_millis(8)).as_millis(),
+            -11
+        );
+        assert_eq!(
+            LocalClockDelta::from(Duration::from_micros(1234)).as_millis(),
+            1
+        );
+        assert_eq!(LocalClockDelta::default().as_millis(), 0);
+        assert_eq!(LocalClockTime::default().as_millis_since_unix_epoch(), 0);
+    }
+
+    // Test: Share mock clock accessors across reprogramming, forward/backward ticks, and owner drop.
+    // Expected: Accessors observe one shared clock, independent clocks remain unchanged, and surviving accessors retain usable time storage.
+    #[test]
+    fn mock_accessors_share_reprogrammed_time_but_not_other_clocks() {
+        let mut clock = MockLocalClock::new();
+        let mut independent = MockLocalClock::new();
+        let untouched = independent.get_time();
+        let accessor = clock.accessor();
+        let clone = accessor.clone();
+        clock.set_time(LocalClockTime::from_millis_since_unix_epoch(-10));
+        clone.tick(Duration::from_millis(15));
+        assert_eq!(clock.get_time().as_millis_since_unix_epoch(), 5);
+        accessor.tick_backwards(Duration::from_millis(8));
+        assert_eq!(clone.get_time().as_millis_since_unix_epoch(), -3);
+        assert_eq!(clock.get_time().as_millis_since_unix_epoch(), -3);
+        assert_eq!(independent.get_time(), untouched);
+        drop(clock);
+        clone.tick(Duration::from_micros(1999));
+        assert_eq!(accessor.get_time().as_millis_since_unix_epoch(), -2);
+    }
+
+    // Test: Convert UTC timestamps, zoned timestamps and signed durations at ordinary and representability boundaries.
+    // Expected: Zone offsets do not change the instant; exact milliseconds survive conversion and timestamps outside Jiff's domain return errors.
+    #[cfg(feature = "jiff_exts")]
+    #[test]
+    fn jiff_conversions_preserve_instant_and_reject_out_of_range_time() {
+        for millis in [-123456789, 0, 123456789] {
+            let timestamp = jiff::Timestamp::from_millisecond(millis).unwrap();
+            let local = LocalClockTime::from(timestamp);
+            assert_eq!(local.as_millis_since_unix_epoch(), millis);
+            assert_eq!(jiff::Timestamp::try_from(local).unwrap(), timestamp);
+            let zoned = timestamp.to_zoned(jiff::tz::TimeZone::fixed(jiff::tz::offset(5)));
+            assert_eq!(LocalClockTime::from(zoned), local);
+            let duration = jiff::SignedDuration::from_millis(millis);
+            let delta = LocalClockDelta::from(duration);
+            assert_eq!(delta.as_millis(), millis);
+            assert_eq!(jiff::SignedDuration::from(delta), duration);
+        }
+        for millis in [i64::MIN, i64::MAX] {
+            assert!(
+                jiff::Timestamp::try_from(LocalClockTime::from_millis_since_unix_epoch(millis))
+                    .is_err()
+            );
+        }
+    }
+}

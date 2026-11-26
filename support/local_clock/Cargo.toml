@@ -18,5 +18,8 @@ inspect = { workspace = true, optional = true, features = ["std"] }
 parking_lot.workspace = true
 jiff = { workspace = true, optional = true }
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
