@@ -413,4 +413,46 @@ mod tests {
         assert_eq!(traits.max_queues, 1);
         assert_eq!(traits.device_register_length, 0);
     }
+
+    // Test: Submit writable buffers immediately below, at, and above the 64 KiB request cap.
+    // Expected: Completion lengths respect both limits and bytes outside the completed region stay intact.
+    #[async_test]
+    async fn rng_request_cap_preserves_unwritten_guest_memory(driver: DefaultDriver) {
+        let mut harness = TestHarness::new(&driver);
+        harness.enable().await;
+        for len in [65_535u32, 65_536, 65_537] {
+            let original = vec![0x5a; len as usize + 2];
+            harness.mem.write_at(DATA_BASE - 1, &original).unwrap();
+            let (id, written) = harness.submit_and_wait(DATA_BASE, len).await;
+            assert_eq!(id, 0);
+            assert_eq!(written, len.min(65_536));
+            let mut result = vec![0; original.len()];
+            harness.mem.read_at(DATA_BASE - 1, &mut result).unwrap();
+            assert_eq!(result[0], 0x5a);
+            assert_eq!(
+                &result[written as usize + 1..],
+                &original[written as usize + 1..]
+            );
+            assert_ne!(
+                &result[1..written as usize + 1],
+                &original[1..written as usize + 1]
+            );
+        }
+    }
+
+    // Test: Follow an unmapped writable buffer with a valid request on the same queue.
+    // Expected: The invalid write completes with zero bytes and does not prevent later entropy delivery.
+    #[async_test]
+    async fn rng_invalid_guest_buffer_does_not_poison_queue(driver: DefaultDriver) {
+        let mut harness = TestHarness::new(&driver);
+        harness.enable().await;
+        let (id, written) = harness.submit_and_wait(TOTAL_MEM_SIZE as u64, 64).await;
+        assert_eq!((id, written), (0, 0));
+        harness.mem.write_at(DATA_BASE, &[0; 64]).unwrap();
+        let (id, written) = harness.submit_and_wait(DATA_BASE, 64).await;
+        assert_eq!((id, written), (0, 64));
+        let mut result = [0; 64];
+        harness.mem.read_at(DATA_BASE, &mut result).unwrap();
+        assert_ne!(result, [0; 64]);
+    }
 }
