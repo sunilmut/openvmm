@@ -186,3 +186,47 @@ impl<T> VpExecToken<T> {
         (self.vp_index, self.vtl, cmd)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use test_with_tracing::test;
+
+    struct CountDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    // Test: Replace a token's owned command, then consume and execute its final
+    //       command on an owned state object rather than a real virtual processor.
+    // Expected: Replacement drops the old capture without running it; routing
+    //       survives and only the final command runs, releasing its capture once.
+    #[test]
+    fn replacing_owned_command_preserves_routing_and_releases_captures() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let old_capture = CountDrop(drops.clone());
+        let final_capture = CountDrop(drops.clone());
+        let token = VpExecToken::new(2047, Vtl::Vtl1)
+            .command(move |state: &mut Vec<&str>| {
+                let _capture = old_capture;
+                state.push("old command");
+            })
+            .command(move |state| {
+                let _capture = final_capture;
+                state.push("final command");
+            });
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        let (vp, vtl, command) = token.get();
+        assert_eq!((vp, vtl), (2047, Vtl::Vtl1));
+        let mut state = Vec::new();
+        command.unwrap()(&mut state);
+        assert_eq!(state, ["final command"]);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+}

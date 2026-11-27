@@ -20,6 +20,9 @@ thiserror.workspace = true
 zerocopy.workspace = true
 nostd_spin_channel.workspace = true
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [target.'cfg(target_os = "uefi")'.dependencies]
 linked_list_allocator.workspace = true
 uefi = { workspace = true, features = ["alloc"] }

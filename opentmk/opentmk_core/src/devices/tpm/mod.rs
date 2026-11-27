@@ -69,3 +69,19 @@ impl TpmUtil {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Build the padded self-test buffer used for TPM device submission.
+    // Expected: The TPM2_SelfTest wire packet requests a full test with its
+    //       eleven-byte big-endian header, and every unused buffer byte is zero.
+    #[test]
+    fn self_test_buffer_has_exact_wire_packet_and_zero_padding() {
+        let buffer = TpmUtil::get_self_test_cmd();
+        assert_eq!(&buffer[..11], &[0x80, 0x01, 0, 0, 0, 11, 0, 0, 1, 0x43, 1]);
+        assert!(buffer[11..].iter().all(|&byte| byte == 0));
+    }
+}

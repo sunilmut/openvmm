@@ -3593,6 +3593,188 @@ mod tests {
     use super::protocol::common::*;
     use super::protocol::*;
     use super::*;
+    use test_with_tracing::test;
+
+    // Test: Encode empty, one-byte and maximum-sized TPM2B payloads, then parse
+    //       exact packets, trailing outer data and every truncated packet prefix.
+    // Expected: Big-endian lengths and payload bytes are exact, unused storage
+    //       is zero, and oversized or truncated inputs are rejected without panic.
+    #[test]
+    fn sized_buffers_enforce_wire_lengths_and_capacity_boundaries() {
+        let maximum: Vec<u8> = (0u8..=u8::MAX).cycle().take(1024).collect();
+        for payload in [&[][..], &[0xfe][..], &maximum[..]] {
+            let buffer = Tpm2bBuffer::new(payload).unwrap();
+            let mut expected = (payload.len() as u16).to_be_bytes().to_vec();
+            expected.extend_from_slice(payload);
+            assert_eq!(buffer.serialize(), expected);
+            assert_eq!(buffer.payload_size(), expected.len());
+            assert!(buffer.buffer[payload.len()..].iter().all(|&b| b == 0));
+            for end in 0..expected.len() {
+                assert!(Tpm2bBuffer::deserialize(&expected[..end]).is_none());
+            }
+            let mut outer = expected.clone();
+            outer.extend_from_slice(&[0xcc, 0xdd]);
+            let decoded = Tpm2bBuffer::deserialize(&outer).unwrap();
+            assert_eq!(&decoded.buffer[..payload.len()], payload);
+            assert_eq!(decoded.serialize(), expected);
+        }
+        assert!(matches!(
+            Tpm2bBuffer::new(&[0; 1025]),
+            Err(InvalidInput::BufferSizeTooLarge(1025, 1024))
+        ));
+        assert!(Tpm2bBuffer::deserialize(&[0x04, 0x01]).is_none());
+    }
+
+    // Test: Serialize and parse a list of differently sized PCR bitmaps, then
+    //       exercise truncation, excess bitmap width and the five-entry limit.
+    // Expected: Every entry boundary and hash/bitmap survives; malformed lists
+    //       and the sixth entry are rejected instead of silently losing entries.
+    #[test]
+    fn pcr_lists_preserve_variable_entry_boundaries_and_enforce_limits() {
+        let selections = [
+            PcrSelection {
+                hash: AlgIdEnum::SHA.into(),
+                size_of_select: 1,
+                bitmap: [0x81, 0, 0],
+            },
+            PcrSelection {
+                hash: AlgIdEnum::SHA256.into(),
+                size_of_select: 3,
+                bitmap: [1, 0x80, 0x55],
+            },
+        ];
+        let expected = [0, 0, 0, 2, 0, 4, 1, 0x81, 0, 0x0b, 3, 1, 0x80, 0x55];
+        let list = TpmlPcrSelection::new(&selections).unwrap();
+        assert_eq!(list.serialize(), expected);
+        let decoded = TpmlPcrSelection::deserialize(&expected).unwrap();
+        assert_eq!(decoded.count.get(), 2);
+        assert_eq!(decoded.pcr_selections[0].hash.0.get(), 4);
+        assert_eq!(decoded.pcr_selections[0].size_of_select, 1);
+        assert_eq!(decoded.pcr_selections[0].bitmap, [0x81, 0, 0]);
+        assert_eq!(decoded.pcr_selections[1].hash.0.get(), 0x0b);
+        assert_eq!(decoded.pcr_selections[1].bitmap, [1, 0x80, 0x55]);
+        assert_eq!(decoded.payload_size(), expected.len());
+        for end in 0..expected.len() {
+            assert!(TpmlPcrSelection::deserialize(&expected[..end]).is_none());
+        }
+        assert_eq!(
+            TpmlPcrSelection::new(&[]).unwrap().serialize(),
+            [0, 0, 0, 0]
+        );
+        let maximum = [selections[0]; 5];
+        let encoded = TpmlPcrSelection::new(&maximum).unwrap().serialize();
+        assert_eq!(
+            TpmlPcrSelection::deserialize(&encoded).unwrap().count.get(),
+            5
+        );
+        assert!(matches!(
+            TpmlPcrSelection::new(&[selections[0]; 6]),
+            Err(InvalidInput::PcrSelectionsLengthTooLong(6, 5))
+        ));
+        assert!(TpmlPcrSelection::deserialize(&[0, 0, 0, 6]).is_none());
+        assert!(TpmlPcrSelection::deserialize(&[0, 0, 0, 1, 0, 4, 4]).is_none());
+    }
+
+    // Test: Validate success replies at and below their minimum size, wrong
+    //       session tags, and unknown-code failure replies with header-only sizes.
+    // Expected: Success minimums and caller tags are enforced; failures use the
+    //       no-session header protocol and retain failure rather than panic.
+    #[test]
+    fn reply_headers_enforce_success_and_failure_protocol_boundaries() {
+        let mut header = ReplyHeader {
+            session_tag: 0x8002.into(),
+            size: 25.into(),
+            response_code: 0.into(),
+        };
+        assert!(
+            header
+                .base_validation(SessionTagEnum::Sessions.into(), 25)
+                .unwrap()
+        );
+        header.size = 26.into();
+        assert!(
+            header
+                .base_validation(SessionTagEnum::Sessions.into(), 25)
+                .unwrap()
+        );
+        header.size = 24.into();
+        assert!(matches!(
+            header.base_validation(SessionTagEnum::Sessions.into(), 25),
+            Err(ResponseValidationError::HeaderResponseSizeMismatch {
+                size: 24,
+                expected_size: 25,
+                command_succeeded: true,
+            })
+        ));
+        header.size = 25.into();
+        header.session_tag = 0x8001.into();
+        assert!(matches!(
+            header.base_validation(SessionTagEnum::Sessions.into(), 25),
+            Err(ResponseValidationError::HeaderSessionTagMismatch {
+                response_session_tag: 0x8001,
+                expected_session_tag: 0x8002,
+                command_succeeded: true,
+            })
+        ));
+        header.response_code = 0xdead_beef.into();
+        header.size = 10.into();
+        assert!(
+            !header
+                .base_validation(SessionTagEnum::Sessions.into(), 25)
+                .unwrap()
+        );
+        header.size = 9.into();
+        assert!(matches!(
+            header.base_validation(SessionTagEnum::Sessions.into(), 25),
+            Err(ResponseValidationError::HeaderResponseSizeMismatch {
+                size: 9,
+                expected_size: 10,
+                command_succeeded: false,
+            })
+        ));
+        let success = [0x80, 1, 0, 0, 0, 10, 0, 0, 0, 0];
+        for end in 0..success.len() {
+            assert!(matches!(
+                SelfTestCmd::base_validate_reply(&success[..end], SessionTagEnum::NoSessions),
+                Err(ResponseValidationError::ResponseSizeTooSmall)
+            ));
+        }
+        assert!(
+            SelfTestCmd::base_validate_reply(&success, SessionTagEnum::NoSessions)
+                .unwrap()
+                .1
+        );
+    }
+
+    // IGNORED: entry320-bug1; failure tag errors currently report the successful
+    //       command's tag instead of the required no-session failure tag.
+    //       Keep the reproducer until a separately authorized production fix.
+    //
+    // Test: Report a failed session-bearing reply whose tag must instead be the
+    //       no-session tag required by the TPM failure-response protocol.
+    // Expected: The error reports the required no-session tag, not the original
+    //       successful-command tag, so the diagnostic explains the actual mismatch.
+    #[test]
+    #[ignore = "entry320-bug1: failure tag diagnostic reports the caller's success tag"]
+    fn failure_reply_tag_error_reports_required_failure_protocol_tag() {
+        let header = ReplyHeader {
+            session_tag: 0x8002.into(),
+            size: 10.into(),
+            response_code: 0x101.into(),
+        };
+        match header.base_validation(SessionTagEnum::Sessions.into(), 25) {
+            Err(ResponseValidationError::HeaderSessionTagMismatch {
+                response_session_tag,
+                expected_session_tag,
+                command_succeeded,
+            }) => {
+                assert_eq!(response_session_tag, 0x8002);
+                assert!(!command_succeeded);
+                assert_eq!(expected_session_tag, 0x8001);
+            }
+            other => panic!("expected a failed-reply tag mismatch, got {other:?}"),
+        }
+    }
 
     #[test]
     fn test_create_primary() {

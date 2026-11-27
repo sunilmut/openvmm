@@ -122,3 +122,71 @@ cfg_select! {
 pub fn init() -> Result<(), SetLoggerError> {
     log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Debug))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use log::Log;
+    use test_with_tracing::test;
+
+    // Test: Format escaped Unicode messages and emit consecutive records through
+    //       an owned writer, including a record without source information.
+    // Expected: Each record is one complete JSON line with lossless fields;
+    //       optional termination changes framing, not the JSON data.
+    #[test]
+    fn owned_logger_preserves_json_fields_and_record_boundaries() {
+        let message = "quotes \" slash \\ newline\n tab\t emoji \u{1f642}";
+        let expected = serde_json::json!({
+            "type": "log",
+            "level": "INFO",
+            "message": message,
+            "line": "fixture.rs:27",
+        });
+        for terminate in [false, true] {
+            let output =
+                format_log_string_to_json(message, "fixture.rs:27", terminate, log::Level::Info);
+            assert_eq!(output.ends_with('\n'), terminate);
+            assert_eq!(
+                output.bytes().filter(|&b| b == b'\n').count(),
+                usize::from(terminate)
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&output).unwrap(),
+                expected
+            );
+        }
+        let logger = TmkLogger::new(String::new());
+        logger.log(
+            &log::Record::builder()
+                .args(format_args!("{message}"))
+                .level(log::Level::Info)
+                .file(Some("fixture.rs"))
+                .line(Some(27))
+                .build(),
+        );
+        logger.log(
+            &log::Record::builder()
+                .args(format_args!("without source {}", 9))
+                .level(log::Level::Warn)
+                .build(),
+        );
+        let output = logger.get_writer();
+        assert!(output.ends_with('\n'));
+        let entries: Vec<serde_json::Value> = output
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                expected,
+                serde_json::json!({
+                    "type": "log",
+                    "level": "WARN",
+                    "message": "without source 9",
+                    "line": ":0",
+                }),
+            ]
+        );
+    }
+}

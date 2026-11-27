@@ -5976,6 +5976,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spin",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "uart_16550",
  "uefi",
