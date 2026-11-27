@@ -51,4 +51,24 @@ mod tests {
             command_line(core::str::from_utf8(&[b'x'; MAX_CMDLINE_SIZE + 1]).unwrap()).is_err()
         );
     }
+
+    // Test: Validate options exactly at the size limit (with and without a
+    //       final newline), BMP characters at the UCS-2 boundary, and C1
+    //       control characters.
+    // Expected: The limit is inclusive and counts the line ending; non-control
+    //       BMP characters up to U+FFFF are allowed; C1 controls are rejected.
+    #[test]
+    fn size_limit_and_ucs2_boundaries() {
+        let max = [b'x'; MAX_CMDLINE_SIZE];
+        let max = core::str::from_utf8(&max).unwrap();
+        assert_eq!(command_line(max), Ok(max));
+        let mut with_newline = [b'x'; MAX_CMDLINE_SIZE];
+        with_newline[MAX_CMDLINE_SIZE - 1] = b'\n';
+        let with_newline = core::str::from_utf8(&with_newline).unwrap();
+        assert_eq!(command_line(with_newline), Ok(&max[..MAX_CMDLINE_SIZE - 1]));
+        assert_eq!(command_line("é \u{ffff}"), Ok("é \u{ffff}"));
+        for text in ["x\u{85}", "x\u{9f}", "x\u{7f}"] {
+            assert!(command_line(text).is_err(), "{text:?}");
+        }
+    }
 }
