@@ -133,8 +133,8 @@ async fn exchange_connection(
 }
 
 // Test: Issue unary gRPC calls with split frames and every supported timeout unit.
-// Expected: Service inputs, inherited deadlines, literal response bytes, and success
-//           trailers survive the real HTTP/2 transport.
+// Expected: Service inputs, decoded deadlines, literal response bytes, and success
+//       trailers survive the real HTTP/2 transport.
 #[test]
 fn grpc_unary_requests_preserve_payloads_and_deadlines() {
     DefaultPool::run_with(async |driver| {
@@ -244,7 +244,7 @@ fn grpc_rejects_invalid_http_requests() {
 
 // Test: Route unknown, malformed, explicitly failed, and abandoned gRPC calls.
 // Expected: HTTP stays successful while trailers preserve distinct RPC status codes,
-//           messages, and protobuf status details.
+//       messages, and protobuf status details.
 #[test]
 fn grpc_failures_preserve_status_trailers_and_details() {
     use base64::Engine;

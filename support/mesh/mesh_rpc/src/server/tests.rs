@@ -18,6 +18,9 @@ mod items {
     include!(concat!(env!("OUT_DIR"), "/ttrpc.example.v1.rs"));
 }
 
+// Test: Exchange a typed call and an unknown method over a paired connection.
+// Expected: Request/reply fields survive, unknown methods report Unimplemented,
+//       and both client and server finish after shutdown.
 #[test]
 fn client_server() {
     let (c, s) = unix_socket::UnixStream::pair().unwrap();
@@ -87,6 +90,7 @@ mod grpc;
 struct SocketPath(std::path::PathBuf);
 
 impl SocketPath {
+    /// Binds a unique test socket before taking ownership of its path cleanup.
     fn bind() -> (Self, unix_socket::UnixListener) {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -94,18 +98,26 @@ impl SocketPath {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = Self(std::env::temp_dir().join(format!(
+        let path = std::env::temp_dir().join(format!(
             "rpc-{}-{stamp:x}-{sequence}.sock",
             std::process::id()
-        )));
-        let listener = unix_socket::UnixListener::bind(&path.0).unwrap();
-        (path, listener)
+        ));
+        let listener = unix_socket::UnixListener::bind(&path).unwrap();
+        (Self(path), listener)
     }
 }
 
 impl Drop for SocketPath {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        if let Err(error) = std::fs::remove_file(&self.0) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    path = %self.0.display(),
+                    %error,
+                    "Failed to remove test socket"
+                );
+            }
+        }
     }
 }
 

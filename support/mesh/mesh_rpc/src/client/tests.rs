@@ -34,6 +34,8 @@ impl Dial for FailDial {
     }
 }
 
+// Test: Start a call through a dialer that rejects the connection.
+// Expected: The call reports Unavailable with the connection failure diagnostic.
 #[async_test]
 async fn test_failed_connect(driver: DefaultDriver) {
     let client = Client::new(&driver, FailDial);
@@ -47,23 +49,29 @@ async fn test_failed_connect(driver: DefaultDriver) {
     assert!(err.message.contains("not connected"));
 }
 
+// Test: Bound a never-connected call with a shorter external cancellation timeout.
+// Expected: External DeadlineExceeded occurs while the call remains pending.
 #[async_test]
 async fn test_delayed_connect_never(driver: DefaultDriver) {
     let client = Client::new(&driver, NeverDial);
 
-    // The request should not fail within the cancel context timeout.
-    CancelContext::new()
-        .with_timeout(Duration::from_millis(250))
-        .until_cancelled(
-            client
-                .call()
-                .deadline(Some(Deadline::now() + Duration::from_mins(1)))
-                .start_raw("service", "method", vec![]),
-        )
-        .await
-        .unwrap_err();
+    assert_eq!(
+        CancelContext::new()
+            .with_timeout(Duration::from_millis(250))
+            .until_cancelled(
+                client
+                    .call()
+                    .deadline(Some(Deadline::now() + Duration::from_mins(1)))
+                    .start_raw("service", "method", vec![]),
+            )
+            .await
+            .unwrap_err(),
+        mesh::CancelReason::DeadlineExceeded
+    );
 }
 
+// Test: Give a never-connected call its own short deadline.
+// Expected: The client reports DeadlineExceeded when that deadline expires.
 #[async_test]
 async fn test_delayed_connect(driver: DefaultDriver) {
     let client = Client::new(&driver, NeverDial);
@@ -113,7 +121,7 @@ async fn existing_connection_can_only_be_consumed_once() {
 
 // Test: Receive malformed, wrong-type, explicit-error, oversized, and valid replies.
 // Expected: Client status codes distinguish each failure, and unsolicited stream IDs
-//           cannot consume the valid reply for an outstanding call.
+//       cannot consume the valid reply for an outstanding call.
 #[async_test]
 async fn wire_responses_preserve_error_classification_and_stream_routing(driver: DefaultDriver) {
     use crate::message::{MESSAGE_TYPE_RESPONSE, Request, Response, read_message, write_message};
