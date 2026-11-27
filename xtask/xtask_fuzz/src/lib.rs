@@ -76,3 +76,63 @@ macro_rules! fuzz_target {
         }
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CHILD_MARKER: &str = "xtask-fuzz-child-ran";
+
+    // Test: Outside repro mode, query the mode, initialize tracing and use the
+    //       repro-only print macro; then rerun in a child process with
+    //       XTASK_FUZZ_REPRO and OPENVMM_LOG set and repeat the same steps.
+    // Expected: Without repro mode nothing is installed or printed and macro
+    //       arguments are not evaluated; in repro mode tracing initializes once
+    //       (a second call is harmless) and the macro prints.
+    #[test]
+    fn non_repro_mode_is_inert() {
+        if std::env::var_os("XTASK_FUZZ_REPRO").is_some() {
+            return repro_child_checks();
+        }
+        assert!(!is_repro());
+        assert!(!is_repro());
+        init_tracing_if_repro();
+        assert!(!tracing::dispatcher::has_been_set());
+        let mut evaluated = false;
+        fuzz_eprintln!("{}", {
+            evaluated = true;
+            0
+        });
+        assert!(!evaluated);
+
+        // Re-run this test in a child process with repro mode enabled.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::non_repro_mode_is_inert",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("XTASK_FUZZ_REPRO", "1")
+            .env("OPENVMM_LOG", "xtask_fuzz=debug")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(stderr.contains(CHILD_MARKER), "{stderr}");
+    }
+
+    /// Repro-mode checks, run only inside the child process started above.
+    fn repro_child_checks() {
+        assert!(is_repro());
+        init_tracing_if_repro();
+        init_tracing_if_repro();
+        assert!(tracing::dispatcher::has_been_set());
+        let mut evaluated = false;
+        fuzz_eprintln!("{} {}", CHILD_MARKER, {
+            evaluated = true;
+            1
+        });
+        assert!(evaluated);
+    }
+}
