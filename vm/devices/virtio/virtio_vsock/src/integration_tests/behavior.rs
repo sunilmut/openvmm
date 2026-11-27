@@ -273,3 +273,31 @@ async fn send_half_close_drains_data_and_keeps_reply_direction_alive(driver: Def
     }
     assert_eq!(received, reply);
 }
+
+// Test: Submit oversized and truncated RW payload declarations on an established
+// connection, followed by a valid binary packet.
+// Expected: Invalid descriptors complete without forwarding their bytes or
+// breaking the connection; the host receives only the valid packet.
+#[async_test]
+async fn malformed_payload_lengths_do_not_poison_the_connection(driver: DefaultDriver) {
+    let mut harness = TestHarness::new(&driver, tempfile::tempdir().unwrap());
+    let mut listener = harness.create_port_listener(1234);
+    harness.enable().await;
+    let stream = harness
+        .connect_guest_to_host(&mut listener, 1024, 1234)
+        .await;
+    let mut stream = PolledSocket::new(&driver, stream).unwrap();
+    for declared_length in [u32::MAX, 16] {
+        let header = harness.guest_header(1024, 1234, Operation::RW, declared_length, 0);
+        let descriptor = harness.post_tx_packet(&header, b"bad");
+        assert_eq!(harness.wait_for_tx_used().await, (descriptor, 0));
+    }
+
+    let expected = b"ok\0\xffdata";
+    let header = harness.guest_header(1024, 1234, Operation::RW, expected.len() as u32, 0);
+    let descriptor = harness.post_tx_packet(&header, expected);
+    assert_eq!(harness.wait_for_tx_used().await, (descriptor, 0));
+    let mut received = [0; 8];
+    stream.read_exact(&mut received).await.unwrap();
+    assert_eq!(&received, expected);
+}
