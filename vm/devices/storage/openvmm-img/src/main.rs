@@ -1350,3 +1350,190 @@ mod tests {
         assert_eq!(std::fs::read(output_path).unwrap(), data);
     }
 }
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use pal_async::DefaultDriver;
+    use test_with_tracing::test;
+
+    fn command(args: &[&str]) -> Command {
+        CliArgs::try_parse_from(std::iter::once("openvmm-img").chain(args.iter().copied()))
+            .unwrap()
+            .command
+    }
+
+    fn arg(path: &std::path::Path) -> &str {
+        path.to_str().unwrap()
+    }
+
+    // Test: Through the CLI dispatcher, convert a patterned raw image to a
+    //       dynamic VHDX, then to a fixed VHDX, then back to raw, and run
+    //       info, map and check on the VHDX outputs.
+    // Expected: Every command succeeds, the outputs keep the disk size with
+    //       the requested allocation, and the final raw image equals the
+    //       original byte-for-byte, including a partial final chunk and zeros.
+    #[pal_async::async_test]
+    async fn cli_converts_through_both_vhdx_allocations(driver: DefaultDriver) {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("in.img");
+        let dynamic = dir.path().join("dyn.vhdx");
+        let fixed = dir.path().join("fixed.vhdx");
+        let out = dir.path().join("out.raw");
+        let mut data = vec![0u8; 3 * 1024 * 1024 + 4096];
+        data[..4096].fill(0x11);
+        data[2 * 1024 * 1024 + 512..2 * 1024 * 1024 + 1024].fill(0x22);
+        data[3 * 1024 * 1024..].fill(0x33);
+        fs_err::write(&raw, &data).unwrap();
+
+        for args in [
+            vec![
+                "convert",
+                arg(&raw),
+                "-o",
+                arg(&dynamic),
+                "--output-format",
+                "vhdx",
+            ],
+            vec![
+                "convert",
+                arg(&dynamic),
+                "-o",
+                arg(&fixed),
+                "--output-format",
+                "vhdx",
+                "--format-options",
+                "allocation=fixed",
+            ],
+            vec!["info", arg(&fixed), "--json"],
+            vec!["info", arg(&dynamic)],
+            vec!["map", arg(&dynamic), "--json"],
+            vec!["map", arg(&fixed)],
+            vec!["check", arg(&fixed)],
+            vec![
+                "convert",
+                arg(&fixed),
+                "-o",
+                arg(&out),
+                "--output-format",
+                "raw",
+            ],
+            vec!["format-options"],
+            vec!["format-options", "raw"],
+            vec!["format-options", "vhdx"],
+        ] {
+            run(command(&args), &driver)
+                .await
+                .unwrap_or_else(|e| panic!("{args:?}: {e:#}"));
+        }
+        assert_eq!(fs_err::read(&out).unwrap(), data);
+        for (path, fully_allocated) in [(&dynamic, false), (&fixed, true)] {
+            let image = VhdxFile::open(BlockingFile::open(path, true).unwrap())
+                .read_only()
+                .await
+                .unwrap();
+            assert_eq!(image.disk_size(), data.len() as u64);
+            assert_eq!(
+                image.is_fully_allocated(),
+                fully_allocated,
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    // Test: Request unsupported or ambiguous conversions and creations through
+    //       the CLI dispatcher, including a differencing input.
+    // Expected: Each request fails with an explanation and creates no output.
+    #[pal_async::async_test]
+    async fn cli_rejects_unsupported_requests(driver: DefaultDriver) {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("in.img");
+        fs_err::write(&raw, vec![1u8; 1024 * 1024]).unwrap();
+        let unknown = dir.path().join("in.bin");
+        fs_err::write(&unknown, vec![1u8; 512]).unwrap();
+        let parent = dir.path().join("parent.vhdx");
+        let child = dir.path().join("child.vhdx");
+        run(command(&["create", arg(&parent), "--size", "4M"]), &driver)
+            .await
+            .unwrap();
+        run(
+            command(&[
+                "create",
+                arg(&child),
+                "--size",
+                "4M",
+                "--parent",
+                arg(&parent),
+            ]),
+            &driver,
+        )
+        .await
+        .unwrap();
+        let out = dir.path().join("out");
+
+        for (args, expected) in [
+            (
+                vec![
+                    "convert",
+                    arg(&raw),
+                    "-o",
+                    arg(&out),
+                    "--output-format",
+                    "raw",
+                ],
+                "raw-to-raw",
+            ),
+            (
+                vec![
+                    "convert",
+                    arg(&raw),
+                    "-o",
+                    arg(&out),
+                    "--output-format",
+                    "raw",
+                    "--format-options",
+                    "allocation=fixed",
+                ],
+                "does not accept --format-options",
+            ),
+            (
+                vec![
+                    "convert",
+                    arg(&unknown),
+                    "-o",
+                    arg(&out),
+                    "--output-format",
+                    "vhdx",
+                ],
+                "specify --input-format",
+            ),
+            (
+                vec![
+                    "convert",
+                    arg(&child),
+                    "-o",
+                    arg(&out),
+                    "--output-format",
+                    "raw",
+                ],
+                "differencing VHDX inputs",
+            ),
+            (
+                vec!["create", arg(&raw), "--size", "1M", "--force"],
+                "creating raw images is not supported",
+            ),
+            (
+                vec!["create", arg(&unknown), "--size", "1M"],
+                "specify --format",
+            ),
+        ] {
+            let error = run(command(&args), &driver).await.unwrap_err();
+            assert!(
+                format!("{error:#}").contains(expected),
+                "{args:?}: {error:#}"
+            );
+            assert!(!out.exists(), "{args:?}");
+        }
+    }
+}
