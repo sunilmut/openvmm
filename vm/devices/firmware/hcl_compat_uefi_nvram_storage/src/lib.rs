@@ -764,6 +764,54 @@ mod test {
         assert_eq!(result_timestamp, timestamp);
     }
 
+    // Test: Restore a missing name terminator followed by an unaligned valid record.
+    // Expected: Strict mode rejects corruption; compatibility mode skips only
+    //       the bad variable and preserves the later variable's metadata and data.
+    #[async_test]
+    async fn missing_terminator_quirk_preserves_following_variable() {
+        let first = Ucs2LeSlice::from_slice_with_nul(wchz!(u16, "bad").as_bytes()).unwrap();
+        let second = Ucs2LeSlice::from_slice_with_nul(wchz!(u16, "good").as_bytes()).unwrap();
+        let vendor = Guid::new_random();
+        let timestamp = EFI_TIME::default();
+        let mut storage = EphemeralStorageBackend::default();
+        let mut source = HclCompatNvram::new(&mut storage, None);
+        source
+            .set_variable(first, vendor, 0x1234, vec![0x91], timestamp)
+            .await
+            .unwrap();
+        source
+            .set_variable(second, vendor, 0x5678, vec![0x12, 0x34, 0x56], timestamp)
+            .await
+            .unwrap();
+        drop(source);
+        let mut bytes = storage.0.unwrap();
+        let terminator = size_of::<format::NvramVariable>() + first.as_bytes().len() - 2;
+        bytes[terminator..terminator + 2].copy_from_slice(&[b'x', 0]);
+        let mut strict = HclCompatNvram::new(EphemeralStorageBackend(Some(bytes.clone())), None);
+        assert!(matches!(
+            strict.get_variable(second, vendor).await,
+            Err(NvramStorageError::Load(_))
+        ));
+        let mut compatible = HclCompatNvram::new(
+            EphemeralStorageBackend(Some(bytes)),
+            Some(HclCompatNvramQuirks {
+                skip_corrupt_vars_with_missing_null_term: true,
+            }),
+        );
+        assert!(
+            compatible
+                .get_variable(first, vendor)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            compatible.get_variable(second, vendor).await.unwrap(),
+            Some((0x5678, vec![0x12, 0x34, 0x56], timestamp))
+        );
+        assert_eq!(compatible.iter().await.unwrap().count(), 1);
+    }
+
     #[cfg(feature = "save_restore")]
     #[async_test]
     async fn mutate_after_restore() {
