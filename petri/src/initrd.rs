@@ -85,10 +85,7 @@ mod tests {
     use std::io::Read;
     use test_with_tracing::test;
 
-    #[test]
-    fn prepares_explicit_files_and_owns_temporary_output() -> anyhow::Result<()> {
-        let temp = tempfile::tempdir()?;
-        let base = temp.path().join("base.gz");
+    fn write_empty_base(base: &Path) -> anyhow::Result<Vec<u8>> {
         let mut trailer = format!(
             "070701{}0000000b00000000TRAILER!!!\0",
             "00000000".repeat(11)
@@ -98,7 +95,15 @@ mod tests {
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         encoder.write_all(&trailer)?;
         let original = encoder.finish()?;
-        fs_err::write(&base, &original)?;
+        fs_err::write(base, &original)?;
+        Ok(original)
+    }
+
+    #[test]
+    fn prepares_explicit_files_and_owns_temporary_output() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let base = temp.path().join("base.gz");
+        let original = write_empty_base(&base)?;
         let files = [
             InitrdFile {
                 name: "pipette",
@@ -175,5 +180,66 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    // Test: Reject invalid init paths, file components and permission type bits.
+    // Expected: Validation reports the specific error without modifying the
+    //       base archive or publishing a partial prepared initrd.
+    #[test]
+    fn invalid_initrd_inputs_do_not_publish_partial_outputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let base = directory.path().join("base.gz");
+        let original = write_empty_base(&base).unwrap();
+        for rdinit in ["relative", "/bad path", "/bad\npath", "/bad\0path"] {
+            let error = PetriInitrd::prepare(&base, &[], rdinit, Some(directory.path()))
+                .expect_err("invalid rdinit accepted");
+            assert!(
+                error
+                    .to_string()
+                    .contains("rdinit must be an absolute path")
+            );
+        }
+        for name in [
+            "",
+            "dir//file",
+            "./file",
+            "dir/../file",
+            "trailing/",
+            "bad\\name",
+        ] {
+            let files = [
+                InitrdFile {
+                    name: "valid",
+                    contents: b"first",
+                    permissions: 0o644,
+                },
+                InitrdFile {
+                    name,
+                    contents: b"invalid",
+                    permissions: 0o644,
+                },
+            ];
+            let error = PetriInitrd::prepare(&base, &files, "/init", Some(directory.path()))
+                .expect_err("invalid file path accepted");
+            assert!(error.to_string().contains("invalid initrd file path"));
+        }
+        let error = PetriInitrd::prepare(
+            &base,
+            &[InitrdFile {
+                name: "valid",
+                contents: b"data",
+                permissions: 0o100644,
+            }],
+            "/init",
+            Some(directory.path()),
+        )
+        .expect_err("file-type permission bits accepted");
+        assert!(
+            error
+                .to_string()
+                .contains("invalid initrd file permissions")
+        );
+        assert_eq!(fs_err::read(&base).unwrap(), original);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }

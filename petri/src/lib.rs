@@ -163,3 +163,58 @@ impl Drop for TestChild {
         let _ = child.wait();
     }
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Run an owned command with padded, non-UTF-8 stdout and separate stderr.
+    // Expected: Success returns trimmed, lossily decoded stdout only.
+    #[test]
+    fn host_command_success_preserves_stdout_contract() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .env_clear()
+            .args(["-c", "printf '  output\\377 \\n'; printf 'not stdout' >&2"]);
+        let output = futures::executor::block_on(run_host_cmd(command)).unwrap();
+        assert_eq!(output, "output\u{fffd}");
+    }
+
+    // Test: Run an owned command that writes both streams and exits with status 23.
+    // Expected: Failure preserves the exit status and untrimmed stderr,
+    //       without treating stdout as a successful result.
+    #[test]
+    fn host_command_failure_preserves_status_and_stderr() {
+        let mut command = Command::new("/bin/sh");
+        command.env_clear().args([
+            "-c",
+            "printf 'discarded stdout'; printf '  failure\\n' >&2; exit 23",
+        ]);
+        match futures::executor::block_on(run_host_cmd(command)) {
+            Err(CommandError::Command(status, stderr)) => {
+                assert_eq!(status.code(), Some(23));
+                assert_eq!(stderr, "  failure\n");
+            }
+            Err(error) => panic!("wrong command error: {error}"),
+            Ok(_) => panic!("failed command unexpectedly succeeded"),
+        }
+    }
+
+    // Test: Launch a nonexistent executable under an owned temporary directory.
+    // Expected: The launch error retains NotFound instead of becoming a
+    //       completed-command failure or empty successful output.
+    #[test]
+    fn host_command_launch_failure_retains_io_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut command = Command::new(directory.path().join("missing"));
+        command.env_clear();
+        match futures::executor::block_on(run_host_cmd(command)) {
+            Err(CommandError::Launch(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotFound)
+            }
+            Err(error) => panic!("wrong launch error: {error}"),
+            Ok(_) => panic!("missing executable unexpectedly launched"),
+        }
+    }
+}

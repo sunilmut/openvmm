@@ -311,3 +311,169 @@ fn build_fat32(
     fs.unmount().context("failed to unmount fs")?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    fn check_image(file: &mut std::fs::File, label: &[u8], expected: &[(&str, &[u8])]) {
+        let gpt = gptman::GPT::read_from(file, SECTOR_SIZE).unwrap();
+        assert_eq!(gpt[1].partition_name.as_str(), "CIDATA");
+        let basic_data_guid: [u8; 16] = guid::guid!("EBD0A0A2-B9E5-4433-87C0-68B6B72699C7").into();
+        assert_eq!(gpt[1].partition_type_guid, basic_data_guid);
+        let start = gpt[1].starting_lba * SECTOR_SIZE;
+        let end = (gpt[1].ending_lba + 1) * SECTOR_SIZE;
+        let partition = fscommon::StreamSlice::new(file, start, end).unwrap();
+        let fs = fatfs::FileSystem::new(partition, FsOptions::new()).unwrap();
+        assert_eq!(fs.volume_label_as_bytes(), label);
+        for &(name, bytes) in expected {
+            let mut contents = Vec::new();
+            fs.root_dir()
+                .open_file(name)
+                .unwrap()
+                .read_to_end(&mut contents)
+                .unwrap();
+            assert_eq!(contents, bytes, "wrong contents for {name}");
+        }
+        fs.unmount().unwrap();
+    }
+
+    // Test: Build a Windows agent image with nested persistent and temporary files.
+    // Expected: Decoding the GPT/FAT image finds the pipette volume and exact
+    //       binary payloads at their requested paths.
+    #[test]
+    fn raw_agent_image_preserves_nested_and_temporary_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistent = directory.path().join("persistent");
+        std::fs::write(&persistent, b"persistent\0\xff").unwrap();
+        let mut temporary = tempfile::NamedTempFile::new().unwrap();
+        temporary.write_all(b"temporary").unwrap();
+        let mut builder = AgentImage::new(OsFlavor::Windows);
+        builder.add_extras(vec![
+            ("tools".into(), ImageEntry::Dir),
+            (
+                "temporary.bin".into(),
+                ImageEntry::TempFile(temporary.into_temp_path()),
+            ),
+        ]);
+        builder.add_file("tools/persistent.bin", &persistent);
+        builder.allocate_free_space(crate::SIZE_1_MB);
+        let mut image = builder.build(ImageType::Raw).unwrap().unwrap();
+        check_image(
+            image.as_file_mut(),
+            b"pipette",
+            &[
+                ("tools/persistent.bin", b"persistent\0\xff"),
+                ("temporary.bin", b"temporary"),
+            ],
+        );
+    }
+
+    // Test: Build Linux cloud-init images without an agent in raw and fixed-VHD modes.
+    // Expected: Both expose the cidata configuration files; the VHD additionally
+    //       has a fixed-disk footer with the correct size and checksum.
+    #[test]
+    fn linux_cloud_init_is_present_in_raw_and_fixed_vhd_images() {
+        for mode in [ImageType::Raw, ImageType::Vhd] {
+            let is_vhd = matches!(mode, ImageType::Vhd);
+            let mut image = AgentImage::new(OsFlavor::Linux)
+                .build(mode)
+                .unwrap()
+                .unwrap();
+            let file = image.as_file_mut();
+            let gpt = gptman::GPT::read_from(file, SECTOR_SIZE).unwrap();
+            let partition = fscommon::StreamSlice::new(
+                &mut *file,
+                gpt[1].starting_lba * SECTOR_SIZE,
+                (gpt[1].ending_lba + 1) * SECTOR_SIZE,
+            )
+            .unwrap();
+            let fs = fatfs::FileSystem::new(partition, FsOptions::new()).unwrap();
+            assert_eq!(fs.volume_label_as_bytes(), b"cidata");
+            for name in ["meta-data", "user-data", "network-config"] {
+                let mut contents = String::new();
+                fs.root_dir()
+                    .open_file(name)
+                    .unwrap()
+                    .read_to_string(&mut contents)
+                    .unwrap();
+                if name == "user-data" {
+                    assert!(contents.starts_with("#cloud-config\n"));
+                    assert!(!contents.contains("pipette"));
+                } else if name == "network-config" {
+                    assert!(contents.contains("optional: true"));
+                }
+            }
+            fs.unmount().unwrap();
+            if is_vhd {
+                let size = file.metadata().unwrap().len();
+                file.seek(std::io::SeekFrom::End(-512)).unwrap();
+                let mut footer = [0; 512];
+                file.read_exact(&mut footer).unwrap();
+                assert_eq!(&footer[..8], b"conectix");
+                assert_eq!(u32::from_be_bytes(footer[60..64].try_into().unwrap()), 2);
+                assert_eq!(
+                    u64::from_be_bytes(footer[48..56].try_into().unwrap()),
+                    size - 512
+                );
+                let checksum = u32::from_be_bytes(footer[64..68].try_into().unwrap());
+                footer[64..68].fill(0);
+                assert_eq!(
+                    checksum,
+                    !footer.iter().map(|&byte| u32::from(byte)).sum::<u32>()
+                );
+            }
+        }
+    }
+
+    // Test: Build an empty Windows image, then request a nonexistent extra file.
+    // Expected: No image is needed without entries, but missing requested data
+    //       remains an IO error rather than silently producing an empty image.
+    #[test]
+    fn absent_image_and_missing_requested_file_remain_distinct() {
+        let mut builder = AgentImage::new(OsFlavor::Windows);
+        assert!(builder.build(ImageType::Raw).unwrap().is_none());
+        let directory = tempfile::tempdir().unwrap();
+        builder.add_file("missing.bin", directory.path().join("missing"));
+        let error = builder.build(ImageType::Raw).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    // IGNORED: The builder sizes this nonempty image from its zero payload bytes.
+    //       It passes a zero-length disk to gptman, which panics on subtraction
+    //       overflow in the development profile. Retain the intended contract
+    //       without changing production code in this tests-only campaign.
+    //
+    // Test: Request an agent image containing only an explicitly added directory.
+    // Expected: A valid image contains that directory even without payload bytes
+    //       or an explicit extra-free-space allocation.
+    #[test]
+    #[ignore = "directory-only images produce a zero-length disk and panic in gptman"]
+    fn directory_only_agent_image_has_room_for_filesystem_metadata() {
+        let mut builder = AgentImage::new(OsFlavor::Windows);
+        builder.add_extras(vec![("empty".into(), ImageEntry::Dir)]);
+        let mut image = builder.build(ImageType::Raw).unwrap().unwrap();
+        let file = image.as_file_mut();
+        let gpt = gptman::GPT::read_from(file, SECTOR_SIZE).unwrap();
+        let partition = fscommon::StreamSlice::new(
+            file,
+            gpt[1].starting_lba * SECTOR_SIZE,
+            (gpt[1].ending_lba + 1) * SECTOR_SIZE,
+        )
+        .unwrap();
+        let fs = fatfs::FileSystem::new(partition, FsOptions::new()).unwrap();
+        {
+            let directory = fs.root_dir().open_dir("empty").unwrap();
+            let names = directory
+                .iter()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert_eq!(names, [".", ".."]);
+        }
+        fs.unmount().unwrap();
+    }
+}
