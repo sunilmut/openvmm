@@ -325,3 +325,100 @@ impl DiagnosticSender {
         Ok(())
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use futures::AsyncReadExt;
+    use futures::AsyncWriteExt;
+    use pal_async::async_test;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Test: Write a binary payload through the write-file request into an owned
+    //       temporary directory, then read it back through the read-file request.
+    // Expected: Both requests report the exact byte count and the bytes survive
+    //       the round trip, including NUL and non-UTF-8 values.
+    #[async_test]
+    async fn file_requests_round_trip_binary_contents(_driver: DefaultDriver) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.bin");
+        let payload: Vec<u8> = (0..=255u8).cycle().take(70_000).collect();
+
+        let (receiver, mut writer) = mesh::pipe::pipe();
+        let write = write_file(pipette_protocol::WriteFileRequest {
+            path: path.to_str().unwrap().into(),
+            receiver,
+        });
+        let feed = async {
+            writer.write_all(&payload).await.unwrap();
+            drop(writer);
+        };
+        let (written, ()) = futures::join!(write, feed);
+        assert_eq!(written.unwrap(), payload.len() as u64);
+        assert_eq!(fs_err::read(&path).unwrap(), payload);
+
+        let (mut reader, sender) = mesh::pipe::pipe();
+        let read = read_file(pipette_protocol::ReadFileRequest {
+            path: path.to_str().unwrap().into(),
+            sender,
+        });
+        let drain = async {
+            let mut out = Vec::new();
+            reader.read_to_end(&mut out).await.unwrap();
+            out
+        };
+        let (count, out) = futures::join!(read, drain);
+        assert_eq!(count.unwrap(), payload.len() as u64);
+        assert_eq!(out, payload);
+    }
+
+    // Test: Read a missing file, write into a missing directory, list a
+    //       directory with a non-UTF-8 entry, and list a normal directory.
+    // Expected: Failures are reported as errors; a normal listing returns every
+    //       entry name, and a non-UTF-8 name fails rather than being mangled.
+    #[async_test]
+    async fn file_request_failures_and_listing(_driver: DefaultDriver) {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let (_reader, sender) = mesh::pipe::pipe();
+        assert!(
+            read_file(pipette_protocol::ReadFileRequest {
+                path: missing.to_str().unwrap().into(),
+                sender,
+            })
+            .await
+            .is_err()
+        );
+        let (receiver, _writer) = mesh::pipe::pipe();
+        assert!(
+            write_file(pipette_protocol::WriteFileRequest {
+                path: missing.join("child").to_str().unwrap().into(),
+                receiver,
+            })
+            .await
+            .is_err()
+        );
+
+        fs_err::write(dir.path().join("a"), b"").unwrap();
+        fs_err::create_dir(dir.path().join("sub dir")).unwrap();
+        let list = |path: &std::path::Path| {
+            list_dir(pipette_protocol::ListDirRequest {
+                path: path.to_str().unwrap().into(),
+            })
+        };
+        let mut files = list(dir.path()).await.unwrap().files;
+        files.sort();
+        assert_eq!(files, ["a", "sub dir"]);
+        assert!(list(&missing).await.is_err());
+
+        fs_err::write(
+            dir.path().join(std::ffi::OsStr::from_bytes(b"bad\xff")),
+            b"",
+        )
+        .unwrap();
+        let Err(error) = list(dir.path()).await else {
+            panic!("non-UTF-8 entry unexpectedly listed");
+        };
+        assert_eq!(error.to_string(), "filename not utf8");
+    }
+}

@@ -33,5 +33,8 @@ libc.workspace = true
 windows-service.workspace = true
 windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32_Security", "Win32_System_Shutdown", "Win32_System_Threading"] }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

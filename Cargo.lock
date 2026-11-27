@@ -7080,6 +7080,7 @@ dependencies = [
  "parking_lot",
  "pipette_protocol",
  "socket2",
+ "tempfile",
  "term",
  "tracing",
  "tracing-subscriber",
