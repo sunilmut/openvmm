@@ -7236,6 +7236,8 @@ dependencies = [
  "pipette_protocol",
  "scsidisk_resources",
  "storvsp_resources",
+ "tempfile",
+ "test_with_tracing",
  "tracing",
  "vm_resource",
 ]

@@ -548,3 +548,156 @@ fn change_gpt_disk_guid(path: &std::path::Path) -> anyhow::Result<()> {
     gpt.write_into(&mut file)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    const SECTOR: u64 = 512;
+
+    fn gpt_image(path: &std::path::Path) -> gptman::GPT {
+        let mut file = fs_err::File::create(path).unwrap();
+        file.set_len(2048 * SECTOR).unwrap();
+        let mut gpt = gptman::GPT::new_from(&mut file, SECTOR, [0x11; 16]).unwrap();
+        gpt.align = 1;
+        let first = gpt.header.first_usable_lba;
+        for (i, (start, name)) in [(first, "boot"), (first + 100, "data")]
+            .into_iter()
+            .enumerate()
+        {
+            gpt[i as u32 + 1] = gptman::GPTPartitionEntry {
+                partition_type_guid: [0xa0 + i as u8; 16],
+                unique_partition_guid: [0x20 + i as u8; 16],
+                starting_lba: start,
+                ending_lba: start + 49,
+                attribute_bits: 1 << i,
+                partition_name: name.into(),
+            };
+        }
+        gpt.write_into(&mut file).unwrap();
+        gpt
+    }
+
+    fn read_gpt(path: &std::path::Path) -> gptman::GPT {
+        gptman::GPT::read_from(&mut fs_err::File::open(path).unwrap(), SECTOR).unwrap()
+    }
+
+    // Test: Regenerate GUIDs in an owned GPT image with two partitions.
+    // Expected: The disk GUID and both partition GUIDs change and differ from
+    //       each other, while partition types, ranges, attributes, names and
+    //       unused entries are preserved; the backup header carries the same
+    //       new disk GUID.
+    #[test]
+    fn gpt_guids_change_without_altering_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("disk.vhd");
+        let before = gpt_image(&path);
+        change_gpt_disk_guid(&path).unwrap();
+        let after = read_gpt(&path);
+
+        assert_ne!(after.header.disk_guid, before.header.disk_guid);
+        let used: Vec<_> = after.iter().filter(|(_, p)| p.is_used()).collect();
+        assert_eq!(used.len(), 2);
+        for ((i, new), (_, old)) in used.iter().zip(before.iter().filter(|(_, p)| p.is_used())) {
+            assert_ne!(new.unique_partition_guid, old.unique_partition_guid, "{i}");
+            assert_ne!(new.unique_partition_guid, after.header.disk_guid);
+            assert_eq!(
+                (
+                    new.partition_type_guid,
+                    new.starting_lba,
+                    new.ending_lba,
+                    new.attribute_bits
+                ),
+                (
+                    old.partition_type_guid,
+                    old.starting_lba,
+                    old.ending_lba,
+                    old.attribute_bits
+                )
+            );
+            assert_eq!(new.partition_name.as_str(), old.partition_name.as_str());
+        }
+        assert_ne!(
+            used[0].1.unique_partition_guid,
+            used[1].1.unique_partition_guid
+        );
+
+        let mut file = fs_err::File::open(&path).unwrap();
+        use std::io::Seek;
+        file.seek(std::io::SeekFrom::Start(after.header.backup_lba * SECTOR))
+            .unwrap();
+        let backup = gptman::GPTHeader::read_from(&mut file).unwrap();
+        assert_eq!(backup.disk_guid, after.header.disk_guid);
+    }
+
+    // Test: Regenerate GUIDs in a file without a GPT and in a missing file.
+    // Expected: Both fail with an error and the non-GPT file is not modified.
+    #[test]
+    fn gpt_guid_change_rejects_non_gpt_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.vhd");
+        fs_err::write(&plain, vec![0x5a; 4096]).unwrap();
+        assert!(change_gpt_disk_guid(&plain).is_err());
+        assert_eq!(fs_err::read(&plain).unwrap(), vec![0x5a; 4096]);
+        assert!(change_gpt_disk_guid(&dir.path().join("missing.vhd")).is_err());
+    }
+
+    // Test: Prepare a result disk next to a source VHD, replacing a stale
+    //       result, then drop and forget the cleanup guard.
+    // Expected: The result gets the suffix and the source's current bytes, a
+    //       stale result is replaced, dropping the guard deletes the result, and
+    //       forgetting it keeps the result.
+    #[test]
+    fn result_disk_is_copied_and_cleaned_up_by_guard() {
+        if std::env::var_os(petri_artifacts_vmm_test::env::PETRI_REUSE_PREPPED_VHDS).is_some() {
+            // The reuse policy depends on process environment that this test
+            // does not modify; its expectations assume the default policy.
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("image.vhd");
+        fs_err::write(&source, b"source").unwrap();
+        let expected = dir.path().join("image-prepped.vhd");
+        fs_err::write(&expected, b"stale result").unwrap();
+
+        let (path, guard) = prepare_result_disk(&source, "-prepped.vhd")
+            .unwrap()
+            .unwrap();
+        assert_eq!(path, expected);
+        assert_eq!(fs_err::read(&path).unwrap(), b"source");
+        drop(guard);
+        assert!(!path.exists());
+        assert!(source.exists());
+
+        let (path, guard) = prepare_result_disk(&source, "-prepped.vhd")
+            .unwrap()
+            .unwrap();
+        std::mem::forget(guard);
+        assert_eq!(fs_err::read(&path).unwrap(), b"source");
+    }
+
+    // IGNORED: entry336-bug1; a source file name without ".vhd" maps to itself,
+    //       so the "stale result" branch deletes the source before copying it.
+    //       Keep the reproducer until a separately authorized fix.
+    //
+    // Test: Prepare a result disk from a source whose name lacks ".vhd".
+    // Expected: The call fails (or picks a distinct name) without deleting the
+    //       source disk.
+    #[test]
+    #[ignore = "entry336-bug1: non-.vhd source name deletes the source disk"]
+    fn non_vhd_source_is_never_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("image.VHD");
+        fs_err::write(&source, b"source").unwrap();
+        let result = prepare_result_disk(&source, "-prepped.vhd");
+        assert!(
+            source.exists(),
+            "source deleted; result: {:?}",
+            result.map(|r| r.map(|(p, g)| {
+                std::mem::forget(g);
+                p
+            }))
+        );
+    }
+}
