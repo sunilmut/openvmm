@@ -87,3 +87,100 @@ pub enum OpenTMKPacket {
     /// An [`OpenTMKErrorPacket`] error message for any other catch-all errors.
     Error(OpenTMKErrorPacket),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+    use test_with_tracing::test;
+
+    // Test: Exchange each packet kind using the executor's postcard encoding.
+    // Expected: Variant tags, lengths and acknowledgement integers match the
+    //       established wire format, and decoding preserves the payload.
+    #[test]
+    fn packets_match_wire_encoding() {
+        for (packet, bytes) in [
+            (
+                OpenTMKPacket::Configuration(OpenTMKConfigurationPacket {
+                    deserializer: OpenTMKGrammarDeserializer::None,
+                    mapping: vec![0, 255, 7],
+                }),
+                vec![0, 0, 3, 0, 255, 7],
+            ),
+            (
+                OpenTMKPacket::Configuration(OpenTMKConfigurationPacket {
+                    deserializer: OpenTMKGrammarDeserializer::SyzDecoder,
+                    mapping: vec![],
+                }),
+                vec![0, 1, 0],
+            ),
+            (
+                OpenTMKPacket::FuzzTest(OpenTMKFuzzTest {
+                    testcase_vcpu0: vec![255, 0, 1],
+                }),
+                vec![1, 3, 255, 0, 1],
+            ),
+            (
+                OpenTMKPacket::Ack(OpenTMKAckPacket { code: 128 }),
+                vec![2, 128, 1],
+            ),
+            (
+                OpenTMKPacket::Error(OpenTMKErrorPacket {
+                    message: String::from("é"),
+                }),
+                vec![3, 2, 0xc3, 0xa9],
+            ),
+        ] {
+            assert_eq!(postcard::to_allocvec(&packet).unwrap(), bytes);
+            assert_eq!(
+                postcard::from_bytes::<OpenTMKPacket>(&bytes).unwrap(),
+                packet
+            );
+            for len in 0..bytes.len() {
+                assert!(postcard::from_bytes::<OpenTMKPacket>(&bytes[..len]).is_err());
+            }
+        }
+    }
+
+    // Test: Transfer arbitrary binary testcases and the largest error code.
+    // Expected: No byte is interpreted as text, and u64 acknowledgement codes
+    //       survive serialization without narrowing.
+    #[test]
+    fn binary_payloads_and_wide_codes_roundtrip() {
+        for packet in [
+            OpenTMKPacket::FuzzTest(OpenTMKFuzzTest {
+                testcase_vcpu0: (0..=255).collect(),
+            }),
+            OpenTMKPacket::FuzzTest(OpenTMKFuzzTest {
+                testcase_vcpu0: vec![],
+            }),
+            OpenTMKPacket::Ack(OpenTMKAckPacket { code: u64::MAX }),
+            OpenTMKPacket::Ack(OpenTMKAckPacket { code: 0 }),
+            OpenTMKPacket::Error(OpenTMKErrorPacket {
+                message: String::from("execution failed: \0 🦀"),
+            }),
+        ] {
+            let bytes = postcard::to_allocvec(&packet).unwrap();
+            assert_eq!(
+                postcard::from_bytes::<OpenTMKPacket>(&bytes).unwrap(),
+                packet
+            );
+        }
+    }
+
+    // Test: Receive unknown packet/grammar tags, invalid UTF-8 and bad lengths.
+    // Expected: Deserialization returns an error instead of a usable packet.
+    #[test]
+    fn malformed_payloads_are_rejected() {
+        for bytes in [
+            &[4][..],
+            &[0, 2, 0],
+            &[3, 1, 255],
+            &[1, 3, 0, 1],
+            &[2, 128],
+            &[2, 255, 255, 255, 255, 255, 255, 255, 255, 255, 2],
+        ] {
+            assert!(postcard::from_bytes::<OpenTMKPacket>(bytes).is_err());
+        }
+    }
+}

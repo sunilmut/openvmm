@@ -6006,7 +6006,9 @@ dependencies = [
 name = "opentmk_exec_packet"
 version = "0.0.0"
 dependencies = [
+ "postcard",
  "serde",
+ "test_with_tracing",
 ]
 
 [[package]]
