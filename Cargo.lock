@@ -4348,6 +4348,8 @@ name = "kmsg_writer"
 version = "0.0.0"
 dependencies = [
  "fs-err",
+ "tempfile",
+ "test_with_tracing",
  "tracing",
  "tracing-subscriber",
 ]
