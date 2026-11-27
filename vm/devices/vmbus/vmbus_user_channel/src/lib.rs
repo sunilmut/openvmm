@@ -296,3 +296,6 @@ pub fn message_pipe(
     let pipe = MessagePipe::new(channel).map_err(ErrorInner::Pipe)?;
     Ok(pipe)
 }
+
+#[cfg(test)]
+mod tests;
