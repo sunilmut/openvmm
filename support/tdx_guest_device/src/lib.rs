@@ -123,3 +123,64 @@ impl TdxGuestDevice {
         Ok(tdx_key_get_request.derived_key)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    fn unsupported_device() -> TdxGuestDevice {
+        // Real ioctl dispatch without a TDX driver or TDCALL.
+        TdxGuestDevice {
+            file: File::open("/dev/null").expect("open inert ioctl target"),
+        }
+    }
+
+    // Test: Request a report through a descriptor that cannot serve TDX ioctls.
+    // Expected: The report-specific error retains ENOTTY rather than reporting
+    //       success or substituting a different operation's error.
+    #[test]
+    fn report_transport_failure_preserves_operation_and_errno() {
+        let device = unsupported_device();
+        match device.get_report([0x5a; TDX_REPORT_DATA_SIZE], 0) {
+            Err(Error::TdxGetReportIoctl(errno)) => {
+                assert_eq!(errno, nix::errno::Errno::ENOTTY);
+            }
+            Err(_) => panic!("report failure changed operation classification"),
+            Ok(_) => panic!("non-TDX descriptor unexpectedly returned a report"),
+        }
+    }
+
+    // Test: Request a derived key through a descriptor without the TDX driver.
+    // Expected: The key-specific error retains ENOTTY and a zero TDCALL code,
+    //       since no firmware response occurred; no key value is exposed.
+    #[test]
+    fn key_transport_failure_preserves_operation_errno_and_firmware_context() {
+        let device = unsupported_device();
+        let request = TdKeyRequest::new_zeroed();
+        match device.get_derived_key(&request) {
+            Err(Error::TdxGetDerivedKeyIoctl(errno, code)) => {
+                assert_eq!(errno, nix::errno::Errno::ENOTTY);
+                assert_eq!(code, 0, "transport failure fabricated a TDCALL result");
+            }
+            Err(_) => panic!("key failure changed operation classification"),
+            Ok(_) => panic!("non-TDX descriptor unexpectedly returned a key"),
+        }
+    }
+
+    // IGNORED: Requires an isolated TDX guest with a compatible /dev/tdx_guest
+    //       driver. Never probe the shared host for firmware or key operations.
+    //
+    // Test: Request a real TDX report with nonzero caller-supplied report data.
+    // Expected: The returned report echoes all64 bytes and identifies a TDX
+    //       report, without logging report identity fields or deriving a key.
+    #[test]
+    #[ignore = "requires an isolated TDX guest and compatible guest driver"]
+    fn hardware_report_echoes_caller_data() {
+        let device = TdxGuestDevice::open().unwrap();
+        let data = std::array::from_fn(|i| i as u8 ^ 0x5a);
+        let report = device.get_report(data, 0).unwrap();
+        assert!(report.report_mac_struct.report_data == data);
+        assert_eq!(report.report_mac_struct.report_type.tee_type, 0x81);
+    }
+}
