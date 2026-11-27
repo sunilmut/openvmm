@@ -363,3 +363,6 @@ fn map_nvme_error(err: nvme_driver::RequestError) -> DiskError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -1713,13 +1713,24 @@ name = "disk_nvme"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "chipset_device",
  "disk_backend",
+ "disk_prwrap",
+ "disklayer_ram",
+ "guid",
  "inspect",
+ "nvme",
  "nvme_common",
  "nvme_driver",
  "nvme_spec",
  "pal",
+ "pal_async",
+ "pci_core",
  "scsi_buffers",
+ "test_with_tracing",
+ "user_driver",
+ "user_driver_emulated_mock",
+ "vmcore",
 ]
 
 [[package]]
