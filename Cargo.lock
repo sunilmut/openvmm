@@ -6791,7 +6791,9 @@ dependencies = [
  "chipset_device",
  "chipset_device_resources",
  "guestmem",
+ "inspect",
  "pci_core",
+ "test_with_tracing",
  "vm_resource",
  "vmcore",
 ]
