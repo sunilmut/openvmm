@@ -209,3 +209,36 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     }
     minimal_rt::arch::fault();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tmk_protocol::TestDescriptor64;
+
+    fn fixture_entry(_: TestContext<'_>) {}
+
+    // Test: Reinterpret an in-memory TMK test descriptor through the 64-bit
+    //       wire descriptor that the host loader parses from the ELF section.
+    // Expected: Size and alignment match, and the name pointer, name length,
+    //       entry point and flags land in the loader's fields unchanged.
+    #[test]
+    fn descriptor_layout_matches_loader_wire_format() {
+        assert_eq!(size_of::<TestDescriptor>(), size_of::<TestDescriptor64>());
+        assert_eq!(align_of::<TestDescriptor>(), align_of::<TestDescriptor64>());
+        let name: &'static [u8] = b"suite::fixture";
+        let descriptor = TestDescriptor {
+            name,
+            entrypoint: fixture_entry,
+            flags: TestFlags64::new()
+                .with_expected_failure(true)
+                .with_linux_only(true),
+        };
+        // SAFETY: the sizes and alignments were checked above, and every field
+        // of `TestDescriptor64` is a plain integer valid for any bit pattern.
+        let wire = unsafe { &*core::ptr::from_ref(&descriptor).cast::<TestDescriptor64>() };
+        assert_eq!(wire.name, name.as_ptr() as u64);
+        assert_eq!(wire.name_len, name.len() as u64);
+        assert_eq!(wire.entrypoint, fixture_entry as *const () as u64);
+        assert!(wire.flags.expected_failure() && wire.flags.linux_only());
+    }
+}
