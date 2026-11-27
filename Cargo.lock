@@ -7102,6 +7102,7 @@ dependencies = [
  "pal_async",
  "pipette_protocol",
  "term",
+ "test_with_tracing",
  "tracing",
  "typed-path",
  "xshell-macros",

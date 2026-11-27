@@ -422,3 +422,96 @@ pub struct Output {
     /// The standard error of the process.
     pub stderr: Vec<u8>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::AsyncWriteExt;
+    use test_with_tracing::test;
+
+    // Test: Wait twice for a child whose exit status arrives through a one-shot channel.
+    // Expected: Both waits return the original status; the second wait uses
+    //       retained completion instead of consuming the one-shot channel again.
+    #[test]
+    fn repeated_wait_retains_the_original_completion() {
+        block_on(async {
+            let (send, recv) = mesh::oneshot();
+            let mut child = Child {
+                stdin: None,
+                stdout: None,
+                stderr: None,
+                pid: 17,
+                result: Ok(recv),
+            };
+            send.send(pipette_protocol::ExitStatus::Normal(37));
+            assert_eq!(child.wait().await.unwrap().code(), Some(37));
+            assert_eq!(child.wait().await.unwrap().code(), Some(37));
+        });
+    }
+
+    // Test: Capture separate binary streams while the producer waits for stdin EOF,
+    //       sends pipe-sized payloads and reports completion only after writing.
+    // Expected: Waiting closes stdin, drains both streams without a status-first
+    //       deadlock and returns the exact distinct bytes and reported exit status.
+    #[test]
+    fn output_wait_closes_stdin_and_drains_both_streams_before_completion() {
+        block_on(async {
+            let (mut stdin_read, stdin_write) = mesh::pipe::pipe();
+            let (stdout_read, mut stdout_write) = mesh::pipe::pipe();
+            let (stderr_read, mut stderr_write) = mesh::pipe::pipe();
+            let (send, recv) = mesh::oneshot();
+            let child = Child {
+                stdin: Some(stdin_write),
+                stdout: Some(stdout_read),
+                stderr: Some(stderr_read),
+                pid: 17,
+                result: Ok(recv),
+            };
+            let stdout = b"out\0\xff".repeat(30_000);
+            let stderr = b"err\0\x80".repeat(20_000);
+            let producer = async {
+                let mut input = Vec::new();
+                stdin_read.read_to_end(&mut input).await.unwrap();
+                assert!(input.is_empty());
+                stdout_write.write_all(&stdout).await.unwrap();
+                drop(stdout_write);
+                stderr_write.write_all(&stderr).await.unwrap();
+                drop(stderr_write);
+                send.send(pipette_protocol::ExitStatus::Normal(19));
+            };
+            let (output, ()) = (child.wait_with_output(), producer).join().await;
+            let output = output.unwrap();
+            assert_eq!(output.stdout, stdout);
+            assert_eq!(output.stderr, stderr);
+            assert_eq!(output.status.code(), Some(19));
+            assert!(!output.status.success());
+        });
+    }
+
+    // Test: Lose the status sender while both output streams end normally.
+    // Expected: Capturing output reports the missing completion channel as an
+    //       error, rather than manufacturing a successful or unknown exit status.
+    #[test]
+    fn output_wait_reports_a_disconnected_completion_channel() {
+        block_on(async {
+            let (stdout, stdout_send) = mesh::pipe::pipe();
+            let (stderr, stderr_send) = mesh::pipe::pipe();
+            drop(stdout_send);
+            drop(stderr_send);
+            let (send, recv) = mesh::oneshot::<pipette_protocol::ExitStatus>();
+            drop(send);
+            let child = Child {
+                stdin: None,
+                stdout: Some(stdout),
+                stderr: Some(stderr),
+                pid: 17,
+                result: Ok(recv),
+            };
+            let error = match child.wait_with_output().await {
+                Err(error) => error,
+                Ok(_) => panic!("missing process completion unexpectedly succeeded"),
+            };
+            assert!(error.downcast_ref::<mesh::RecvError>().is_some());
+        });
+    }
+}
