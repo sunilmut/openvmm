@@ -85,3 +85,93 @@ impl flowey_core::node::RuntimeVarDb for SingleJsonFileVarDb {
         serde_json::to_writer(&self.file, &db).expect("failed to write to db JSON");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flowey_core::node::RuntimeVarDb;
+    use test_with_tracing::test;
+
+    // Test: Persist public and secret-marked structured values, reopen the
+    //       database, then append another variable through the reopened handle.
+    // Expected: The independent on-disk schema, payloads and secrecy flags
+    //       survive reopening and appending; missing variables remain absent.
+    #[test]
+    fn reopening_and_appending_preserves_values_and_secret_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("variables.json");
+        let mut db = SingleJsonFileVarDb::new(&path).unwrap();
+        assert!(db.try_get_var("missing").is_none());
+        db.set_var("z_public", false, br#"[1,true,"two"]"#.to_vec());
+        db.set_var("a_private", true, br#"{"nested":{"x":null}}"#.to_vec());
+        drop(db);
+        let expected = serde_json::json!({
+            "z_public": [false, [1, true, "two"]],
+            "a_private": [true, {"nested": {"x": null}}],
+        });
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs_err::read(&path).unwrap()).unwrap();
+        assert_eq!(stored, expected);
+
+        let mut db = SingleJsonFileVarDb::new(&path).unwrap();
+        assert_eq!(
+            db.try_get_var("a_private"),
+            Some((br#"{"nested":{"x":null}}"#.to_vec(), true))
+        );
+        assert_eq!(
+            db.try_get_var("z_public"),
+            Some((br#"[1,true,"two"]"#.to_vec(), false))
+        );
+        db.set_var("0_added", false, b"42".to_vec());
+        drop(db);
+        let mut expected = expected;
+        expected["0_added"] = serde_json::json!([false, 42]);
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs_err::read(&path).unwrap()).unwrap();
+        assert_eq!(stored, expected);
+        let mut db = SingleJsonFileVarDb::new(&path).unwrap();
+        assert_eq!(db.try_get_var("0_added"), Some((b"42".to_vec(), false)));
+        assert!(db.try_get_var("missing").is_none());
+    }
+
+    // Test: Attempt to overwrite a variable after closing and reopening its database.
+    // Expected: The one-time-write invariant rejects the second assignment,
+    //       rather than silently replacing a value from an earlier invocation.
+    #[test]
+    #[should_panic(expected = "existing.is_none()")]
+    fn one_time_write_is_enforced_across_reopening() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("variables.json");
+        let mut db = SingleJsonFileVarDb::new(&path).unwrap();
+        db.set_var("existing", false, b"1".to_vec());
+        drop(db);
+        let mut db = SingleJsonFileVarDb::new(path).unwrap();
+        db.set_var("existing", false, b"2".to_vec());
+    }
+
+    // Test: Open a database beneath a missing parent or at an existing directory.
+    // Expected: Both I/O failures retain database-opening context and do not
+    //       manufacture an empty database or replace the existing directory.
+    #[test]
+    fn invalid_database_paths_report_opening_errors_without_replacing_data() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("directory");
+        fs_err::create_dir(&directory).unwrap();
+        for path in [
+            root.path().join("missing/variables.json"),
+            directory.clone(),
+        ] {
+            let error = match SingleJsonFileVarDb::new(path) {
+                Err(error) => error,
+                Ok(_) => panic!("invalid database path unexpectedly opened"),
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("failed to open/create database file")
+            );
+        }
+        assert!(directory.is_dir());
+        assert!(!root.path().join("missing").exists());
+    }
+}

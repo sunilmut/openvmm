@@ -39,6 +39,134 @@ fn check_generated_yaml_size(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flowey_core::node::FlowPlatformLinuxDistro;
+    use flowey_core::patch::ResolvedPatches;
+    use test_with_tracing::test;
+
+    fn job(platform: FlowPlatform, arch: FlowArch) -> ResolvedPipelineJob {
+        ResolvedPipelineJob {
+            root_nodes: BTreeMap::new(),
+            root_configs: BTreeMap::new(),
+            patches: ResolvedPatches {
+                swap: BTreeMap::new(),
+                inject_side_effect: BTreeMap::new(),
+            },
+            label: "fixture".into(),
+            platform,
+            arch,
+            ado_pool: None,
+            timeout_minutes: None,
+            command_wrapper: None,
+            ado_variables: BTreeMap::new(),
+            gh_override_if: None,
+            gh_global_env: BTreeMap::new(),
+            gh_pool: None,
+            gh_concurrency_group: None,
+            gh_permissions: BTreeMap::new(),
+            external_read_vars: BTreeSet::new(),
+            cond_param_idx: None,
+            parameters_used: Vec::new(),
+            artifacts_used: Vec::new(),
+            artifacts_published: Vec::new(),
+        }
+    }
+
+    // Test: Generate a GitHub workflow at the 500 KiB limit and one byte above it.
+    // Expected: The exact boundary is accepted; oversized GitHub output reports
+    //       its path and byte count, while the GitHub-only limit does not affect ADO.
+    #[test]
+    fn github_workflow_size_limit_is_inclusive_and_backend_specific() {
+        let path = Path::new("owned-workflow.yaml");
+        let mut yaml = "a".repeat(512_000);
+        check_generated_yaml_size(&yaml, FlowBackendCli::Github, path).unwrap();
+        yaml.push('b');
+        let error = check_generated_yaml_size(&yaml, FlowBackendCli::Github, path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("owned-workflow.yaml"));
+        assert!(error.contains("512001 bytes"));
+        assert!(error.contains("exceeding"));
+        check_generated_yaml_size(&yaml, FlowBackendCli::Ado, path).unwrap();
+    }
+
+    // Test: Generate UTF-8 text whose character count fits but encoded size
+    //       exceeds the GitHub workflow limit by one byte.
+    // Expected: Size validation uses bytes, accepting the exact encoded boundary
+    //       and rejecting oversized text instead of counting Unicode characters.
+    #[test]
+    fn github_workflow_limit_counts_encoded_bytes_not_characters() {
+        let path = Path::new("owned-workflow.yaml");
+        let mut yaml = "\u{e9}".repeat(256_000);
+        check_generated_yaml_size(&yaml, FlowBackendCli::Github, path).unwrap();
+        yaml.push('x');
+        assert!(yaml.chars().count() < 512_000);
+        let error = check_generated_yaml_size(&yaml, FlowBackendCli::Github, path)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("512001 bytes"));
+    }
+
+    // Test: Register a consumer before its provider, then route a consumer chain
+    //       through incompatible ancestors alongside an unrelated same-platform job.
+    // Expected: Compatible descendants share one published ancestor artifact;
+    //       incompatible and unrelated jobs bootstrap independently with unique names.
+    #[test]
+    fn bootstrap_sharing_requires_compatible_ancestry_and_unique_artifacts() {
+        let linux = FlowPlatform::Linux(FlowPlatformLinuxDistro::Ubuntu);
+        let mut graph = petgraph::Graph::new();
+        let consumer = graph.add_node(job(linux, FlowArch::X86_64));
+        let root = graph.add_node(job(linux, FlowArch::X86_64));
+        let arm_bridge = graph.add_node(job(linux, FlowArch::Aarch64));
+        let windows_bridge = graph.add_node(job(FlowPlatform::Windows, FlowArch::X86_64));
+        let second_consumer = graph.add_node(job(linux, FlowArch::X86_64));
+        let unrelated = graph.add_node(job(linux, FlowArch::X86_64));
+        graph.add_edge(root, arm_bridge, ());
+        graph.add_edge(root, windows_bridge, ());
+        graph.add_edge(arm_bridge, consumer, ());
+        graph.add_edge(windows_bridge, consumer, ());
+        graph.add_edge(consumer, second_consumer, ());
+        let roles = job_flowey_bootstrap_source(
+            &graph,
+            &vec![
+                root,
+                arm_bridge,
+                windows_bridge,
+                consumer,
+                second_consumer,
+                unrelated,
+            ],
+        );
+        let artifact = match &roles[&root] {
+            FloweySource::Bootstrap(name, true) => name,
+            _ => panic!("compatible ancestor must publish for its descendant"),
+        };
+        for node in [consumer, second_consumer] {
+            match &roles[&node] {
+                FloweySource::Consume(name) => assert_eq!(name, artifact),
+                _ => panic!("descendant must consume its compatible ancestor's artifact"),
+            }
+        }
+        for node in [arm_bridge, windows_bridge, unrelated] {
+            assert!(matches!(&roles[&node], FloweySource::Bootstrap(_, false)));
+        }
+        let bootstrap_names: Vec<_> = roles
+            .values()
+            .filter_map(|role| match role {
+                FloweySource::Bootstrap(name, _) => Some(name),
+                FloweySource::Consume(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            bootstrap_names.iter().collect::<BTreeSet<_>>().len(),
+            bootstrap_names.len()
+        );
+        assert_eq!(roles.len(), graph.node_count());
+    }
+}
+
 /// The output of resolving a flow into a sequence of YAML steps (shared by ADO
 /// and GitHub resolvers).
 pub(crate) struct ResolvedFlowSteps {
