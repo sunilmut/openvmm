@@ -88,3 +88,81 @@ macro_rules! open_enum {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use std::format;
+    use test_with_tracing::test;
+    use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+    open_enum! {
+        #[derive(FromBytes, IntoBytes, Immutable, KnownLayout)]
+        enum Operation: u32 {
+            READY = 1,
+            READY_ALIAS = 1,
+            COMPLETE = 2,
+        }
+    }
+
+    open_enum! {
+        enum SignedStatus: i64 {
+            FAILED = -1,
+        }
+    }
+
+    open_enum! {
+        enum FutureStatus: u8 {}
+    }
+
+    // Test: Decode and forward a protocol operation with an unknown value.
+    // Expected: Known values match their variants; unknown bits survive a
+    //       typed wire round trip instead of being rejected or normalized.
+    #[test]
+    fn wire_operations_preserve_unknown_values() {
+        for raw in [1u32, 2, 0, 0x8000_0000, u32::MAX] {
+            let bytes = raw.to_ne_bytes();
+            let operation = Operation::read_from_bytes(&bytes).unwrap();
+            let recognized = match operation {
+                Operation::READY => Some("ready"),
+                Operation::COMPLETE => Some("complete"),
+                _ => None,
+            };
+            assert_eq!(
+                recognized,
+                match raw {
+                    1 => Some("ready"),
+                    2 => Some("complete"),
+                    _ => None,
+                }
+            );
+            assert_eq!(operation.as_bytes(), &bytes);
+        }
+    }
+
+    // Test: Format named, aliased and unknown protocol values in diagnostics.
+    // Expected: The first declared alias is named, string padding/precision
+    //       are honored, and unknown values retain integer formatting.
+    #[test]
+    fn diagnostics_distinguish_known_and_unknown_values() {
+        assert_eq!(format!("{:?}", Operation::READY_ALIAS), "READY");
+        assert_eq!(format!("{:>8?}", Operation::COMPLETE), "COMPLETE");
+        assert_eq!(format!("{:_^9.3?}", Operation::READY), "___REA___");
+        assert_eq!(format!("{:?}", Operation(0x8000_0000)), "2147483648");
+        assert_eq!(format!("{:08x?}", Operation(0xabcdef)), "00abcdef");
+        assert_eq!(format!("{:?}", SignedStatus::FAILED), "FAILED");
+        assert_eq!(
+            format!("{:?}", SignedStatus(i64::MIN)),
+            "-9223372036854775808"
+        );
+    }
+
+    // Test: Use an open protocol enum before any values have been assigned.
+    // Expected: Diagnostics can still represent every underlying byte.
+    #[test]
+    fn empty_enum_reports_future_values() {
+        assert_eq!(format!("{:?}", FutureStatus(0)), "0");
+        assert_eq!(format!("{:#x?}", FutureStatus(u8::MAX)), "0xff");
+    }
+}

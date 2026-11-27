@@ -5729,6 +5729,10 @@ dependencies = [
 [[package]]
 name = "open_enum"
 version = "0.0.0"
+dependencies = [
+ "test_with_tracing",
+ "zerocopy",
+]
 
 [[package]]
 name = "openhcl_attestation_protocol"
