@@ -278,3 +278,126 @@ fn resolve_magic_path_artifact(handle: ErasedArtifactHandle) -> anyhow::Result<P
     }
     Ok(magic_path)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use petri_artifacts_core::ArtifactHandle;
+    use petri_artifacts_core::ResolveTestArtifact;
+    use petri_artifacts_vmm_test::artifacts::test_vhd::GEN2_WINDOWS_DATA_CENTER_CORE2025_X64;
+    use petri_artifacts_vmm_test::artifacts::test_vhd::GEN2_WINDOWS_DATA_CENTER_CORE2025_X64_PREPPED;
+    use test_with_tracing::test;
+
+    fn local_image(handle: ErasedArtifactHandle) -> Option<PathBuf> {
+        let dir = std::env::var_os(VMM_TEST_IMAGES)?;
+        Some(PathBuf::from(dir).join(handle.relative_path())).filter(|p| p.exists())
+    }
+
+    // Test: Resolve the source of a blob-hosted image and of a prepared image
+    //       that has no remote URL, under the process's existing environment.
+    // Expected: A missing local blob image falls back to its exact remote URL;
+    //       a missing prepared image keeps the local error instead of inventing
+    //       a URL. Local copies, when present, take precedence.
+    #[test]
+    fn image_sources_prefer_local_then_blob_url_only_when_hosted() {
+        let resolver = OpenvmmKnownPathsTestArtifactResolver::new("suite::test");
+        let hosted = ArtifactHandle::<GEN2_WINDOWS_DATA_CENTER_CORE2025_X64>::new().erase();
+        match (
+            local_image(hosted),
+            resolver.resolve_source(hosted).unwrap(),
+        ) {
+            (Some(path), ArtifactSource::Local(got)) => assert_eq!(got, path),
+            (None, ArtifactSource::Remote { url }) => assert_eq!(
+                url,
+                format!(
+                    "https://hvlitetestvhds.blob.core.windows.net/vhds/{}",
+                    hosted.filename()
+                )
+            ),
+            (local, other) => panic!("unexpected source {other:?} for local {local:?}"),
+        }
+
+        let prepped =
+            ArtifactHandle::<GEN2_WINDOWS_DATA_CENTER_CORE2025_X64_PREPPED>::new().erase();
+        if local_image(prepped).is_none() {
+            let error = format!("{:#}", resolver.resolve_source(prepped).unwrap_err());
+            assert!(
+                error.contains("test images dir env var not set") || error.contains("missing"),
+                "{error}"
+            );
+        }
+    }
+
+    // Test: Resolve a Linux GNU executable for a foreign architecture that is
+    //       not built on this host.
+    // Expected: Resolution either finds an existing file or reports every
+    //       attempted location, including the Musl fallback for the GNU triple.
+    #[test]
+    fn missing_executable_error_lists_gnu_and_musl_fallback_attempts() {
+        let handle = ArtifactHandle::<OPENVMM_LINUX_AARCH64>::new().erase();
+        match resolve_artifact(handle) {
+            Ok(path) => assert!(path.exists() && path.ends_with(handle.filename())),
+            Err(error) => {
+                let error = error.to_string();
+                assert!(
+                    error.starts_with(&format!("unable to locate {}:", handle.global_unique_id())),
+                    "{error}"
+                );
+                assert!(error.contains("aarch64-unknown-linux-gnu"), "{error}");
+                assert!(error.contains("aarch64-unknown-linux-musl"), "{error}");
+                assert!(error.contains("not a magic path artifact"), "{error}");
+                assert_eq!(error.matches("\n\t").count(), 6, "{error}");
+            }
+        }
+    }
+
+    // Test: Resolve a magic package artifact and a non-magic artifact directly.
+    // Expected: The magic artifact maps to the repository .packages directory
+    //       for its firmware package; the other artifact is rejected as non-magic.
+    #[test]
+    fn magic_paths_map_only_known_packages() {
+        let firmware = ArtifactHandle::<loadable::UEFI_FIRMWARE_X64>::new().erase();
+        let expected = get_repo_root()
+            .join(".packages/hyperv.uefi.mscoreuefi.x64.RELEASE/MsvmX64/RELEASE_VS2022/FV")
+            .join(firmware.filename());
+        match resolve_magic_path_artifact(firmware) {
+            Ok(path) => assert_eq!(path, expected),
+            Err(error) => assert_eq!(
+                error.to_string(),
+                format!("{} not found", expected.display())
+            ),
+        }
+        let other = ArtifactHandle::<OPENVMM_LINUX_AARCH64>::new().erase();
+        assert_eq!(
+            resolve_magic_path_artifact(other).unwrap_err().to_string(),
+            "not a magic path artifact"
+        );
+    }
+
+    // Test: Look up missing executables relative to the running test binary and
+    //       under an explicit build profile in the repository target directory.
+    // Expected: Relative lookup escapes the `deps` directory, and an explicit
+    //       profile is used verbatim in the reported target path.
+    #[test]
+    fn executable_lookups_report_resolved_search_paths() {
+        let name = "definitely_missing_known_paths_fixture";
+        let error = get_executable_path_relative(name).unwrap_err().to_string();
+        let exe = std::env::current_exe().unwrap();
+        let mut dir = exe.parent().unwrap();
+        if dir.file_name().unwrap() == "deps" {
+            dir = dir.parent().unwrap();
+        }
+        let expected = dir.join(Path::new(name).with_extension(EXE_EXTENSION));
+        assert_eq!(error, format!("{} not found", expected.display()));
+
+        let triple: target_lexicon::Triple = "x86_64-unknown-linux-gnu".parse().unwrap();
+        let error = get_executable_path_artifact(&triple, Some("fixture-profile"), name)
+            .unwrap_err()
+            .to_string();
+        let expected = get_repo_root()
+            .join("target/x86_64-unknown-linux-gnu/fixture-profile")
+            .join(name);
+        assert_eq!(error, format!("{} not found", expected.display()));
+        assert!(matches!(cargo_build_profile(), "debug" | "release"));
+    }
+}

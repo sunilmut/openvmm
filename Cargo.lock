@@ -6990,6 +6990,7 @@ dependencies = [
  "petri_artifacts_core",
  "petri_artifacts_vmm_test",
  "target-lexicon",
+ "test_with_tracing",
 ]
 
 [[package]]
