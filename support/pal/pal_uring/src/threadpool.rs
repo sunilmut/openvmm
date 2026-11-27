@@ -1043,4 +1043,28 @@ mod tests {
         pool.run();
         assert!(done.load(Ordering::SeqCst));
     }
+
+    // Test: Schedule a child task from the idle task before attempting to block.
+    // Expected: Pending runnable work forbids blocking and completes normally,
+    //       after which the idle task and pool can both shut down.
+    #[test]
+    fn idle_task_yields_to_work_it_schedules() {
+        let pool = IoUringPool::new("idle-runnable", 8).unwrap();
+        let initiator = pool.client().initiator().clone();
+        let completed = Arc::new(AtomicBool::new(false));
+        pool.client().set_idle_task({
+            let completed = completed.clone();
+            move |mut control: crate::IdleControl| async move {
+                let child = initiator.spawn("idle-child", async { 37 });
+                assert!(
+                    !control.pre_block(),
+                    "idle task must not block over runnable work"
+                );
+                assert_eq!(child.await, 37);
+                completed.store(true, Ordering::SeqCst);
+            }
+        });
+        pool.run();
+        assert!(completed.load(Ordering::SeqCst));
+    }
 }

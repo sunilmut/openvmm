@@ -703,4 +703,27 @@ mod tests {
         assert!(weak_worker.upgrade().is_none());
         assert!(weak_ring.upgrade().is_none());
     }
+
+    // Test: Change bounded and unbounded worker limits independently on a private ring.
+    // Expected: Kernel readback reflects each requested limit, while None leaves
+    //       the other limit unchanged instead of resetting or swapping it.
+    #[test]
+    fn worker_limits_preserve_independent_settings() {
+        let (ring, _completions) = IoRing::new(8).unwrap();
+        for (bounded, unbounded, expected) in [
+            (Some(2), Some(3), [2, 3]),
+            (None, Some(4), [2, 4]),
+            (Some(5), None, [5, 4]),
+            (None, None, [5, 4]),
+        ] {
+            ring.set_iowq_max_workers(bounded, unbounded).unwrap();
+            let mut actual = [0, 0];
+            ring.inner
+                .ring
+                .submitter()
+                .register_iowq_max_workers(&mut actual)
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
 }

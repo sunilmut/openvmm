@@ -408,6 +408,7 @@ impl<T: Initiate> PollTimer for Timer<T> {
 pub(crate) mod tests {
     use crate::IoInitiator;
     use crate::IoUringPool;
+    use futures::FutureExt;
     use futures::executor::block_on;
     use once_cell::sync::OnceCell;
     use pal_async::executor_tests;
@@ -415,6 +416,7 @@ pub(crate) mod tests {
     use std::future::Future;
     use std::io;
     use std::thread::JoinHandle;
+    use test_with_tracing::test;
 
     pub struct SingleThreadPool {
         _thread: JoinHandle<()>,
@@ -500,5 +502,146 @@ pub(crate) mod tests {
             pool,
             executor_tests::io_uring_tests::uring_tests(pool.initiator().clone()),
         )
+    }
+
+    // Test: Expand a pending read poll to include write readiness in the same slot.
+    // Expected: The old interest is replaced, writable readiness arrives without
+    //       peer input, and clearing a consumed read does not leave stale readiness.
+    #[test]
+    fn expanded_interest_replaces_pending_poll_and_clears_consumed_readiness() {
+        use pal_async::fd::PollFdReady;
+        use pal_async::interest::InterestSlot;
+        use pal_async::interest::PollEvents;
+        use std::future::poll_fn;
+        use std::io::Read;
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let pool = get_pool_or_skip!();
+        let initiator = pool.initiator().clone();
+        run_until(pool, async move {
+            let (mut socket, mut peer) = UnixStream::pair().unwrap();
+            let mut readiness = super::FdReady::new(initiator, socket.as_raw_fd());
+            poll_fn(|cx| {
+                assert!(
+                    readiness
+                        .poll_fd_ready(cx, InterestSlot::Read, PollEvents::IN)
+                        .is_pending()
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let events = poll_fn(|cx| {
+                readiness.poll_fd_ready(cx, InterestSlot::Read, PollEvents::IN | PollEvents::OUT)
+            })
+            .await;
+            assert_eq!(events, PollEvents::OUT);
+            readiness.clear_fd_ready(InterestSlot::Read);
+            peer.write_all(b"first").unwrap();
+            assert_eq!(
+                poll_fn(|cx| readiness.poll_fd_ready(cx, InterestSlot::Read, PollEvents::IN)).await,
+                PollEvents::IN
+            );
+            let mut bytes = [0; 5];
+            socket.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"first");
+            readiness.clear_fd_ready(InterestSlot::Read);
+            assert!(
+                poll_fn(|cx| readiness.poll_fd_ready(cx, InterestSlot::Read, PollEvents::IN))
+                    .now_or_never()
+                    .is_none()
+            );
+            peer.write_all(b"again").unwrap();
+            assert_eq!(
+                poll_fn(|cx| readiness.poll_fd_ready(cx, InterestSlot::Read, PollEvents::IN)).await,
+                PollEvents::IN
+            );
+            socket.read_exact(&mut bytes).unwrap();
+            assert_eq!(&bytes, b"again");
+        });
+    }
+
+    // Test: Wait on a private write-only file whose read fails.
+    // Expected: Each wait preserves EBADF, and cancellation after the completed
+    //       error is immediately idle rather than reporting a consumed signal.
+    #[test]
+    fn wait_read_errors_preserve_errno_and_restore_idle_state() {
+        use pal_async::wait::PollWait;
+        use std::future::poll_fn;
+        use std::os::fd::AsRawFd;
+
+        let pool = get_pool_or_skip!();
+        let initiator = pool.initiator().clone();
+        run_until(pool, async move {
+            let directory = tempfile::tempdir().unwrap();
+            let file = std::fs::File::create(directory.path().join("write-only")).unwrap();
+            let mut wait = super::FdWait::new(initiator, file.as_raw_fd(), 8);
+            for _ in 0..2 {
+                let error = poll_fn(|cx| wait.poll_wait(cx)).await.unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+                assert_eq!(
+                    poll_fn(|cx| wait.poll_cancel_wait(cx)).now_or_never(),
+                    Some(false)
+                );
+            }
+        });
+    }
+
+    // Test: Arm a burst of signaled waits larger than a private ring's queues.
+    // Expected: Every wait completes and consumes its own signal, with no lost
+    //       requests or completions, and the small-ring executor shuts down.
+    #[test]
+    fn small_ring_completes_burst_without_losing_signals() {
+        use pal_async::wait::PollWait;
+        use pal_event::Event;
+        use std::future::poll_fn;
+        use std::os::fd::AsFd;
+        use std::os::fd::AsRawFd;
+        use std::task::Poll;
+
+        let pool = IoUringPool::new("small-ring-burst", 1).unwrap();
+        let initiator = pool.client().initiator().clone();
+        let task = initiator.spawn("burst", {
+            let initiator = initiator.clone();
+            async move {
+                let events: Vec<_> = (0..64).map(|_| Event::new()).collect();
+                for event in &events {
+                    event.signal();
+                }
+                let mut waits: Vec<_> = events
+                    .iter()
+                    .map(|event| {
+                        super::FdWait::new(initiator.clone(), event.as_fd().as_raw_fd(), 8)
+                    })
+                    .collect();
+                poll_fn(|cx| {
+                    for wait in &mut waits {
+                        assert!(wait.poll_wait(cx).is_pending());
+                    }
+                    Poll::Ready(())
+                })
+                .await;
+                for result in futures::future::join_all(
+                    waits
+                        .iter_mut()
+                        .map(|wait| poll_fn(move |cx| wait.poll_wait(cx))),
+                )
+                .await
+                {
+                    result.unwrap();
+                }
+                for event in &events {
+                    assert!(
+                        !event.try_wait(),
+                        "completed wait left its signal unconsumed"
+                    );
+                }
+            }
+        });
+        drop(initiator);
+        let thread = std::thread::spawn(move || pool.run());
+        block_on(task);
+        thread.join().unwrap();
     }
 }
