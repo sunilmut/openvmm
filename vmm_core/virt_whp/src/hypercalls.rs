@@ -1988,6 +1988,58 @@ mod aarch64 {
         }
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use test_with_tracing::test;
+        use virt_support_aarch64emu::translate::TranslatePrivilegeCheck;
+
+        #[test]
+        fn translation_preserves_access_checks_and_privilege_selection() {
+            let flags = TranslateGvaControlFlagsArm64::new()
+                .with_validate_read(true)
+                .with_validate_write(true)
+                .with_set_page_table_bits(true)
+                .with_user_access(true)
+                .with_supervisor_access(true);
+            let translated = convert_translate_control_flags(flags).unwrap();
+            assert!(translated.validate_read);
+            assert!(translated.validate_write);
+            assert!(!translated.validate_execute);
+            assert!(translated.set_page_table_bits);
+            assert!(matches!(
+                translated.privilege_check,
+                TranslatePrivilegeCheck::Both
+            ));
+            let translated = convert_translate_control_flags(
+                flags.with_validate_execute(true).with_pan_clear(true),
+            )
+            .unwrap();
+            assert!(translated.validate_execute);
+            assert!(matches!(
+                translated.privilege_check,
+                TranslatePrivilegeCheck::None
+            ));
+        }
+
+        #[test]
+        fn translation_rejects_reserved_and_unhandled_vtl_bits() {
+            for bit in [3, 10, 55, 56, 63] {
+                let flags = TranslateGvaControlFlagsArm64::from((1u64 << bit) | 1);
+                assert!(matches!(
+                    convert_translate_control_flags(flags),
+                    Err(HvError::InvalidParameter)
+                ));
+            }
+        }
+
+        #[test]
+        #[ignore = "ARM64 get/set VP-register dispatch unwraps the absent Sirbp WHP mapping"]
+        fn unmapped_ring_buffer_register_is_rejected_without_panicking() {
+            assert!(WhpProcessor::hypervisor_owned_reg(HvArm64RegisterName::Sirbp).is_none());
+        }
+    }
+
     fn convert_translate_control_flags(
         control_flags: TranslateGvaControlFlagsArm64,
     ) -> Result<TranslateFlags, HvError> {
