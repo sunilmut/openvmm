@@ -76,3 +76,37 @@ mesh_worker::register_workers! {
     #[cfg(feature = "debug_worker")]
     debug_worker::DebuggerWorker<vmsocket::VmListener>,
 }
+
+#[cfg(test)]
+mod tests {
+    use test_with_tracing::test;
+    use vm_resource::{IntoResource, ResourceResolver};
+    use vmcore::non_volatile_store::resources::EphemeralNonVolatileStoreHandle;
+
+    // Test: Resolve stores through the linked OpenHCL resource catalog, without
+    //       adding any resolvers dynamically.
+    // Expected: The catalog supplies functional, independent stores and
+    //       distinguishes unwritten storage from an explicitly empty value.
+    #[test]
+    fn linked_catalog_resolves_independent_stores() {
+        futures::executor::block_on(async {
+            let resolver = ResourceResolver::new();
+            let mut first = resolver
+                .resolve(EphemeralNonVolatileStoreHandle.into_resource(), &())
+                .await
+                .unwrap()
+                .0;
+            let mut second = resolver
+                .resolve(EphemeralNonVolatileStoreHandle.into_resource(), &())
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(first.restore().await.unwrap(), None);
+            first.persist(vec![0, 255, 42]).await.unwrap();
+            assert_eq!(second.restore().await.unwrap(), None);
+            second.persist(vec![]).await.unwrap();
+            assert_eq!(second.restore().await.unwrap(), Some(vec![]));
+            assert_eq!(first.restore().await.unwrap(), Some(vec![0, 255, 42]));
+        });
+    }
+}
