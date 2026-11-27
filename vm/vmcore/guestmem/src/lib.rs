@@ -2552,13 +2552,14 @@ mod lock_mode_tests {
     }
 
     impl LockMapping {
-        fn new(user_lockable: bool, kernel_lockable: bool) -> Self {
+        /// Allocates a backing whose independent capabilities use named fields.
+        fn new() -> Self {
             let mapping = SparseMapping::new(PAGE_SIZE).unwrap();
             mapping.alloc(0, PAGE_SIZE).unwrap();
             Self {
                 mapping,
-                user_lockable,
-                kernel_lockable,
+                user_lockable: false,
+                kernel_lockable: false,
                 user_locks: AtomicUsize::new(0),
                 kernel_locks: AtomicUsize::new(0),
                 exposures: AtomicUsize::new(0),
@@ -2652,22 +2653,34 @@ mod lock_mode_tests {
         }
     }
 
+    // Test: Lock Arc-backed memory under all user/kernel support combinations.
+    // Expected: Each API preserves its capability and invokes only its hooks.
     #[test]
     fn arc_preserves_independent_lock_modes() {
         for user in [false, true] {
             for kernel in [false, true] {
-                let backing = Arc::new(LockMapping::new(user, kernel));
+                let backing = Arc::new(LockMapping {
+                    user_lockable: user,
+                    kernel_lockable: kernel,
+                    ..LockMapping::new()
+                });
                 let memory = GuestMemory::new("lock-modes", backing.clone());
                 check_lock_modes(&memory, &[backing], &[0]);
             }
         }
     }
 
+    // Test: Lock aligned and nested views under independent support settings.
+    // Expected: Neither view swaps or combines the user and kernel capabilities.
     #[test]
     fn subranges_preserve_independent_lock_modes() {
         for user in [false, true] {
             for kernel in [false, true] {
-                let backing = Arc::new(LockMapping::new(user, kernel));
+                let backing = Arc::new(LockMapping {
+                    user_lockable: user,
+                    kernel_lockable: kernel,
+                    ..LockMapping::new()
+                });
                 let memory = GuestMemory::new("subrange-lock-modes", backing.clone());
                 let range = memory.subrange(0, PAGE_SIZE64, false).unwrap();
                 check_lock_modes(&range, std::slice::from_ref(&backing), &[0]);
@@ -2677,14 +2690,24 @@ mod lock_mode_tests {
         }
     }
 
+    // Test: Lock two regions under every pair of user/kernel capability modes.
+    // Expected: Each capability aggregates independently across both backings.
     #[test]
     fn multi_region_aggregates_lock_modes_independently() {
         let modes = [(false, false), (true, false), (false, true), (true, true)];
         for (first_user, first_kernel) in modes {
             for (second_user, second_kernel) in modes {
                 let backings = [
-                    Arc::new(LockMapping::new(first_user, first_kernel)),
-                    Arc::new(LockMapping::new(second_user, second_kernel)),
+                    Arc::new(LockMapping {
+                        user_lockable: first_user,
+                        kernel_lockable: first_kernel,
+                        ..LockMapping::new()
+                    }),
+                    Arc::new(LockMapping {
+                        user_lockable: second_user,
+                        kernel_lockable: second_kernel,
+                        ..LockMapping::new()
+                    }),
                 ];
                 let memory = GuestMemory::new_multi_region(
                     "multi-lock-modes",

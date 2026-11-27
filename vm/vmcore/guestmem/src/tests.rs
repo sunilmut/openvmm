@@ -33,13 +33,14 @@ struct LockMapping {
 }
 
 impl LockMapping {
-    fn new(size: usize, lockable: bool, unlock_required: bool) -> Self {
+    /// Allocates a backing whose locking behavior is selected by named fields.
+    fn new(size: usize) -> Self {
         let mapping = SparseMapping::new(size).unwrap();
         mapping.alloc(0, size).unwrap();
         Self {
             mapping,
-            lockable,
-            unlock_required,
+            lockable: false,
+            unlock_required: false,
             operations: Mutex::new(Vec::new()),
         }
     }
@@ -111,10 +112,16 @@ fn check_locks(memory: &GuestMemory, backing: &LockMapping, gpns: &[u64], expect
     }
 }
 
+// Test: Lock Arc-backed memory with supported and unsupported locking.
+// Expected: Capabilities, ordered lock hooks and required unlocks are preserved.
 #[test]
 fn arc_preserves_locking_support_and_hooks() {
     for lockable in [false, true] {
-        let backing = Arc::new(LockMapping::new(PAGE_SIZE * 2, lockable, true));
+        let backing = Arc::new(LockMapping {
+            lockable,
+            unlock_required: true,
+            ..LockMapping::new(PAGE_SIZE * 2)
+        });
         let memory = GuestMemory::new("arc-locking", backing.clone());
         assert_eq!(memory.supports_kernel_lock(), lockable);
         assert_eq!(memory.supports_user_lock(), lockable);
@@ -131,10 +138,16 @@ fn arc_preserves_locking_support_and_hooks() {
     }
 }
 
+// Test: Lock aligned and nested views over both backing capability settings.
+// Expected: Each view retains its parent's support and accepts only valid locks.
 #[test]
 fn subranges_preserve_locking_support() {
     for lockable in [false, true] {
-        let backing = Arc::new(LockMapping::new(PAGE_SIZE * 4, lockable, true));
+        let backing = Arc::new(LockMapping {
+            lockable,
+            unlock_required: true,
+            ..LockMapping::new(PAGE_SIZE * 4)
+        });
         let memory = GuestMemory::new("subrange-locking", backing.clone());
         let range = memory
             .subrange(PAGE_SIZE64, PAGE_SIZE64 * 2, false)
@@ -155,10 +168,16 @@ fn subranges_preserve_locking_support() {
     }
 }
 
+// Test: Lock reordered pages through nested views with both unlock policies.
+// Expected: Hooks receive translated pages in order and unlock only when needed.
 #[test]
 fn subranges_forward_lock_hooks_with_offsets() {
     for unlock_required in [false, true] {
-        let backing = Arc::new(LockMapping::new(PAGE_SIZE * 5, true, unlock_required));
+        let backing = Arc::new(LockMapping {
+            lockable: true,
+            unlock_required,
+            ..LockMapping::new(PAGE_SIZE * 5)
+        });
         let memory = GuestMemory::new("subrange-hooks", backing.clone());
         let range = memory
             .subrange(PAGE_SIZE64, PAGE_SIZE64 * 3, false)
@@ -169,13 +188,23 @@ fn subranges_forward_lock_hooks_with_offsets() {
     }
 }
 
+// Test: Lock a view of the second region under all backing support combinations.
+// Expected: Support reflects all regions; only the selected backing is locked.
 #[test]
 fn multi_region_subranges_preserve_parent_support_and_translate_gpns() {
     for first in [false, true] {
         for second in [false, true] {
             let backings = [
-                Arc::new(LockMapping::new(PAGE_SIZE, first, true)),
-                Arc::new(LockMapping::new(PAGE_SIZE, second, true)),
+                Arc::new(LockMapping {
+                    lockable: first,
+                    unlock_required: true,
+                    ..LockMapping::new(PAGE_SIZE)
+                }),
+                Arc::new(LockMapping {
+                    lockable: second,
+                    unlock_required: true,
+                    ..LockMapping::new(PAGE_SIZE)
+                }),
             ];
             let memory = GuestMemory::new_multi_region(
                 "multi-subrange",
@@ -203,9 +232,15 @@ fn multi_region_subranges_preserve_parent_support_and_translate_gpns() {
     }
 }
 
+// Test: Copy bytes and request page locks through unaligned and nested views.
+// Expected: Copies succeed; both lock APIs fail without calling backing hooks.
 #[test]
 fn unaligned_subranges_allow_copies_but_not_page_locks() {
-    let backing = Arc::new(LockMapping::new(PAGE_SIZE * 4, true, true));
+    let backing = Arc::new(LockMapping {
+        lockable: true,
+        unlock_required: true,
+        ..LockMapping::new(PAGE_SIZE * 4)
+    });
     let memory = GuestMemory::new("unaligned-subrange", backing.clone());
     let range = memory.subrange(1, PAGE_SIZE64 * 2, false).unwrap();
     let nested = range.subrange(PAGE_SIZE64 - 1, PAGE_SIZE64, false).unwrap();
@@ -225,9 +260,15 @@ fn unaligned_subranges_allow_copies_but_not_page_locks() {
     assert!(backing.take_operations().is_empty());
 }
 
+// Test: Lock partial, absent and overflowing pages through a bounded view.
+// Expected: Invalid page lists fail before any backing lock or unlock hook.
 #[test]
 fn subrange_locks_reject_partial_pages_and_invalid_gpns() {
-    let backing = Arc::new(LockMapping::new(PAGE_SIZE * 4, true, true));
+    let backing = Arc::new(LockMapping {
+        lockable: true,
+        unlock_required: true,
+        ..LockMapping::new(PAGE_SIZE * 4)
+    });
     let memory = GuestMemory::new("subrange-bounds", backing.clone());
     let range = memory
         .subrange(PAGE_SIZE64, PAGE_SIZE64 + 1, false)
@@ -294,6 +335,8 @@ fn create_test_mapping() -> GuestMemoryMapping {
     }
 }
 
+// Test: Read and write plain, page-sized and large buffers in RAM and a hole.
+// Expected: RAM starts zeroed and preserves copied bytes; the hole rejects reads.
 #[test]
 fn test_basic_read_write() {
     let mapping = create_test_mapping();
@@ -324,7 +367,7 @@ fn test_basic_read_write() {
     gm.read_at(addr, read_buffer.as_mut_slice()).unwrap();
     assert_eq!(write_buffer, read_buffer);
 
-    // Test read/write to first 1MB
+    // Copy a full megabyte through the second RAM region.
     let write_buffer: Vec<u8> = (0..SIZE_1MB).map(|x| x as u8).collect();
     let mut read_buffer: Vec<u8> = (0..SIZE_1MB).map(|_| 0).collect();
     gm.write_at(addr, write_buffer.as_slice()).unwrap();
@@ -337,6 +380,8 @@ fn test_basic_read_write() {
     assert!(result.is_err());
 }
 
+// Test: Compare-exchange both halves of a 128-bit word, including mismatches.
+// Expected: Updates preserve guards; unsupported hosts fail without writing.
 #[test]
 fn test_compare_exchange_u128() {
     const OLD: u128 = 0x0123456789abcdef_fedcba9876543210;
@@ -375,6 +420,8 @@ fn test_compare_exchange_u128() {
         .unwrap_err();
 }
 
+// Test: Have four threads repeatedly compare-exchange paired 128-bit increments.
+// Expected: The joined total has no lost increments and neither half is torn.
 #[test]
 fn test_compare_exchange_u128_concurrent() {
     // test_compare_exchange_u128 covers the unsupported result.
@@ -410,6 +457,8 @@ fn test_compare_exchange_u128_concurrent() {
     assert_eq!(gm.read_plain::<u128>(0).unwrap(), (4000 << 64) | 4000);
 }
 
+// Test: Read present regions, an absent region and each backing/address limit.
+// Expected: Only addresses inside present backings can be read.
 #[test]
 fn test_multi() {
     let len = SIZE_1MB * 4;
@@ -438,6 +487,8 @@ fn test_multi() {
     gm.read_at(3 * region_len, &mut b).unwrap_err();
 }
 
+// Test: Read allowed, denied and page-crossing ranges under a permission bitmap.
+// Expected: Every touched page must be permitted, including the trailing page.
 #[cfg(feature = "bitmap")]
 #[test]
 fn test_bitmap() {
@@ -508,6 +559,8 @@ impl FaultingMapping {
     }
 }
 
+// Test: Retry faults into writable or read-only pages and access denied pages.
+// Expected: Valid retries succeed; denied and read-only writes return errors.
 #[test]
 fn test_fault() {
     let len = PAGE_SIZE * 4;
@@ -524,6 +577,8 @@ fn test_fault() {
     gm.write_plain::<u8>(PAGE_SIZE64 * 3 - 1, &0).unwrap_err();
 }
 
+// Test: Compare-exchange at aligned and unaligned composed view addresses.
+// Expected: Supported accesses change only the word; unsupported ones fail.
 #[test]
 fn test_compare_exchange_alignment() {
     trycopy::initialize_try_copy();
@@ -561,14 +616,12 @@ fn test_compare_exchange_alignment() {
     }
 }
 
+// Regression: Computing offset + len - 1 underflowed for an empty access.
+// Test: Read and write zero-sized values at zero with every bitmap page denied.
+// Expected: Both succeed without touching a page or computing a last-page index.
 #[cfg(feature = "bitmap")]
 #[test]
 fn test_zero_length_access_at_offset_zero() {
-    // Regression test for a fuzzing-reported subtract-with-overflow panic
-    // in `check_access`: a zero-length access at offset 0 underflowed while
-    // computing the index of the last accessed page (`offset + len - 1`).
-    // A zero-length access touches no pages and so must succeed without
-    // consulting the bitmap, even when the page is marked inaccessible.
     let len = PAGE_SIZE * 4;
     let mapping = SparseMapping::new(len).unwrap();
     mapping.alloc(0, len).unwrap();
@@ -579,13 +632,12 @@ fn test_zero_length_access_at_offset_zero() {
     });
     let gm = GuestMemory::new("test", mapping);
 
-    // Zero-sized plain accesses reach `check_access` with offset 0 and
-    // len 0; these previously panicked with "attempt to subtract with
-    // overflow".
     gm.read_plain::<()>(0).unwrap();
     gm.write_plain::<()>(0, &()).unwrap();
 }
 
+// Test: Fill an allocated heap and borrow or recover it while clones exist.
+// Expected: Bytes survive; mutable access and recovery require unique ownership.
 #[test]
 fn test_allocated() {
     let mut gm = GuestMemory::allocate(0x10000);
@@ -660,6 +712,8 @@ unsafe impl GuestMemoryAccess for ToggleLockMapping {
     }
 }
 
+// Test: Lock the same backing for user and kernel access, then drop the guards.
+// Expected: Only kernel locks expose memory; every successful lock is released.
 #[test]
 fn usermode_locks_do_not_prepare_kernel_io() {
     let backing = Arc::new(ToggleLockMapping::new(PAGE_SIZE, true));
@@ -677,6 +731,8 @@ fn usermode_locks_do_not_prepare_kernel_io() {
     assert_eq!(backing.unlocks.load(Ordering::Relaxed), 2);
 }
 
+// Test: Request kernel locks through supported and unsupported Arc backings.
+// Expected: Arc forwards required hooks and never locks an unsupported backing.
 #[test]
 fn test_arc_lock_forwarding() {
     let backing = Arc::new(ToggleLockMapping::new(PAGE_SIZE, true));
@@ -693,6 +749,8 @@ fn test_arc_lock_forwarding() {
     assert_eq!(backing.locks.load(Ordering::Relaxed), 0);
 }
 
+// Test: Query heap and homogeneous or mixed-region locking support.
+// Expected: Present backings must all support locking; unsupported locks fail.
 #[test]
 fn test_supports_kernel_lock() {
     // A mapping-backed backing supports locking by default.
@@ -775,23 +833,46 @@ fn atomic_copies_preserve_scattered_order_and_guards() {
     memory.fill_at(0, 0xa5, PAGE_SIZE * 3).unwrap();
     let pages = [2, 0];
     let range = crate::PagedRange::new(PAGE_SIZE - 2, 5, &pages).unwrap();
-    let source = [1, 2, 3, 4, 5].map(AtomicU8::new);
-    memory.write_range_from_atomic(&range, &source).unwrap();
-    let destination = [0; 5].map(AtomicU8::new);
-    memory.read_range_to_atomic(&range, &destination).unwrap();
-    assert_eq!(destination.map(|byte| byte.into_inner()), [1, 2, 3, 4, 5]);
+    let source = [0xcc, 1, 2, 3, 4, 5, 0xdd].map(AtomicU8::new);
+    memory
+        .write_range_from_atomic(&range, &source[1..6])
+        .unwrap();
+    let destination = [0xa5; 7].map(AtomicU8::new);
+    memory
+        .read_range_to_atomic(&range, &destination[1..6])
+        .unwrap();
+    assert_eq!(
+        destination.map(|byte| byte.into_inner()),
+        [0xa5, 1, 2, 3, 4, 5, 0xa5]
+    );
     let mut expected = vec![0xa5; PAGE_SIZE * 3];
     expected[PAGE_SIZE * 3 - 2..].copy_from_slice(&[1, 2]);
     expected[..3].copy_from_slice(&[3, 4, 5]);
     let mut actual = vec![0; expected.len()];
     memory.read_at(0, &mut actual).unwrap();
     assert_eq!(actual, expected);
-    memory.write_from_atomic(PAGE_SIZE64 - 2, &source).unwrap();
-    let destination = [0; 5].map(AtomicU8::new);
     memory
-        .read_to_atomic(PAGE_SIZE64 - 2, &destination)
+        .write_from_atomic(PAGE_SIZE64 - 2, &source[1..6])
         .unwrap();
-    assert_eq!(destination.map(|byte| byte.into_inner()), [1, 2, 3, 4, 5]);
+    let destination = [0xa5; 7].map(AtomicU8::new);
+    memory
+        .read_to_atomic(PAGE_SIZE64 - 2, &destination[1..6])
+        .unwrap();
+    assert_eq!(
+        destination.map(|byte| byte.into_inner()),
+        [0xa5, 1, 2, 3, 4, 5, 0xa5]
+    );
+    assert_eq!(
+        memory.read_plain::<[u8; 7]>(PAGE_SIZE64 - 3).unwrap(),
+        [0xa5, 1, 2, 3, 4, 5, 0xa5]
+    );
+    expected[PAGE_SIZE - 2..PAGE_SIZE + 3].copy_from_slice(&[1, 2, 3, 4, 5]);
+    memory.read_at(0, &mut actual).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        source.map(|byte| byte.into_inner()),
+        [0xcc, 1, 2, 3, 4, 5, 0xdd]
+    );
 }
 
 // Test: Borrow and recover heap memory while clones exist and after they drop.
@@ -845,7 +926,7 @@ fn nested_subranges_constrain_visible_memory() {
 }
 
 // Test: Submit layouts whose granularity, backing size, or address space is invalid.
-// Expected: Construction returns the specific layout error without touching data.
+// Expected: Each invalid layout returns its corresponding error category.
 #[test]
 fn invalid_multi_region_layouts_return_errors() {
     use crate::AlignedHeapMemory;
@@ -1026,8 +1107,9 @@ unsafe impl GuestMemoryAccess for FallbackMemory {
         len: usize,
     ) -> Result<(), GuestMemoryBackingError> {
         let bytes = self.0.lock();
-        // The caller validates the range and destination; the mutex protects bytes.
-        unsafe { trycopy::try_copy(bytes.as_ptr().add(address as usize), dest, len) }
+        let source = &bytes[address as usize..address as usize + len];
+        // SAFETY: the slice bounds the source; the caller provides a valid dest.
+        unsafe { trycopy::try_copy(source.as_ptr(), dest, len) }
             .map_err(|error| GuestMemoryBackingError::other(address, error))
     }
 
@@ -1038,8 +1120,9 @@ unsafe impl GuestMemoryAccess for FallbackMemory {
         len: usize,
     ) -> Result<(), GuestMemoryBackingError> {
         let mut bytes = self.0.lock();
-        // The caller validates the range and source; no backing pointer escapes.
-        unsafe { trycopy::try_copy(source, bytes.as_mut_ptr().add(address as usize), len) }
+        let destination = &mut bytes[address as usize..address as usize + len];
+        // SAFETY: the slice bounds dest; the caller provides a valid source.
+        unsafe { trycopy::try_copy(source, destination.as_mut_ptr(), len) }
             .map_err(|error| GuestMemoryBackingError::other(address, error))
     }
 
@@ -1155,7 +1238,11 @@ impl<'a> crate::LockedRange<'a> for LockedSegments<'a> {
 // Expected: Data follows page order and dropping the range releases the same pages.
 #[test]
 fn locked_range_exposes_selected_bytes_and_releases_pages() {
-    let backing = Arc::new(LockMapping::new(PAGE_SIZE * 4, true, true));
+    let backing = Arc::new(LockMapping {
+        lockable: true,
+        unlock_required: true,
+        ..LockMapping::new(PAGE_SIZE * 4)
+    });
     let memory = GuestMemory::new("locked-range", backing.clone());
     memory.fill_at(0, 0xa5, PAGE_SIZE * 4).unwrap();
     let pages = [2, 0, 1];
@@ -1218,7 +1305,11 @@ fn probes_validate_access_without_changing_data() {
 // Expected: Handles retain data, repeated pages alias, and each lock is released.
 #[test]
 fn locked_page_handles_preserve_order_aliases_and_lifetime() {
-    let backing = Arc::new(LockMapping::new(PAGE_SIZE * 3, true, true));
+    let backing = Arc::new(LockMapping {
+        lockable: true,
+        unlock_required: true,
+        ..LockMapping::new(PAGE_SIZE * 3)
+    });
     let memory = GuestMemory::new("page-handles", backing.clone());
     memory.fill_at(0, 0x1a, PAGE_SIZE).unwrap();
     memory.fill_at(PAGE_SIZE64, 0x2a, PAGE_SIZE).unwrap();
@@ -1326,6 +1417,9 @@ fn bitmap_permissions_survive_aligned_nested_views() {
     assert!(nested.read_plain::<u8>(PAGE_SIZE64).is_err());
 }
 
+// IGNORED: A known product bug drops the byte offset in unaligned bitmap views.
+//       Keep this regression ignored until a separate production fix.
+//
 // Test: Access a denied parent page through an unaligned bitmap-backed view.
 // Expected: The view rejects the same byte as its parent (known product bug).
 #[cfg(feature = "bitmap")]
