@@ -944,6 +944,7 @@ mod tests {
     use std::sync::Arc;
     use test_with_tracing::test;
     use vmcore::line_interrupt::LineSetTarget;
+    use vmcore::save_restore::SaveRestore;
 
     #[derive(Default)]
     struct RecordingTarget(Mutex<Vec<bool>>);
@@ -954,6 +955,17 @@ mod tests {
         }
     }
 
+    impl RecordingTarget {
+        // Collapse adjacent equal requests while preserving every low/high pulse.
+        fn level_sequence(&self) -> Vec<bool> {
+            let mut levels = self.0.lock().clone();
+            levels.dedup();
+            levels
+        }
+    }
+
+    // Test: Mask and re-enable each RTC source in normal and enlightened modes.
+    // Expected: Pending flags survive masking; matching enables and reads drive IRQ.
     #[test]
     fn test_interrupt_masking() {
         for enlightened in [false, true] {
@@ -972,49 +984,55 @@ mod tests {
                     _ => unreachable!(),
                 };
                 fire(&mut rtc);
-                assert_eq!(rtc.state.cmos[CmosReg::STATUS_C], source | 0x80);
-                assert_eq!(target.0.lock().last(), Some(&true));
+                if enlightened {
+                    assert_eq!(target.level_sequence(), [false, true]);
+                } else {
+                    assert_eq!(target.level_sequence(), [true]);
+                }
 
                 target.0.lock().clear();
                 fire(&mut rtc);
                 if enlightened {
-                    assert_eq!(*target.0.lock(), [false, true]);
+                    assert_eq!(target.level_sequence(), [false, true]);
                 } else {
-                    assert!(!target.0.lock().contains(&false));
+                    assert_eq!(target.level_sequence(), [true]);
                 }
 
                 target.0.lock().clear();
                 set_cmos_data(&mut rtc, CmosReg::STATUS_B, 0x06);
-                assert_eq!(rtc.state.cmos[CmosReg::STATUS_C], source);
-                assert_eq!(*target.0.lock(), [false]);
+                assert_eq!(target.level_sequence(), [false]);
+                let masked = rtc.save().unwrap();
+                assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_C), source);
+                rtc.restore(masked).unwrap();
+                assert_eq!(target.level_sequence(), [false]);
 
                 target.0.lock().clear();
                 set_cmos_data(&mut rtc, CmosReg::STATUS_B, 0x06 | other_source);
-                assert_eq!(rtc.state.cmos[CmosReg::STATUS_C], source);
-                assert!(!target.0.lock().contains(&true));
-
-                set_cmos_data(&mut rtc, CmosReg::STATUS_B, 0x06 | source);
-                assert_eq!(rtc.state.cmos[CmosReg::STATUS_C], source | 0x80);
-                assert_eq!(target.0.lock().last(), Some(&true));
+                assert_eq!(target.level_sequence(), [false]);
 
                 target.0.lock().clear();
                 set_cmos_data(&mut rtc, CmosReg::STATUS_B, 0x06 | source);
-                assert!(!target.0.lock().contains(&false));
+                assert_eq!(target.level_sequence(), [true]);
+
+                target.0.lock().clear();
+                set_cmos_data(&mut rtc, CmosReg::STATUS_B, 0x06 | source);
+                assert_eq!(target.level_sequence(), [true]);
                 assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_C), source | 0x80);
-                assert_eq!(target.0.lock().last(), Some(&false));
+                assert_eq!(target.level_sequence(), [true, false]);
                 assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_C), 0);
 
                 target.0.lock().clear();
                 set_cmos_data(&mut rtc, CmosReg::STATUS_B, 0x06 | other_source);
                 fire(&mut rtc);
-                assert_eq!(rtc.state.cmos[CmosReg::STATUS_C], source);
-                assert!(!target.0.lock().contains(&true));
+                assert_eq!(target.level_sequence(), [false]);
                 assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_C), source);
                 assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_C), 0);
             }
         }
     }
 
+    // Test: Latch periodic and update events, then switch their interrupt enables.
+    // Expected: Both guest flags persist and only a matching enable keeps IRQ high.
     #[test]
     fn test_interrupt_mixed_sources() {
         for enlightened in [false, true] {
@@ -1025,32 +1043,32 @@ mod tests {
             rtc.interrupt = LineInterrupt::new_with_target("rtc", target.clone(), 0);
             rtc.on_periodic_timer();
             rtc.on_update_timer();
-            assert_eq!(rtc.state.cmos[CmosReg::STATUS_C], 0xD0);
 
             target.0.lock().clear();
             set_cmos_data(&mut rtc, CmosReg::STATUS_B, 0x26);
-            assert_eq!(rtc.state.cmos[CmosReg::STATUS_C], 0x50);
-            assert_eq!(*target.0.lock(), [false]);
+            assert_eq!(target.level_sequence(), [false]);
+            let masked = rtc.save().unwrap();
+            assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_C), 0x50);
+            rtc.restore(masked).unwrap();
+            assert_eq!(target.level_sequence(), [false]);
 
             target.0.lock().clear();
             set_cmos_data(&mut rtc, CmosReg::STATUS_B, 0x16);
-            assert_eq!(rtc.state.cmos[CmosReg::STATUS_C], 0xD0);
-            assert_eq!(*target.0.lock(), [true]);
+            assert_eq!(target.level_sequence(), [true]);
 
             target.0.lock().clear();
             set_cmos_data(&mut rtc, CmosReg::STATUS_B, 0x46);
-            assert_eq!(rtc.state.cmos[CmosReg::STATUS_C], 0xD0);
-            assert!(!target.0.lock().contains(&false));
+            assert_eq!(target.level_sequence(), [true]);
             assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_C), 0xD0);
-            assert_eq!(target.0.lock().last(), Some(&false));
+            assert_eq!(target.level_sequence(), [true, false]);
             assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_C), 0);
         }
     }
 
+    // Test: Restore a masked pending event whose checkpoint has stale IRQF set.
+    // Expected: Guest status clears stale IRQF; re-enabling publishes the event.
     #[test]
     fn restore_masked_pending_flag_clears_stale_irqf() {
-        use vmcore::save_restore::SaveRestore;
-
         for enlightened in [false, true] {
             let (mut pool, _, _, mut rtc) = new_test_rtc();
             rtc.enlightened_interrupts = enlightened;
@@ -1066,8 +1084,11 @@ mod tests {
             rtc.interrupt.set_level(true);
             target.0.lock().clear();
             SaveRestore::restore(&mut rtc, state).unwrap();
-            assert_eq!(rtc.state.cmos[CmosReg::STATUS_C], 0x40);
             assert_eq!(*target.0.lock(), [false]);
+            let masked = rtc.save().unwrap();
+            assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_C), 0x40);
+            assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_C), 0);
+            rtc.restore(masked).unwrap();
 
             target.0.lock().clear();
             set_cmos_data(&mut rtc, CmosReg::STATUS_B, 0x46);
@@ -1077,10 +1098,10 @@ mod tests {
         }
     }
 
+    // Test: Restore an enlightened RTC checkpoint containing an enabled event.
+    // Expected: Restore sets the level once; a later timer event pulses low/high.
     #[test]
     fn restore_enlightened_rtc_publishes_level_without_a_pulse() {
-        use vmcore::save_restore::SaveRestore;
-
         let (mut pool, _, _, mut rtc) = new_test_rtc();
         rtc.enlightened_interrupts = true;
         set_cmos_data(&mut rtc, CmosReg::STATUS_B, 0x46);
@@ -1247,36 +1268,19 @@ mod tests {
         set_cmos_data(rtc, CmosReg::STATUS_B, value);
     }
 
-    #[test]
-    fn test_setup() {
-        let (_, _, _, _rtc) = new_test_rtc();
-    }
-
+    // Test: Read reset selector and RTC control/status bytes through guest ports.
+    // Expected: Selector, oscillator, encoding and valid-RAM defaults match the wire.
     #[test]
     fn test_default() {
-        let default_state = RtcState::new(None);
-
         let (_, _, _, mut rtc) = new_test_rtc();
 
         let mut data = [0];
         rtc.io_read(RtcIoPort::ADDR.0, &mut data).unwrap();
         assert_eq!(data[0], 0x80);
-        assert_eq!(
-            get_cmos_data(&mut rtc, CmosReg::STATUS_A),
-            default_state.cmos[CmosReg::STATUS_A] | 0x80
-        );
-        assert_eq!(
-            get_cmos_data(&mut rtc, CmosReg::STATUS_B),
-            default_state.cmos[CmosReg::STATUS_B]
-        );
-        assert_eq!(
-            get_cmos_data(&mut rtc, CmosReg::STATUS_C),
-            default_state.cmos[CmosReg::STATUS_C]
-        );
-        assert_eq!(
-            get_cmos_data(&mut rtc, CmosReg::STATUS_D),
-            default_state.cmos[CmosReg::STATUS_D]
-        );
+        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_A), 0xa6);
+        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_B), 0x02);
+        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_C), 0);
+        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_D), 0x80);
     }
 
     fn test_time_move(rtc: &mut Rtc, is_move: bool, time: MockLocalClockAccessor) {
@@ -1296,16 +1300,13 @@ mod tests {
         }
     }
 
+    // Test: Stop and restart the RTC oscillator while advancing the mock clock.
+    // Expected: Guest time advances only while the oscillator is enabled.
     #[test]
     fn test_oscillator() {
-        let default_state = RtcState::new(None);
-
         let (_, _, time, mut rtc) = new_test_rtc();
 
-        assert_eq!(
-            get_cmos_data(&mut rtc, CmosReg::STATUS_A),
-            default_state.cmos[CmosReg::STATUS_A] | 0x80
-        );
+        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_A), 0xa6);
 
         println!("RTC should move forward when oscillator is enabled (default control mask 010)");
         test_time_move(&mut rtc, true, time.clone());
@@ -1321,6 +1322,8 @@ mod tests {
         test_time_move(&mut rtc, true, time);
     }
 
+    // Test: Observe 65 update-in-progress cycles using only simulated clock ticks.
+    // Expected: Guest time advances by 65 seconds within the stated one-second bound.
     #[test]
     fn test_uip() {
         let (_, _, time, mut rtc) = new_test_rtc();
@@ -1359,34 +1362,30 @@ mod tests {
         }
     }
 
+    // Test: Write every byte value to read-only status D through guest ports.
+    // Expected: The valid-RAM byte remains 0x80 after every write.
     #[test]
     fn test_readonly() {
-        let default_state = RtcState::new(None);
-
         let (_, _, _, mut rtc) = new_test_rtc();
 
-        assert_eq!(
-            get_cmos_data(&mut rtc, CmosReg::STATUS_D),
-            default_state.cmos[CmosReg::STATUS_D]
-        );
+        assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_D), 0x80);
 
         //Status D bits are read-only
         for i in 0..=0xFF {
             set_cmos_data(&mut rtc, CmosReg::STATUS_D, i);
-            assert_eq!(
-                get_cmos_data(&mut rtc, CmosReg::STATUS_D),
-                default_state.cmos[CmosReg::STATUS_D]
-            );
+            assert_eq!(get_cmos_data(&mut rtc, CmosReg::STATUS_D), 0x80);
         }
     }
 
+    // Test: Write both all-set and all-clear values to non-clock CMOS RAM bytes.
+    // Expected: Each guest read returns its written value without touching century.
     #[test]
     fn test_writeable() {
         let (_, _, _, mut rtc) = new_test_rtc();
 
         //Registers 0x0f..0x7f should be writable, skip 0x32 which is century field of RTC
         for i in (0x0F..=0x7F).map(CmosReg) {
-            if i == rtc.century_reg {
+            if i == CmosReg(0x32) {
                 continue;
             }
 
@@ -1460,14 +1459,18 @@ mod tests {
         assert_eq!(get_rtc_data(&mut rtc, CmosReg::HOUR, bcd, hour24), 1);
     }
 
+    // Test: Cross noon, midnight and the next hour in BCD and binary modes.
+    // Expected: Guest time and date roll over correctly in both encodings.
     #[test]
     fn test_bcd_binary() {
-        println!("----Testing BCD mode...");
-        test_count(true, true);
-        println!("----Testing Binary mode...");
-        test_count(false, true);
+        let hour24 = true;
+        for bcd in [true, false] {
+            test_count(bcd, hour24);
+        }
     }
 
+    // Test: Read all 24 hours in each BCD/binary and 12/24-hour combination.
+    // Expected: Raw guest bytes preserve midnight, noon and the AM/PM bit.
     #[test]
     fn test_hour_encodings() {
         let (_, _, _, mut rtc) = new_test_rtc();
@@ -1520,6 +1523,8 @@ mod tests {
         }
     }
 
+    // Test: Advance through noon and midnight in all four hour encodings.
+    // Expected: Literal guest hour bytes and the day boundary match each mode.
     #[test]
     fn test_hour_encoding_transitions() {
         let (_, _, time, mut rtc) = new_test_rtc();
@@ -1548,6 +1553,8 @@ mod tests {
         }
     }
 
+    // Test: Write 12-hour midnight/noon bytes and advance the mock clock.
+    // Expected: The clock receives the right hour and guest AM/PM bytes remain valid.
     #[test]
     fn test_hour_inputs() {
         let (_, _, time, mut rtc) = new_test_rtc();
@@ -1580,6 +1587,8 @@ mod tests {
         }
     }
 
+    // Test: Program alarms across noon, midnight and ordinary hour transitions.
+    // Expected: Every hour encoding schedules the next match one second later.
     #[test]
     fn test_hour_alarms() {
         let (_, _, _, mut rtc) = new_test_rtc();
@@ -1610,16 +1619,13 @@ mod tests {
         }
     }
 
+    // Test: Exercise clock rollover in all BCD/binary and 12/24-hour modes.
+    // Expected: Seconds, minutes, hours, date and weekday carry correctly.
     #[test]
     fn test_hour_mode() {
-        println!("----Testing Binary + 12 hour mode...");
-        test_count(false, false);
-        println!("----Testing Binary + 24 hour mode...");
-        test_count(false, true);
-        println!("----Testing BCD + 12 hour mode...");
-        test_count(true, false);
-        println!("----Testing BCD + 24 hour mode...");
-        test_count(true, true);
+        for (bcd, hour24) in [(false, false), (false, true), (true, false), (true, true)] {
+            test_count(bcd, hour24);
+        }
     }
 
     fn test_day_of_month(bcd: bool, hour24: bool) {
@@ -1692,12 +1698,14 @@ mod tests {
         }
     }
 
+    // Test: Advance past each month end, including leap and non-leap February.
+    // Expected: Day, month and year carry correctly in BCD and binary modes.
     #[test]
     fn test_month() {
-        println!("----Testing BCD mode...");
-        test_day_of_month(true, true);
-        println!("----Testing Binary mode...");
-        test_day_of_month(false, true);
+        let hour24 = true;
+        for bcd in [true, false] {
+            test_day_of_month(bcd, hour24);
+        }
     }
 
     fn test_day_of_week(bcd: bool, hour24: bool) {
@@ -1753,14 +1761,18 @@ mod tests {
         assert_eq!(get_rtc_data(&mut rtc, CmosReg::DAY_OF_WEEK, bcd, hour24), 7);
     }
 
+    // Test: Advance across weekday seven and then the preceding day.
+    // Expected: Weekday wraps to one and then seven in BCD and binary modes.
     #[test]
     fn test_week() {
-        println!("----Testing Binary mode...");
-        test_day_of_week(false, true);
-        println!("----Testing BCD mode...");
-        test_day_of_week(true, true);
+        let hour24 = true;
+        for bcd in [false, true] {
+            test_day_of_week(bcd, hour24);
+        }
     }
 
+    // Test: Calculate repeated alarm matches with fixed and wildcard fields.
+    // Expected: Literal delays select the next future match, including day rollover.
     #[test]
     fn test_alarm_next_match() {
         let (_, _, _, mut rtc) = new_test_rtc();
@@ -1824,6 +1836,8 @@ mod tests {
         }
     }
 
+    // Test: Make each alarm field invalid in all four clock encodings.
+    // Expected: Invalid non-wildcard fields defer the alarm by one day.
     #[test]
     fn test_alarm_invalid_fields() {
         let (_, _, _, mut rtc) = new_test_rtc();
@@ -1852,6 +1866,8 @@ mod tests {
         }
     }
 
+    // Test: Use every wildcard byte in all hour/minute/second wildcard combinations.
+    // Expected: Literal next-match delays and raw alarm register bytes are preserved.
     #[test]
     fn test_alarm_wildcards() {
         let (_, _, _, mut rtc) = new_test_rtc();
@@ -1898,6 +1914,8 @@ mod tests {
         }
     }
 
+    // Test: Program a fixed alarm and then make every alarm field a wildcard.
+    // Expected: The fixed delay is 3661 seconds and the wildcard delay is one second.
     #[test]
     fn test_alarm() {
         fn hms_to_duration(h: u8, m: u8, s: u8) -> Duration {
@@ -1921,7 +1939,5 @@ mod tests {
         set_cmos_data(&mut rtc, CmosReg::MINUTE_ALARM, 0xff);
         set_cmos_data(&mut rtc, CmosReg::SECOND_ALARM, 0xff);
         assert_eq!(rtc.calculate_alarm_duration(), hms_to_duration(0, 0, 1));
-
-        // TODO: test some more alarm scenarios
     }
 }

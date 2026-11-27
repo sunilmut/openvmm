@@ -213,8 +213,21 @@ async fn future_last_tick_checkpoint_is_rejected(driver: DefaultDriver) {
     ));
 }
 
+// Test: Convert decimal counts at digit boundaries and round-trip every legal BCD count.
+// Expected: Literal packed digits match the wire and all values through 9999 survive.
 #[test]
 fn test_bcd_comp() {
+    for (decimal, packed) in [
+        (0, 0),
+        (9, 9),
+        (10, 0x10),
+        (99, 0x99),
+        (100, 0x100),
+        (9999, 0x9999),
+    ] {
+        assert_eq!(to_bcd(decimal), packed);
+        assert_eq!(from_bcd(packed), decimal);
+    }
     for i in 0..=9999 {
         assert_eq!(from_bcd(to_bcd(i)), i, "{i} {}", to_bcd(i));
     }
@@ -243,9 +256,23 @@ fn set_low_byte_timer(timer: &mut Timer, mode: Mode, cr: u8) {
     timer.write(cr);
 }
 
+// Read the same status latch consumed by a guest read-back command.
+fn timer_status(timer: &mut Timer) -> u8 {
+    timer.state.latch_status();
+    timer.read()
+}
+
+// Latch and read status plus both counter bytes without advancing the timer.
+fn timer_readback(timer: &mut Timer) -> [u8; 3] {
+    timer.state.latch_status();
+    timer.set_control(ControlWord::new());
+    [timer.read(), timer.read(), timer.read()]
+}
+
 fn check_invert(timer: &mut Timer, initial_out: bool, expected_next: u64) {
-    let mode = Mode::from(timer.state.control.mode());
-    assert_eq!(timer.state.out, initial_out, "{mode:?}");
+    let status = timer_status(timer);
+    let mode = Mode::from((status >> 1) & 7);
+    assert_eq!(status & 0x80 != 0, initial_out, "{mode:?}");
     let n = timer.state.next_wakeup().unwrap();
     assert_eq!(n, expected_next, "{mode:?}");
     for i in 0..n - 1 {
@@ -255,18 +282,26 @@ fn check_invert(timer: &mut Timer, initial_out: bool, expected_next: u64) {
             n,
             "{mode:?}, {i}"
         );
-        assert_eq!(timer.state.out, initial_out, "{mode:?}, {i}");
+        assert_eq!(
+            timer_status(timer) & 0x80 != 0,
+            initial_out,
+            "{mode:?}, {i}"
+        );
     }
     timer.evaluate(1);
-    assert_eq!(timer.state.out, !initial_out, "{mode:?}, {n}");
+    assert_eq!(
+        timer_status(timer) & 0x80 != 0,
+        !initial_out,
+        "{mode:?}, {n}"
+    );
 }
 
 fn check_done(timer: &mut Timer) {
     assert!(timer.state.next_wakeup().is_none());
-    let out = timer.state.out;
+    let out = timer_status(timer) & 0x80;
     for _ in 0..65536 {
         timer.evaluate(1);
-        assert_eq!(timer.state.out, out);
+        assert_eq!(timer_status(timer) & 0x80, out);
     }
 }
 
@@ -314,16 +349,22 @@ fn test_output(bcd: bool) {
     check_done(&mut timer);
 }
 
+// Test: Exercise output transitions and completion in all six binary timer modes.
+// Expected: Terminal, periodic and strobe edges occur at their exact count boundaries.
 #[test]
 fn test_binary() {
     test_output(false);
 }
 
+// Test: Exercise BCD timer modes with zero-count reloads and an odd square-wave count.
+// Expected: Decimal periods and terminal/strobe boundaries preserve the output phase.
 #[test]
 fn test_bcd() {
     test_output(true);
 }
 
+// Test: Advance each timer by one elapsed interval and by individual ticks.
+// Expected: Counter/status read-back and the next deadline agree.
 #[test]
 fn elapsed_interval_matches_incremental_pit_evaluation() {
     for mode in [
@@ -342,10 +383,21 @@ fn elapsed_interval_matches_incremental_pit_evaluation() {
             incremental.evaluate(1);
         }
 
-        assert_eq!(elapsed.state, incremental.state, "{mode:?}");
+        assert_eq!(
+            timer_readback(&mut elapsed),
+            timer_readback(&mut incremental),
+            "{mode:?}"
+        );
+        assert_eq!(
+            elapsed.state.next_wakeup(),
+            incremental.state.next_wakeup(),
+            "{mode:?}"
+        );
     }
 }
 
+// Test: Advance a rate generator through three periods and half the next one.
+// Expected: Guest read-back reports count 51/output high with 50 ticks to the edge.
 #[test]
 fn elapsed_interval_preserves_periodic_phase() {
     let mut timer = Timer::new(true, None);
@@ -353,11 +405,12 @@ fn elapsed_interval_preserves_periodic_phase() {
 
     timer.evaluate(350);
 
-    assert_eq!(timer.state.ce, 51);
-    assert!(timer.state.out);
+    assert_eq!(timer_readback(&mut timer), [0xb4, 51, 0]);
     assert_eq!(timer.state.next_wakeup(), Some(50));
 }
 
+// Test: Fast-forward binary/BCD periodic timers, including zero, one and maximum elapsed ticks.
+// Expected: Read-back and deadlines match incremental or whole-period-reduced evaluation.
 #[test]
 fn long_elapsed_interval_fast_forwards_periodic_pit() {
     for mode in [Mode::RateGenerator, Mode::SquareWave] {
@@ -395,9 +448,11 @@ fn long_elapsed_interval_fast_forwards_periodic_pit() {
                 incremental.evaluate(1);
             }
             assert_eq!(
-                elapsed.state, incremental.state,
+                timer_readback(&mut elapsed),
+                timer_readback(&mut incremental),
                 "{mode:?}, count={count}, bcd={bcd}"
             );
+            assert_eq!(elapsed.state.next_wakeup(), incremental.state.next_wakeup());
 
             let mut elapsed = Timer::new(true, None);
             let mut remainder = Timer::new(true, None);
@@ -409,13 +464,17 @@ fn long_elapsed_interval_fast_forwards_periodic_pit() {
             elapsed.evaluate(u64::MAX);
             remainder.evaluate(u64::MAX % period);
             assert_eq!(
-                elapsed.state, remainder.state,
+                timer_readback(&mut elapsed),
+                timer_readback(&mut remainder),
                 "{mode:?}, count={count}, bcd={bcd}"
             );
+            assert_eq!(elapsed.state.next_wakeup(), remainder.state.next_wakeup());
         }
     }
 }
 
+// Test: Fast-forward from several periodic phases across exact-period boundaries.
+// Expected: Read-back and deadlines match independently stepped timers at each boundary.
 #[test]
 fn periodic_fast_forward_matches_incremental_from_each_phase() {
     for mode in [Mode::RateGenerator, Mode::SquareWave] {
@@ -423,13 +482,6 @@ fn periodic_fast_forward_matches_incremental_from_each_phase() {
             for count in [2, 3, 100, 1001] {
                 let period = u64::from(count);
                 for phase in [0, 1, period / 2, period / 2 + 1, period - 1] {
-                    let mut initial = Timer::new(true, None);
-                    set_timer(&mut initial, mode, count, bcd);
-                    initial.evaluate(1);
-                    for _ in 0..phase {
-                        initial.evaluate(1);
-                    }
-
                     for ticks in [
                         period - 1,
                         period,
@@ -440,8 +492,12 @@ fn periodic_fast_forward_matches_incremental_from_each_phase() {
                     ] {
                         let mut elapsed = Timer::new(true, None);
                         let mut incremental = Timer::new(true, None);
-                        elapsed.state = initial.state;
-                        incremental.state = initial.state;
+                        set_timer(&mut elapsed, mode, count, bcd);
+                        set_timer(&mut incremental, mode, count, bcd);
+                        for _ in 0..=phase {
+                            elapsed.evaluate(1);
+                            incremental.evaluate(1);
+                        }
 
                         elapsed.evaluate(ticks);
                         for _ in 0..ticks {
@@ -449,9 +505,11 @@ fn periodic_fast_forward_matches_incremental_from_each_phase() {
                         }
 
                         assert_eq!(
-                            elapsed.state, incremental.state,
+                            timer_readback(&mut elapsed),
+                            timer_readback(&mut incremental),
                             "{mode:?}, count={count}, bcd={bcd}, phase={phase}, ticks={ticks}"
                         );
+                        assert_eq!(elapsed.state.next_wakeup(), incremental.state.next_wakeup());
                     }
                 }
             }
@@ -459,6 +517,8 @@ fn periodic_fast_forward_matches_incremental_from_each_phase() {
     }
 }
 
+// Test: Advance count-one rate generators by the largest elapsed interval.
+// Expected: Counter/status stay stable and no IRQ0 edges are emitted.
 #[test]
 fn count_one_rate_generator_does_not_emit_irq0_edges() {
     for bcd in [false, true] {
@@ -468,15 +528,17 @@ fn count_one_rate_generator_does_not_emit_irq0_edges() {
         set_timer(&mut timer, Mode::RateGenerator, 1, bcd);
         timer.evaluate(1);
         target.0.lock().clear();
-        let active_state = timer.state;
+        let active = timer_readback(&mut timer);
 
         timer.evaluate(u64::MAX);
 
-        assert_eq!(timer.state, active_state, "bcd={bcd}");
+        assert_eq!(timer_readback(&mut timer), active, "bcd={bcd}");
         assert!(target.0.lock().is_empty(), "bcd={bcd}");
     }
 }
 
+// Test: Rewrite an active periodic count before fast-forwarding, including a one-count reload.
+// Expected: New counts load, null-count clears, and the pending output edge is delivered once.
 #[test]
 fn reprogrammed_periodic_count_loads_before_fast_forward() {
     for mode in [Mode::RateGenerator, Mode::SquareWave] {
@@ -494,8 +556,10 @@ fn reprogrammed_periodic_count_loads_before_fast_forward() {
             incremental.evaluate(1);
         }
 
-        assert_eq!(elapsed.state, incremental.state, "{mode:?}");
-        assert!(!elapsed.state.null, "{mode:?}");
+        let observed = timer_readback(&mut elapsed);
+        assert_eq!(observed, timer_readback(&mut incremental), "{mode:?}");
+        assert_eq!(observed[0] & 0x40, 0, "{mode:?}");
+        assert_eq!(elapsed.state.next_wakeup(), incremental.state.next_wakeup());
     }
 
     let target = Arc::new(RecordingTarget::default());
@@ -505,16 +569,16 @@ fn reprogrammed_periodic_count_loads_before_fast_forward() {
     timer.evaluate(4);
     timer.write(1);
     target.0.lock().clear();
-    assert!(timer.state.null);
-    assert!(!timer.state.out);
+    assert_eq!(timer_status(&mut timer), 0x54);
 
     timer.evaluate(u64::MAX);
 
-    assert!(!timer.state.null);
-    assert!(timer.state.out);
+    assert_eq!(timer_status(&mut timer), 0x94);
     assert_eq!(*target.0.lock(), [true]);
 }
 
+// Test: Hold each periodic timer's gate low while advancing the maximum tick interval.
+// Expected: Counter/status remain paused and no IRQ0 edge is delivered.
 #[test]
 fn low_gate_pauses_periodic_fast_forward() {
     for mode in [Mode::RateGenerator, Mode::SquareWave] {
@@ -525,15 +589,17 @@ fn low_gate_pauses_periodic_fast_forward() {
         timer.evaluate(1);
         timer.set_gate(false);
         target.0.lock().clear();
-        let paused_state = timer.state;
+        let paused = timer_readback(&mut timer);
 
         timer.evaluate(u64::MAX);
 
-        assert_eq!(timer.state, paused_state, "{mode:?}");
+        assert_eq!(timer_readback(&mut timer), paused, "{mode:?}");
         assert!(target.0.lock().is_empty(), "{mode:?}");
     }
 }
 
+// Test: Fast-forward a count-two rate generator through many complete periods.
+// Expected: Missed periodic IRQ0 edges coalesce into one low/high pulse.
 #[test]
 fn long_elapsed_interval_coalesces_periodic_irq0_edges() {
     let target = Arc::new(RecordingTarget::default());
@@ -546,5 +612,5 @@ fn long_elapsed_interval_coalesces_periodic_irq0_edges() {
     timer.evaluate(u64::MAX - 1);
 
     assert_eq!(*target.0.lock(), [false, true]);
-    assert!(timer.state.out);
+    assert_ne!(timer_status(&mut timer) & 0x80, 0);
 }

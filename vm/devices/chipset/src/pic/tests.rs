@@ -20,6 +20,18 @@ fn read_port(pic: &mut DualPic, port: u16) -> u8 {
     value[0]
 }
 
+// Select and read a controller's guest-visible IRR or ISR without polling it.
+pub(super) fn read_register(pic: &mut DualPic, controller: usize, isr: bool) -> u8 {
+    let port = match controller {
+        0 => PRIMARY_PIC_COMMAND_PORT,
+        1 => SECONDARY_PIC_COMMAND_PORT,
+        _ => unreachable!(),
+    };
+    pic.io_write(port, &[if isr { 0x0b } else { 0x0a }])
+        .unwrap();
+    read_port(pic, port)
+}
+
 // Test: Apply the Hyper-V paired command write at either PIC's command port.
 // Expected: The byte for each controller selects its own IRR/ISR register regardless of port order.
 #[test]
@@ -152,21 +164,32 @@ fn unselected_and_spurious_poll_reads_leave_ready_deasserted() {
     assert_eq!(pic.acknowledge_interrupt(), None);
 }
 
+// Test: Try every pending IRQ against each in-service combination, then issue EOI.
+// Expected: Only higher-priority IRQs win; EOI releases the highest service level.
 #[test]
 fn priority_masks_and_non_specific_eoi() {
     let mut pic = Pic::new(true);
-    pic.lines = u8::MAX;
     pic.line_low_latch = u8::MAX;
     for isr in 0..=u8::MAX {
-        pic.isr = isr;
         let first = (0..8).find(|&irq| isr & (1 << irq) != 0);
-        let expected = ((1u16 << first.unwrap_or(8)) - 1) as u8;
-        assert_eq!(pic.ready_vec(), expected, "ISR {isr:#x}");
-        assert_eq!(pic.pending_line(), (expected != 0).then_some(0));
-
-        pic.eoi(None);
         let serviced = first.map_or(0, |irq| 1 << irq);
-        assert_eq!(pic.isr, isr & !serviced, "ISR {isr:#x}");
+        let remaining = isr & !serviced;
+        let next = (0..8).find(|&irq| remaining & (1 << irq) != 0);
+        for irq in 0..8 {
+            pic.lines = 1 << irq;
+            pic.isr = isr;
+            assert_eq!(
+                pic.pending_line(),
+                (irq < first.unwrap_or(8)).then_some(irq),
+                "ISR {isr:#x}, IRQ {irq}"
+            );
+            pic.eoi(None);
+            assert_eq!(
+                pic.pending_line(),
+                (irq < next.unwrap_or(8)).then_some(irq),
+                "EOI ISR {isr:#x}, IRQ {irq}"
+            );
+        }
     }
 }
 
@@ -219,14 +242,23 @@ fn send_eoi(pic: &mut DualPic, consts: PicTestConstants) {
     }
 }
 
+// Test: Initialize both controllers and deliver a primary then a secondary IRQ.
+// Expected: Ready starts low and each controller supplies its configured vector.
 #[test]
 fn test_create_pic() {
-    let (ready, pic) = create_pic();
-    assert!(matches!(pic.pics[0].init, InitStage::Initialized));
-    assert!(matches!(pic.pics[1].init, InitStage::Initialized));
+    let (ready, mut pic) = create_pic();
     assert!(!ready());
+    pic.set_irq(1, true);
+    assert!(ready());
+    assert_eq!(pic.acknowledge_interrupt(), Some(IV_BASE + 1));
+    pic.set_irq(9, true);
+    pic.io_write(PRIMARY_PIC_COMMAND_PORT, &[0x61]).unwrap();
+    assert!(ready());
+    assert_eq!(pic.acknowledge_interrupt(), Some(IV_BASE + 9));
 }
 
+// Test: Poll an asserted primary IRQ through its command port.
+// Expected: Poll returns the IRQ, sets ISR and consumes the pending request.
 #[test]
 fn test_poll_read_primary_lowers_ready() {
     let (ready, mut pic) = create_pic();
@@ -237,15 +269,16 @@ fn test_poll_read_primary_lowers_ready() {
     let mut data = [0];
     pic.io_read(PRIMARY_PIC_COMMAND_PORT, &mut data).unwrap();
     assert_eq!(data[0], 0x81);
-    assert_eq!(pic.pics[0].isr, 1 << 1);
-    assert!(!pic.pics[0].interrupt_pending());
+    assert_eq!(read_register(&mut pic, 0, true), 1 << 1);
+    assert_eq!(read_register(&mut pic, 0, false), 0);
     assert!(!ready());
 }
 
+// Test: Poll the cascade and secondary IRQ, acknowledge service, then reassert it.
+// Expected: Both pending requests clear and a later edge reaches the cascade.
 #[test]
 fn test_poll_read_secondary_lowers_cascade() {
     let (ready, mut pic) = create_pic();
-    let cascade = 1 << PIC_CHAIN_COMMUNICATION_IRQ;
     pic.set_irq(9, true);
     assert!(ready());
 
@@ -254,17 +287,20 @@ fn test_poll_read_secondary_lowers_cascade() {
     pic.io_read(PRIMARY_PIC_COMMAND_PORT, &mut data).unwrap();
     assert_eq!(data[0], 0x80 | PIC_CHAIN_COMMUNICATION_IRQ);
 
+    assert_eq!(read_register(&mut pic, 1, false), 1 << 1);
     pic.io_write(SECONDARY_PIC_COMMAND_PORT, &[0x0c]).unwrap(); // OCW3: poll
-    assert_ne!(pic.pics[0].lines & cascade, 0);
-    assert_eq!(pic.pics[0].line_low_latch & cascade, 0);
-
     pic.io_read(SECONDARY_PIC_COMMAND_PORT, &mut data).unwrap();
     assert_eq!(data[0], 0x81);
-    assert_eq!(pic.pics[1].isr, 1 << 1);
-    assert!(!pic.pics[1].interrupt_pending());
-    assert_eq!(pic.pics[0].lines & cascade, 0);
-    assert_ne!(pic.pics[0].line_low_latch & cascade, 0);
+    assert_eq!(read_register(&mut pic, 1, true), 1 << 1);
+    assert_eq!(read_register(&mut pic, 1, false), 0);
+    assert_eq!(read_register(&mut pic, 0, false), 0);
     assert!(!ready());
+    pic.set_irq(9, false);
+    pic.io_write(SECONDARY_PIC_COMMAND_PORT, &[0x61]).unwrap();
+    pic.io_write(PRIMARY_PIC_COMMAND_PORT, &[0x62]).unwrap();
+    pic.set_irq(9, true);
+    assert!(ready());
+    assert_eq!(pic.acknowledge_interrupt(), Some(IV_BASE + 9));
 }
 
 // (Vector, pics index)
@@ -272,11 +308,15 @@ type PicTestConstants = (u8, usize);
 const PRIMARY: PicTestConstants = (0, 0);
 const SECONDARY: PicTestConstants = (8, 1);
 
+// Test: Assert, consume and retrigger a primary edge-sensitive IRQ.
+// Expected: Port IRR/ISR and delivered vectors follow each edge and EOI.
 #[test]
 fn test_edge_interrupt_primary() {
     test_edge_interrupt(PRIMARY);
 }
 
+// Test: Assert, consume and retrigger a secondary edge-sensitive IRQ.
+// Expected: Cascade delivery and port IRR/ISR follow each edge and EOI.
 #[test]
 fn test_edge_interrupt_secondary() {
     test_edge_interrupt(SECONDARY);
@@ -288,9 +328,9 @@ fn test_edge_interrupt(consts: PicTestConstants) {
 
     pic.set_irq(v, true);
     assert!(ready());
-    assert!(pic.pics[i].irr() == 0b1);
+    assert_eq!(read_register(&mut pic, i, false), 0b1);
     pic.set_irq(v, false);
-    assert!(pic.pics[i].irr() == 0b0);
+    assert_eq!(read_register(&mut pic, i, false), 0b0);
     let pending = pic.acknowledge_interrupt();
     assert!(pending.is_none());
 
@@ -298,38 +338,42 @@ fn test_edge_interrupt(consts: PicTestConstants) {
 
     pic.set_irq(v, true);
     assert!(ready());
-    assert!(pic.pics[i].irr() == 0b1);
+    assert_eq!(read_register(&mut pic, i, false), 0b1);
 
     let pending = pic.acknowledge_interrupt();
     assert_eq!(pending, Some(IV_BASE + v));
-    assert!(pic.pics[i].irr() == 0);
-    assert!(pic.pics[i].isr == 0b1);
+    assert_eq!(read_register(&mut pic, i, false), 0);
+    assert_eq!(read_register(&mut pic, i, true), 0b1);
 
     send_eoi(&mut pic, consts);
 
-    assert!(pic.pics[i].irr() == 0);
-    assert!(pic.pics[i].isr == 0);
+    assert_eq!(read_register(&mut pic, i, false), 0);
+    assert_eq!(read_register(&mut pic, i, true), 0);
     let pending = pic.acknowledge_interrupt();
     assert!(pending.is_none());
 
     assert!(!ready());
 
     pic.set_irq(v, true);
-    assert!(pic.pics[i].irr() == 0b0);
+    assert_eq!(read_register(&mut pic, i, false), 0b0);
     pic.set_irq(v, false);
     pic.set_irq(v, true);
-    assert!(pic.pics[i].irr() == 0b1);
+    assert_eq!(read_register(&mut pic, i, false), 0b1);
     assert!(ready());
 
     pic.set_irq(v, false);
-    assert!(pic.pics[i].irr() == 0b0);
+    assert_eq!(read_register(&mut pic, i, false), 0b0);
 }
 
+// Test: Hold a primary level-sensitive IRQ through acknowledgement and EOI.
+// Expected: It redelivers while high and disappears after deassertion.
 #[test]
 fn test_level_interrupts_primary() {
     test_level_interrupts(PRIMARY);
 }
 
+// Test: Hold a secondary level-sensitive IRQ through acknowledgement and EOI.
+// Expected: Cascade redelivery continues only while the source remains high.
 #[test]
 fn test_level_interrupts_secondary() {
     test_level_interrupts(SECONDARY);
@@ -351,9 +395,9 @@ fn test_level_interrupts(consts: PicTestConstants) {
 
     pic.set_irq(v, true);
     assert!(ready());
-    assert!(pic.pics[i].irr() == 0b1);
+    assert_eq!(read_register(&mut pic, i, false), 0b1);
     pic.set_irq(v, false);
-    assert!(pic.pics[i].irr() == 0b0);
+    assert_eq!(read_register(&mut pic, i, false), 0b0);
     let pending = pic.acknowledge_interrupt();
 
     // No spurious interrupt is possible with the current interface.
@@ -363,31 +407,35 @@ fn test_level_interrupts(consts: PicTestConstants) {
 
     pic.set_irq(v, true);
     assert!(ready());
-    assert!(pic.pics[i].irr() == 0b1);
+    assert_eq!(read_register(&mut pic, i, false), 0b1);
 
     let pending = pic.acknowledge_interrupt();
     assert_eq!(pending, Some(IV_BASE + v));
-    assert!(pic.pics[i].irr() == 0b1);
-    assert!(pic.pics[i].isr == 0b1);
+    assert_eq!(read_register(&mut pic, i, false), 0b1);
+    assert_eq!(read_register(&mut pic, i, true), 0b1);
 
     send_eoi(&mut pic, consts);
-    assert!(pic.pics[i].irr() == 0b1);
-    assert!(pic.pics[i].isr == 0);
+    assert_eq!(read_register(&mut pic, i, false), 0b1);
+    assert_eq!(read_register(&mut pic, i, true), 0);
 
     let pending = pic.acknowledge_interrupt();
     assert_eq!(pending, Some(IV_BASE + v));
     pic.set_irq(v, false);
     send_eoi(&mut pic, consts);
-    assert!(pic.pics[i].irr() == 0);
+    assert_eq!(read_register(&mut pic, i, false), 0);
     let pending = pic.acknowledge_interrupt();
     assert!(pending.is_none());
 }
 
+// Test: Queue two primary edges and acknowledge them around EOI.
+// Expected: The higher-priority vector wins and the peer remains pending.
 #[test]
 fn test_multiple_edge_interrupt_primary() {
     test_multiple_edge_interrupt(PRIMARY);
 }
 
+// Test: Queue two secondary edges and acknowledge them around cascade EOI.
+// Expected: Priority and the pending peer are preserved through both controllers.
 #[test]
 fn test_multiple_edge_interrupt_secondary() {
     test_multiple_edge_interrupt(SECONDARY);
@@ -399,37 +447,39 @@ fn test_multiple_edge_interrupt(consts: PicTestConstants) {
 
     pic.set_irq(v, true);
     assert!(ready());
-    assert!(pic.pics[i].irr() == 0b1);
+    assert_eq!(read_register(&mut pic, i, false), 0b1);
     pic.set_irq(v, false);
-    assert!(pic.pics[i].irr() == 0b0);
+    assert_eq!(read_register(&mut pic, i, false), 0b0);
 
     pic.set_irq(v + 1, true);
-    assert!(pic.pics[i].irr() == 0b10);
+    assert_eq!(read_register(&mut pic, i, false), 0b10);
     pic.set_irq(v + 1, false);
-    assert!(pic.pics[i].irr() == 0b00);
+    assert_eq!(read_register(&mut pic, i, false), 0b00);
 
     assert!(!ready());
 
     pic.set_irq(v, true);
     assert!(ready());
-    assert!(pic.pics[i].irr() == 0b1);
+    assert_eq!(read_register(&mut pic, i, false), 0b1);
     pic.set_irq(v + 1, true);
-    assert!(pic.pics[i].irr() == 0b11);
+    assert_eq!(read_register(&mut pic, i, false), 0b11);
 
     let pending = pic.acknowledge_interrupt();
     assert_eq!(pending, Some(IV_BASE + v));
-    assert!(pic.pics[i].irr() == 0b10);
-    assert!(pic.pics[i].isr == 0b01);
+    assert_eq!(read_register(&mut pic, i, false), 0b10);
+    assert_eq!(read_register(&mut pic, i, true), 0b01);
 
     send_eoi(&mut pic, consts);
-    assert!(pic.pics[i].irr() == 0b10);
-    assert!(pic.pics[i].isr == 0b00);
+    assert_eq!(read_register(&mut pic, i, false), 0b10);
+    assert_eq!(read_register(&mut pic, i, true), 0b00);
     assert!(ready());
     let pending = pic.acknowledge_interrupt();
     assert_eq!(pending, Some(IV_BASE + 1 + v));
     assert!(!ready());
 }
 
+// Test: Nest three primary service levels and issue a non-specific EOI.
+// Expected: Only the highest-priority ISR bit clears through the command port.
 #[test]
 fn test_non_specific_eois() {
     let (_, mut pic) = create_pic();
@@ -443,7 +493,7 @@ fn test_non_specific_eois() {
     pic.set_irq(1, true);
     assert_eq!(pic.acknowledge_interrupt(), Some(IV_BASE + 1));
 
-    assert_eq!(pic.pics[0].isr, 0b101010);
+    assert_eq!(read_register(&mut pic, 0, true), 0b101010);
 
     pic.io_write(
         PRIMARY_PIC_COMMAND_PORT,
@@ -451,7 +501,7 @@ fn test_non_specific_eois() {
     )
     .unwrap();
 
-    assert_eq!(pic.pics[0].isr, 0b101000);
+    assert_eq!(read_register(&mut pic, 0, true), 0b101000);
 }
 
 mod reference_tests;

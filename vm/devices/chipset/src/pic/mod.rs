@@ -721,6 +721,7 @@ mod save_restore {
     #[cfg(test)]
     mod tests {
         use super::super::tests::create_pic;
+        use super::super::tests::read_register;
         use super::super::*;
         use super::*;
         use pal_async::async_test;
@@ -733,10 +734,12 @@ mod save_restore {
             let mut data = [0];
             pic.io_read(PRIMARY_PIC_COMMAND_PORT, &mut data).unwrap();
             assert_eq!(data[0], 0x82);
-            assert!(pic.pics[1].interrupt_pending());
-            assert_eq!(pic.pics[0].line_low_latch & 4, 0);
+            assert_eq!(read_register(pic, 1, false), 1 << 3);
+            assert_eq!(read_register(pic, 0, false), 0);
         }
 
+        // Test: Restore consumed cascade history into fresh and reset controllers.
+        // Expected: Input replay creates no IRQ; a later low/high edge does.
         #[async_test]
         async fn restore_preserves_consumed_cascade_on_fresh_and_reset_destinations() {
             let (_, mut source) = create_pic();
@@ -749,9 +752,7 @@ mod save_restore {
                     destination.reset().await;
                 }
                 destination.restore(saved.parse().unwrap()).unwrap();
-                assert_eq!(destination.pics[0].lines & 4, 4);
-                assert_eq!(destination.pics[0].irr() & 4, 0);
-                assert_eq!(destination.pics[0].line_low_latch & 4, 0);
+                assert_eq!(read_register(&mut destination, 0, false), 0);
                 assert!(!ready());
 
                 // Saving again before updating inputs must preserve the history.
@@ -760,8 +761,7 @@ mod save_restore {
                 destination.restore(saved_again.parse().unwrap()).unwrap();
                 for n in (0..16).filter(|&n| n != 2) {
                     destination.set_irq(n, n == 11);
-                    assert_eq!(destination.pics[0].irr() & 4, 0);
-                    assert_eq!(destination.pics[0].line_low_latch & 4, 0);
+                    assert_eq!(read_register(&mut destination, 0, false), 0);
                 }
 
                 // EOI the primary before acknowledging the secondary: ISR2
@@ -771,12 +771,15 @@ mod save_restore {
                     .unwrap();
                 assert!(!ready());
                 destination.set_irq(11, false);
-                assert_ne!(destination.pics[0].line_low_latch & 4, 0);
+                assert_eq!(read_register(&mut destination, 0, false), 0);
                 destination.set_irq(11, true);
                 assert!(ready());
+                assert_eq!(destination.acknowledge_interrupt(), Some(0x3b));
             }
         }
 
+        // Test: Restore primary and secondary input history, then update levels.
+        // Expected: Ready reflects the restored request and subsequent input.
         #[test]
         fn restored_inputs_preserve_pending_outputs_and_recognize_changes() {
             for irq in [1, 11] {
@@ -795,6 +798,8 @@ mod save_restore {
             }
         }
 
+        // Test: Restore legacy checkpoints without recorded input levels.
+        // Expected: Replayed cascade input creates a pending, deliverable request.
         #[test]
         fn legacy_restore_retains_provisional_cascade_behavior() {
             let (_, mut source) = create_pic();
@@ -803,11 +808,16 @@ mod save_restore {
             saved.primary.lines = None;
             saved.secondary.lines = None;
             let saved = SavedStateBlob::new(saved);
-            let (_, mut destination) = create_pic();
+            let (ready, mut destination) = create_pic();
             destination.restore(saved.parse().unwrap()).unwrap();
-            assert_ne!(destination.pics[0].line_low_latch & 4, 0);
+            assert_eq!(read_register(&mut destination, 0, false), 0);
             destination.set_irq(11, true);
-            assert_ne!(destination.pics[0].irr() & 4, 0);
+            assert_eq!(read_register(&mut destination, 0, false), 4);
+            destination
+                .io_write(PRIMARY_PIC_COMMAND_PORT, &[0x62])
+                .unwrap();
+            assert!(ready());
+            assert_eq!(destination.acknowledge_interrupt(), Some(0x3b));
         }
     }
 }

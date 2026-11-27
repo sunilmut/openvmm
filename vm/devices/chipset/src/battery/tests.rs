@@ -36,19 +36,14 @@ fn create_platform_with_interrupt(
 
 fn mmio_read_helper(battery: &mut BatteryDevice, offset: u64) -> [u8; 4] {
     let mut bytes = [0; 4];
-    battery
-        .mmio_read(battery.base_addr + offset, &mut bytes)
-        .unwrap();
+    let base = *battery.get_static_regions()[0].1.start();
+    battery.mmio_read(base + offset, &mut bytes).unwrap();
     bytes
 }
 
 fn check_mmio_read(battery: &mut BatteryDevice, offset: u64, expected_value: u32) {
     assert_eq!(
         u32::from_ne_bytes(mmio_read_helper(battery, offset)),
-        expected_value
-    );
-    assert_eq!(
-        battery.read_register(RegisterOffset(offset)),
         expected_value
     );
 }
@@ -187,7 +182,8 @@ fn polling_drains_updates_and_read_only_writes_preserve_the_latest_state() {
     assert!(target.is_high(0));
 }
 
-/// Test basic battery mmio behavior
+// Test: Publish absent, full, charging and discharging host battery updates.
+// Expected: Guest registers reflect each update and acknowledgement clears notify.
 #[test]
 fn test_basic_battery_mmio() {
     // create battery, send channel, and a blank battery state
@@ -288,14 +284,21 @@ fn test_basic_battery_mmio() {
 
     // ensure that mmio_write clears the notify_bits
     let data: u32 = 0x2;
-    let _ = battery.mmio_write(
-        battery.base_addr + RegisterOffset::BATTERY_ACPI_NOTIFY_CLEAR.0,
-        &data.to_ne_bytes(),
+    battery
+        .mmio_write(
+            BATTERY_MMIO_REGION_BASE_ADDRESS_X64 + RegisterOffset::BATTERY_ACPI_NOTIFY_CLEAR.0,
+            &data.to_ne_bytes(),
+        )
+        .unwrap();
+    check_mmio_read(
+        &mut battery,
+        RegisterOffset::BATTERY_ACPI_NOTIFY_STATUS.0,
+        0,
     );
-    assert_eq!(battery.notify_bits, 0);
 }
 
-/// Test values when battery is not present
+// Test: Publish AC-online state with no battery present.
+// Expected: Battery values stay unavailable while AC status and notify are set.
 #[test]
 fn test_battery_not_present() {
     // create battery and send channel
@@ -327,35 +330,34 @@ fn test_battery_not_present() {
     );
 }
 
-/// Test bad register read/write operations and ensure they error
+// Test: Read and write unsupported MMIO transfer sizes.
+// Expected: InvalidAccessSize preserves read buffers and the battery registers.
 #[test]
 fn test_bad_register_read_writes() {
     // create battery and send channel
     let (mut battery, _) = create_test_platform();
 
-    // Test reading with a data size not equal to size_of::<u32>()
-    let mut data = vec![0; size_of::<u32>() + 1];
-    match battery.mmio_read(battery.base_addr, &mut data) {
-        IoResult::Err(e) => assert!(matches!(e, IoError::InvalidAccessSize)),
-        _ => panic!("Expected error, but got Ok"),
-    }
-
-    // Test writing with a data size not equal to size_of::<u32>()
-    let data = vec![0; size_of::<u32>() + 1];
-    match battery.mmio_write(battery.base_addr, &data) {
-        IoResult::Err(e) => assert!(matches!(e, IoError::InvalidAccessSize)),
-        _ => panic!("Expected error, but got Ok"),
-    }
-
-    // Test writing with data that cannot be converted into a `u32`
-    let data = vec![0; size_of::<u32>() - 1];
-    match battery.mmio_write(battery.base_addr, &data) {
-        IoResult::Err(e) => assert!(matches!(e, IoError::InvalidAccessSize)),
-        _ => panic!("Expected error, but got Ok"),
+    let expected = [0, 4, 8, 12, 16, 20].map(|offset| mmio_read_helper(&mut battery, offset));
+    for size in [0, 1, 2, 3, 5, 8] {
+        let mut data = vec![0xa5; size];
+        assert!(matches!(
+            battery.mmio_read(BATTERY_MMIO_REGION_BASE_ADDRESS_X64, &mut data),
+            IoResult::Err(IoError::InvalidAccessSize)
+        ));
+        assert_eq!(data, vec![0xa5; size]);
+        assert!(matches!(
+            battery.mmio_write(BATTERY_MMIO_REGION_BASE_ADDRESS_X64, &data),
+            IoResult::Err(IoError::InvalidAccessSize)
+        ));
+        assert_eq!(
+            [0, 4, 8, 12, 16, 20].map(|offset| mmio_read_helper(&mut battery, offset)),
+            expected
+        );
     }
 }
 
-/// Test bad capacity on a battery
+// Test: Publish a present battery whose maximum capacity is zero.
+// Expected: The guest sees an unavailable battery but retains AC status and notify.
 #[test]
 fn test_bad_battery_capacity() {
     // create battery and send channel

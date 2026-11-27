@@ -277,6 +277,8 @@ async fn inert_registers_and_holes_ignore_writes(driver: DefaultDriver) {
     }
 }
 
+// Test: Press the power button with unrelated, matching and disabled SCI enables.
+// Expected: Pending status survives restore and clears only on acknowledgement.
 #[async_test]
 async fn power_button_latches_until_cleared_and_obeys_sci_enable(driver: DefaultDriver) {
     let target = TestLineInterruptTarget::new_arc();
@@ -316,7 +318,7 @@ async fn power_button_latches_until_cleared_and_obeys_sci_enable(driver: Default
     let saved = pm.save().unwrap();
     pm.reset().await;
     assert!(!target.is_high(0));
-    assert_eq!(pm.state.status, 0);
+    assert_eq!(read(&mut pm, DynReg::STATUS), 0);
     pm.restore(saved).unwrap();
     assert!(target.is_high(0));
     pm.pcat_facp_acpi_enable(false);
@@ -325,9 +327,14 @@ async fn power_button_latches_until_cleared_and_obeys_sci_enable(driver: Default
     assert!(target.is_high(0));
     write(&mut pm, DynReg::STATUS, POWER_BUTTON_MASK);
     assert!(!target.is_high(0));
-    assert_eq!(pm.state.status & POWER_BUTTON_MASK, 0);
+    assert_eq!(
+        read(&mut pm, DynReg::STATUS) & u32::from(POWER_BUTTON_MASK),
+        0
+    );
 }
 
+// Test: Latch GPE8 while enabling an unrelated GPE, then enable and clear GPE8.
+// Expected: Only the matching enabled pending GPE raises SCI.
 #[async_test]
 async fn sci_requires_a_matching_enabled_gpe(driver: DefaultDriver) {
     let target = TestLineInterruptTarget::new_arc();
@@ -348,6 +355,8 @@ async fn sci_requires_a_matching_enabled_gpe(driver: DefaultDriver) {
     assert!(!target.is_high(0));
 }
 
+// Test: Latch a global PM event with unrelated and then matching event enables.
+// Expected: Only the matching enable raises SCI, and acknowledgement lowers it.
 #[async_test]
 async fn sci_requires_a_matching_enabled_pm_event(driver: DefaultDriver) {
     let target = TestLineInterruptTarget::new_arc();

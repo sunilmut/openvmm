@@ -208,6 +208,17 @@ mod tests {
         }
     }
 
+    // Read pending-event state through the guest-visible status register.
+    fn status(button: &mut AcpiPowerButton) -> u32 {
+        let mut value = [0; 4];
+        button
+            .mmio_read(u64::from(ACPI_POWER_BUTTON_MMIO_BASE), &mut value)
+            .unwrap();
+        u32::from_le_bytes(value)
+    }
+
+    // Test: Press the power button twice and acknowledge each pending event.
+    // Expected: Each press latches status and IRQ until a matching guest write.
     #[test]
     fn presses_latch_until_guest_acknowledgement() {
         futures::executor::block_on(async {
@@ -249,6 +260,8 @@ mod tests {
         });
     }
 
+    // Test: Stop, checkpoint, reset and restore a pending power-button event.
+    // Expected: Stop preserves it; reset and idle restore clear status and IRQ.
     #[test]
     fn pending_event_survives_stop_and_save_restore_and_reset_clears_it() {
         futures::executor::block_on(async {
@@ -259,23 +272,29 @@ mod tests {
             );
             button.set_pending(true);
             button.stop().await;
+            assert_eq!(status(&mut button), 1);
             let pending = button.save().unwrap();
             assert_eq!(*interrupts.0.lock(), [(10, true)]);
             button.start();
             assert_eq!(*interrupts.0.lock(), [(10, true)]);
 
             button.reset().await;
-            assert!(!button.pending);
+            assert_eq!(status(&mut button), 0);
             let idle = button.save().unwrap();
             button.restore(pending).unwrap();
-            assert!(button.pending);
+            assert_eq!(status(&mut button), 1);
             assert_eq!(*interrupts.0.lock(), [(10, true), (10, false), (10, true)]);
             button.restore(idle).unwrap();
-            assert!(!button.pending);
-            assert_eq!(interrupts.0.lock().last(), Some(&(10, false)));
+            assert_eq!(status(&mut button), 0);
+            assert_eq!(
+                *interrupts.0.lock(),
+                [(10, true), (10, false), (10, true), (10, false)]
+            );
         });
     }
 
+    // Test: Acknowledge the button while another source holds its shared IRQ.
+    // Expected: Button status clears without lowering the peer's active line.
     #[test]
     fn acknowledgement_preserves_other_sources_on_a_shared_line() {
         let interrupts = Arc::new(Interrupts::default());
@@ -283,17 +302,21 @@ mod tests {
         let other = interrupt.new_shared("other").unwrap();
         let mut button = AcpiPowerButton::new(interrupt, mesh::channel().1);
         other.set_level(true);
+        assert_eq!(*interrupts.0.lock(), [(10, true)]);
         button.set_pending(true);
         button.set_pending(true);
+        assert_eq!(status(&mut button), 1);
         button
             .mmio_write(u64::from(ACPI_POWER_BUTTON_MMIO_BASE), &1u32.to_le_bytes())
             .unwrap();
-        assert!(!button.pending);
-        assert!(interrupts.0.lock().iter().all(|&(_, high)| high));
+        assert_eq!(status(&mut button), 0);
+        assert!(interrupts.0.lock().iter().all(|event| *event == (10, true)));
         other.set_level(false);
         assert_eq!(interrupts.0.lock().last(), Some(&(10, false)));
     }
 
+    // Test: Attempt invalid sizes and addresses while a button event is pending.
+    // Expected: Typed errors preserve read buffers and guest-visible event status.
     #[test]
     fn invalid_mmio_accesses_do_not_clear_pending_event() {
         let mut button = AcpiPowerButton::new(LineInterrupt::detached(), mesh::channel().1);
@@ -305,6 +328,7 @@ mod tests {
                 button.mmio_read(base, &mut data),
                 IoResult::Err(IoError::InvalidAccessSize)
             ));
+            assert_eq!(data, vec![0xff; size]);
             assert!(matches!(
                 button.mmio_write(base, &data),
                 IoResult::Err(IoError::InvalidAccessSize)
@@ -320,6 +344,6 @@ mod tests {
                 IoResult::Err(IoError::InvalidRegister)
             ));
         }
-        assert!(button.pending);
+        assert_eq!(status(&mut button), 1);
     }
 }

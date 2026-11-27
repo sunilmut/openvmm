@@ -389,7 +389,10 @@ fn invalid_accesses_preserve_buffers_and_controller_command_phase() {
     fixture.expect_keyboard_bytes(&[0x81]);
 }
 
-// Test: Known product bug: mask keyboard interrupts while a keyboard byte is still pending.
+// IGNORED: Command-byte writes do not resynchronize an already pending IRQ.
+//       Keep the regression ignored until the separately owned product fix lands.
+//
+// Test: Mask keyboard interrupts while a keyboard byte is still pending.
 // Expected: IRQ1 deasserts immediately while the unread byte remains available.
 #[test]
 #[ignore = "known product bug: command-byte writes do not resynchronize pending IRQs"]

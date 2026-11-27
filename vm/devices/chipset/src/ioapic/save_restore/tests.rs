@@ -55,7 +55,7 @@ fn set_entry(device: &mut IoApicDevice, level: bool, masked: bool) {
         .with_vector(VECTOR)
         .with_trigger_mode_level(level)
         .with_masked(masked);
-    device.write_redirection_register(IRQ * 2, u64::from(entry) as u32);
+    mmio_set(device, 0x10 + IRQ * 2, u64::from(entry) as u32);
 }
 
 fn mmio_set(device: &mut IoApicDevice, index: u8, value: u32) {
@@ -129,7 +129,7 @@ fn mmio_redirection_programming_controls_routing_eoi_and_reset() {
         assert_eq!(routes[0].irq, IRQ);
         let (address, data) = routes[0].request.unwrap();
         assert_eq!(address, 0xfee07000);
-        assert_eq!(data & 0xff, 0x30);
+        assert_eq!(data, 0xc030);
     }
     device
         .supports_line_interrupt_target()
@@ -147,7 +147,19 @@ fn mmio_redirection_programming_controls_routing_eoi_and_reset() {
     assert_eq!(*routing.assertions.lock(), [IRQ, IRQ]);
     assert_eq!(mmio_get(&mut device, 0x12) & 0x4000, 0);
     mmio_set(&mut device, 0x12, 0x18030);
-    assert_eq!(routing.routes.lock().last().unwrap().request, None);
+    assert_eq!(
+        *routing.routes.lock(),
+        [
+            RouteCall {
+                irq: IRQ,
+                request: Some((0xfee07000, 0xc030))
+            },
+            RouteCall {
+                irq: IRQ,
+                request: None
+            }
+        ]
+    );
     block_on(device.reset());
     assert_eq!(mmio_get(&mut device, 0), 0);
     assert_eq!(mmio_get(&mut device, 0x12) & 0x100ff, 0x10000);
@@ -185,7 +197,10 @@ fn wrong_entry_count_checkpoint_preserves_the_active_mmio_route() {
     assert_eq!(*routing.assertions.lock(), [IRQ]);
 }
 
-// Test: Known product bug: read eight bytes from the guest-visible I/O APIC DATA window.
+// IGNORED: Oversized DATA-window reads panic in the register-copy implementation.
+//       Keep this regression ignored until its separately owned fix lands.
+//
+// Test: Read eight bytes from the guest-visible I/O APIC DATA window.
 // Expected: A guest access returns data or a typed error without panicking.
 #[test]
 #[ignore = "known product bug: MMIO reads larger than four bytes panic when copying the register"]
@@ -195,10 +210,16 @@ fn known_bug_eight_byte_mmio_read_does_not_panic() {
     let _ = device.mmio_read(BASE + 0x10, &mut [0; 8]);
 }
 
+// Test: Restore a checkpoint whose edge-sensitive input was already high.
+// Expected: Replaying high emits nothing; a later low/high transition delivers.
 #[test]
 fn restore_preserves_edge_history() {
     let (mut source, _) = device();
-    set_entry(&mut source, false, false);
+    set_entry(
+        &mut source,
+        /* level: */ false,
+        /* masked: */ false,
+    );
     source.set_irq(IRQ.into(), true);
     let state = source.save().expect("save succeeds");
 
@@ -212,14 +233,24 @@ fn restore_preserves_edge_history() {
     assert_eq!(*routing.assertions.lock(), [IRQ]);
 }
 
+// Test: Restore deasserted input history over an already asserted destination.
+// Expected: Restore is quiet and the next high level is recognized as a new edge.
 #[test]
 fn restore_allows_new_rising_edge() {
     let (mut source, _) = device();
-    set_entry(&mut source, false, false);
+    set_entry(
+        &mut source,
+        /* level: */ false,
+        /* masked: */ false,
+    );
     let state = source.save().expect("save succeeds");
 
     let (mut restored, routing) = device();
-    set_entry(&mut restored, false, false);
+    set_entry(
+        &mut restored,
+        /* level: */ false,
+        /* masked: */ false,
+    );
     restored.set_irq(IRQ.into(), true);
     routing.assertions.lock().clear();
 
@@ -229,25 +260,37 @@ fn restore_allows_new_rising_edge() {
     assert_eq!(*routing.assertions.lock(), [IRQ]);
 }
 
+// Test: Restore an asserted but masked level-sensitive input, then unmask it.
+// Expected: The checkpoint stays quiet until unmasking delivers the held level.
 #[test]
 fn restore_preserves_asserted_level_until_unmasked() {
     let (mut source, _) = device();
-    set_entry(&mut source, true, true);
+    set_entry(&mut source, /* level: */ true, /* masked: */ true);
     source.set_irq(IRQ.into(), true);
     let state = source.save().expect("save succeeds");
 
     let (mut restored, routing) = device();
     restored.restore(state).expect("restore succeeds");
     assert!(routing.assertions.lock().is_empty());
-    set_entry(&mut restored, true, false);
+    set_entry(
+        &mut restored,
+        /* level: */ true,
+        /* masked: */ false,
+    );
 
     assert_eq!(*routing.assertions.lock(), [IRQ]);
 }
 
+// Test: Restore an in-service level input and send matching and later EOIs.
+// Expected: Remote IRR blocks duplicate delivery until EOI, then low suppresses it.
 #[test]
 fn restore_preserves_remote_irr_until_eoi() {
     let (mut source, _) = device();
-    set_entry(&mut source, true, false);
+    set_entry(
+        &mut source,
+        /* level: */ true,
+        /* masked: */ false,
+    );
     source.set_irq(IRQ.into(), true);
     let state = source.save().expect("save succeeds");
 
@@ -263,10 +306,12 @@ fn restore_preserves_remote_irr_until_eoi() {
     assert_eq!(*routing.assertions.lock(), [IRQ]);
 }
 
+// Test: Restore a checkpoint with an asserted level whose route is now unmasked.
+// Expected: Restore emits nothing; an explicit input update evaluates the level.
 #[test]
 fn restore_does_not_evaluate_level_interrupts() {
     let (mut source, _) = device();
-    set_entry(&mut source, true, true);
+    set_entry(&mut source, /* level: */ true, /* masked: */ true);
     source.set_irq(IRQ.into(), true);
     let mut state = source.save().expect("save succeeds");
     state.redirection_entries[IRQ as usize] =
@@ -282,21 +327,29 @@ fn restore_does_not_evaluate_level_interrupts() {
     assert_eq!(*routing.assertions.lock(), [IRQ]);
 }
 
+// Test: Restore an older checkpoint without saved line levels, then unmask it.
+// Expected: Missing input history defaults low and emits no interrupt.
 #[test]
 fn restore_defaults_absent_line_levels_to_deasserted() {
     let (mut source, _) = device();
-    set_entry(&mut source, true, true);
+    set_entry(&mut source, /* level: */ true, /* masked: */ true);
     source.set_irq(IRQ.into(), true);
     let mut state = source.save().expect("save succeeds");
     state.line_levels.clear();
 
     let (mut restored, routing) = device();
     restored.restore(state).expect("restore succeeds");
-    set_entry(&mut restored, true, false);
+    set_entry(
+        &mut restored,
+        /* level: */ true,
+        /* masked: */ false,
+    );
 
     assert!(routing.assertions.lock().is_empty());
 }
 
+// Test: Restore the wrong number of line levels over an active edge route.
+// Expected: The exact error preserves MMIO configuration and existing edge history.
 #[test]
 fn restore_rejects_wrong_number_of_line_levels() {
     let (mut source, _) = device();
@@ -304,13 +357,23 @@ fn restore_rejects_wrong_number_of_line_levels() {
     state.line_levels.pop();
 
     let (mut restored, routing) = device();
-    set_entry(&mut restored, false, false);
-    let before = restored.save().expect("save succeeds");
+    set_entry(
+        &mut restored,
+        /* level: */ false,
+        /* masked: */ false,
+    );
+    restored.set_irq(IRQ.into(), true);
+    routing.assertions.lock().clear();
+    let calls = routing.routes.lock().len();
     let error = restored.restore(state).expect_err("restore must fail");
 
     assert_eq!(error.to_string(), "wrong number of line levels");
-    let after = restored.save().expect("save succeeds");
-    assert_eq!(after.redirection_entries, before.redirection_entries);
-    assert_eq!(after.line_levels, before.line_levels);
+    assert_eq!(mmio_get(&mut restored, 0x12), u32::from(VECTOR));
+    assert_eq!(mmio_get(&mut restored, 0x13), 0);
+    assert_eq!(routing.routes.lock().len(), calls);
+    restored.set_irq(IRQ.into(), true);
     assert!(routing.assertions.lock().is_empty());
+    restored.set_irq(IRQ.into(), false);
+    restored.set_irq(IRQ.into(), true);
+    assert_eq!(*routing.assertions.lock(), [IRQ]);
 }
