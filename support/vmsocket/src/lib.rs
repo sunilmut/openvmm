@@ -277,6 +277,83 @@ impl Write for &'_ VmStream {
     }
 }
 
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::VmAddress;
+    use super::VmStream;
+    use socket2::SockAddr;
+    use socket2::Socket;
+    use std::io::Read;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::net::TcpStream;
+    use std::os::windows::io::OwnedSocket;
+    use std::time::Duration;
+    use test_with_tracing::test;
+
+    // Test: Encode boundary VSOCK ports in Hyper-V service GUIDs and decode OS addresses.
+    // Expected: Port bytes and VM identity survive conversion; unrelated families are rejected.
+    #[test]
+    fn hyperv_service_mapping_and_address_validation() {
+        let vm_id = "12345678-9abc-def0-1234-56789abcdef0".parse().unwrap();
+        for (port, expected_service) in [
+            (0, "00000000-facb-11e6-bd58-64006a7986d3"),
+            (0x1234_5678, "12345678-facb-11e6-bd58-64006a7986d3"),
+            (u32::MAX, "ffffffff-facb-11e6-bd58-64006a7986d3"),
+        ] {
+            let raw: SockAddr = VmAddress::hyperv_vsock(vm_id, port).into();
+            let address = VmAddress::try_from_sock_addr(&raw).unwrap();
+            assert_eq!(address.vm_id(), vm_id);
+            assert_eq!(address.service_id().to_string(), expected_service);
+            assert_eq!(
+                address.to_string(),
+                format!("12345678-9abc-def0-1234-56789abcdef0:{expected_service}")
+            );
+        }
+        for address in [
+            SockAddr::from("127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap()),
+            SockAddr::from("[::1]:1234".parse::<std::net::SocketAddr>().unwrap()),
+        ] {
+            assert!(VmAddress::try_from_sock_addr(&address).is_none());
+        }
+    }
+
+    // Test: Transfer binary data through shared and cloned stream wrappers using real TCP sockets.
+    // Expected: Owned-socket conversion and dropping the original preserve a working bidirectional clone.
+    #[test]
+    fn owned_socket_and_clone_preserve_bidirectional_stream_io() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let local = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        local
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let stream = VmStream::from(Socket::from(local));
+        let mut shared = &stream;
+        shared.write_all(&[0, 0x11, 0xff]).unwrap();
+        shared.flush().unwrap();
+        let mut received = [0; 3];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, [0, 0x11, 0xff]);
+        peer.write_all(&[0xaa, 0, 0x55]).unwrap();
+        shared.read_exact(&mut received).unwrap();
+        assert_eq!(received, [0xaa, 0, 0x55]);
+
+        let owned: OwnedSocket = stream.into();
+        let restored = VmStream::from(owned);
+        let mut cloned = restored.try_clone().unwrap();
+        drop(restored);
+        cloned.write_all(&[3, 2, 1]).unwrap();
+        cloned.flush().unwrap();
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, [3, 2, 1]);
+        peer.write_all(&[6, 5, 4]).unwrap();
+        cloned.read_exact(&mut received).unwrap();
+        assert_eq!(received, [6, 5, 4]);
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::VmAddress;
