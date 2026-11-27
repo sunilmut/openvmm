@@ -7744,6 +7744,7 @@ version = "0.0.0"
 dependencies = [
  "serde",
  "serde_yaml",
+ "test_with_tracing",
 ]
 
 [[package]]

@@ -287,3 +287,245 @@ pub struct Job {
     // snippets.
     pub steps: Vec<serde_yaml::Value>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    fn job(name: &str) -> Job {
+        Job {
+            job: name.into(),
+            display_name: "Job".into(),
+            pool: Pool::Pool("ubuntu".into()),
+            depends_on: BTreeSet::new(),
+            timeout_in_minutes: None,
+            condition: None,
+            variables: None,
+            steps: vec![],
+        }
+    }
+
+    fn yaml<T: Serialize>(value: &T) -> Result<serde_yaml::Value, serde_yaml::Error> {
+        serde_yaml::to_value(value)
+    }
+
+    // Test: Serialize jobs and stages whose names are valid, empty, start with
+    //       a digit, or contain '-', a space or non-ASCII letters.
+    // Expected: Only ASCII alphanumeric/underscore names not starting with a
+    //       digit serialize; every other name fails with an explanation.
+    #[test]
+    fn job_and_stage_names_are_validated() {
+        for valid in ["build", "_x", "Job_2"] {
+            assert_eq!(yaml(&job(valid)).unwrap()["job"], valid);
+        }
+        for (invalid, expected) in [
+            ("", "name cannot be empty"),
+            ("2build", "name cannot start with a number"),
+            ("build-x", "ascii alphanumeric"),
+            ("build x", "ascii alphanumeric"),
+            ("bü", "ascii alphanumeric"),
+        ] {
+            let error = yaml(&job(invalid)).unwrap_err().to_string();
+            assert!(error.contains(expected), "{invalid:?}: {error}");
+            let stage = Stage {
+                stage: invalid.into(),
+                display_name: "S".into(),
+                depends_on: BTreeSet::new(),
+                condition: None,
+                jobs: vec![],
+            };
+            assert!(yaml(&stage).is_err(), "{invalid:?}");
+        }
+    }
+
+    // Test: Serialize disabled triggers, enabled triggers with empty and
+    //       populated filters, schedules with and without batch, and parse a
+    //       schedule that omits batch.
+    // Expected: Disabled triggers are the literal "none"; field names are
+    //       camelCase; empty includes, absent excludes and false batch are
+    //       omitted; a missing batch parses as false.
+    #[test]
+    fn triggers_and_schedules_use_ado_field_names() {
+        assert_eq!(yaml(&PrTrigger::None(())).unwrap(), "none");
+        assert_eq!(yaml(&CiTrigger::None(())).unwrap(), "none");
+        let pr = PrTrigger::Some {
+            auto_cancel: true,
+            drafts: false,
+            branches: TriggerBranches {
+                include: vec!["main".into()],
+                exclude: None,
+            },
+            paths: Some(TriggerPaths {
+                include: vec![],
+                exclude: Some(vec!["Guide/*".into()]),
+            }),
+        };
+        assert_eq!(
+            serde_yaml::to_string(&pr).unwrap(),
+            "autoCancel: true\ndrafts: false\nbranches:\n  include:\n  - main\npaths:\n  exclude:\n  - Guide/*\n"
+        );
+        let ci = CiTrigger::Some {
+            batch: true,
+            branches: None,
+            tags: Some(TriggerTags {
+                include: vec!["v*".into()],
+                exclude: None,
+            }),
+            paths: None,
+        };
+        assert_eq!(
+            serde_yaml::to_string(&ci).unwrap(),
+            "batch: true\ntags:\n  include:\n  - v*\n"
+        );
+
+        let schedule = |batch| Schedule {
+            cron: "0 0 * * *".into(),
+            display_name: "Nightly".into(),
+            branches: TriggerBranches {
+                include: vec!["main".into()],
+                exclude: None,
+            },
+            batch,
+        };
+        assert!(yaml(&schedule(false)).unwrap().get("batch").is_none());
+        assert_eq!(yaml(&schedule(true)).unwrap()["batch"], true);
+        let parsed: Schedule = serde_yaml::from_str(
+            "cron: '0 0 * * *'\ndisplayName: Nightly\nbranches:\n  include: [main]\n",
+        )
+        .unwrap();
+        assert!(!parsed.batch && parsed.display_name == "Nightly");
+    }
+
+    // Test: Serialize each parameter type, repository types and both pool
+    //       forms, then round-trip a complete pipeline through YAML.
+    // Expected: Parameters carry a lowercase `type` tag next to their name;
+    //       repositories use `ref`/`type` with lowercase type names; pools are a
+    //       string or a map; the pipeline re-serializes identically.
+    #[test]
+    fn parameters_repositories_pools_and_pipelines_round_trip() {
+        let param = |ty| Parameter {
+            name: "p".into(),
+            display_name: "P".into(),
+            ty,
+        };
+        assert_eq!(
+            serde_yaml::to_string(&param(ParameterType::Boolean {
+                default: Some(true)
+            }))
+            .unwrap(),
+            "name: p\ndisplayName: P\ntype: boolean\ndefault: true\n"
+        );
+        assert_eq!(
+            yaml(&param(ParameterType::Number {
+                default: None,
+                values: Some(vec![1, 2])
+            }))
+            .unwrap()["type"],
+            "number"
+        );
+        assert_eq!(
+            yaml(&param(ParameterType::Object { default: None })).unwrap()["type"],
+            "object"
+        );
+
+        for (ty, name) in [
+            (ResourcesRepositoryType::Git, "git"),
+            (ResourcesRepositoryType::GitHub, "github"),
+            (
+                ResourcesRepositoryType::GitHubEnterprise,
+                "githubenterprise",
+            ),
+            (ResourcesRepositoryType::Bitbucket, "bitbucket"),
+        ] {
+            let repo = ResourcesRepository {
+                repository: "self_alias".into(),
+                endpoint: None,
+                name: "org/repo".into(),
+                r#ref: "refs/heads/main".into(),
+                r#type: ty,
+            };
+            let value = yaml(&repo).unwrap();
+            assert_eq!(
+                (value["type"].as_str(), value["ref"].as_str()),
+                (Some(name), Some("refs/heads/main"))
+            );
+            assert!(value.get("endpoint").is_none());
+        }
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("name".to_string(), serde_yaml::Value::from("pool-a"));
+        let mut pool_job = job("with_pool");
+        pool_job.pool = Pool::PoolWithMetadata(metadata);
+        let pipeline = Pipeline {
+            name: Some("$(Date)".into()),
+            trigger: Some(CiTrigger::None(())),
+            pr: Some(PrTrigger::None(())),
+            schedules: None,
+            variables: Some(vec![Variable {
+                name: "V".into(),
+                value: "1".into(),
+            }]),
+            parameters: Some(vec![param(ParameterType::String {
+                default: Some("a".into()),
+                values: Some(vec!["a".into(), "b".into()]),
+            })]),
+            resources: Some(Resources {
+                repositories: vec![ResourcesRepository {
+                    repository: "tools".into(),
+                    endpoint: Some("svc".into()),
+                    name: "org/tools".into(),
+                    r#ref: "refs/heads/main".into(),
+                    r#type: ResourcesRepositoryType::GitHub,
+                }],
+            }),
+            stages: None,
+            jobs: Some(vec![job("plain"), pool_job]),
+            extends: None,
+        };
+        let text = serde_yaml::to_string(&pipeline).unwrap();
+        let reparsed: Pipeline = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(serde_yaml::to_string(&reparsed).unwrap(), text);
+        assert!(text.contains("trigger: none\npr: none\n"), "{text}");
+        assert!(
+            text.contains("pool: ubuntu\n") && text.contains("pool:\n    name: pool-a\n"),
+            "{text}"
+        );
+    }
+
+    // IGNORED: entry348-bug1; fields skipped when empty on serialize
+    //       (`Resources::repositories`, trigger `include` lists) are required on
+    //       deserialize, so the crate's own output cannot be parsed back. Latent:
+    //       nothing in the repository deserializes these types today.
+    //
+    // Test: Serialize a pipeline with empty resources and a branch filter that
+    //       only excludes, then parse the YAML back.
+    // Expected: The emitted YAML parses back into the same structure.
+    #[test]
+    #[ignore = "entry348-bug1: empty-skipped fields are required when parsing"]
+    fn empty_skipped_fields_parse_back() {
+        let pipeline = Pipeline {
+            name: None,
+            trigger: Some(CiTrigger::Some {
+                batch: false,
+                branches: Some(TriggerBranches {
+                    include: vec![],
+                    exclude: Some(vec!["old".into()]),
+                }),
+                tags: None,
+                paths: None,
+            }),
+            pr: None,
+            schedules: None,
+            variables: None,
+            parameters: None,
+            resources: Some(Resources::default()),
+            stages: None,
+            jobs: None,
+            extends: None,
+        };
+        let text = serde_yaml::to_string(&pipeline).unwrap();
+        let reparsed: Pipeline = serde_yaml::from_str(&text).unwrap();
+        assert_eq!(serde_yaml::to_string(&reparsed).unwrap(), text);
+    }
+}
