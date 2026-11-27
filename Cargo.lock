@@ -2378,6 +2378,7 @@ dependencies = [
  "fs-err",
  "log",
  "serde",
+ "tempfile",
 ]
 
 [[package]]
