@@ -320,3 +320,6 @@ pub mod vsock {
         const ID: &'static str = "virtio-vsock-vhost";
     }
 }
+
+#[cfg(test)]
+mod tests;
