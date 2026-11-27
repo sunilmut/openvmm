@@ -363,4 +363,87 @@ mod tests {
             Err(PatchError::InvalidJson)
         ));
     }
+
+    fn region_of(image: &[u8]) -> &OpenTmkConfig {
+        let base = config_base(image);
+        OpenTmkConfig::ref_from_prefix(&image[base..]).unwrap().0
+    }
+
+    // Test: Parse an unpatched region, a patched region, a region re-patched
+    //       with shorter JSON, and regions with a bad magic, oversized length,
+    //       invalid UTF-8 or invalid JSON.
+    // Expected: Only correctly patched regions parse, defaulting the optional
+    //       version and params; re-patching zeroes stale bytes; every malformed
+    //       region yields None without panicking.
+    #[test]
+    fn parse_accepts_only_well_formed_regions() {
+        assert!(OpenTmkConfig::new().parse().is_none());
+        assert!(OpenTmkConfig::default().parse().is_none());
+
+        let mut image = image_with_region();
+        let long =
+            br#"{"backend":"hyperv","test":"a_long_test_name","version":3,"params":{"n":5}}"#;
+        patch_opentmk_config(&mut image, long).unwrap();
+        let cfg = region_of(&image).parse().unwrap();
+        assert_eq!(
+            (cfg.version, cfg.backend.as_str(), cfg.test.as_str()),
+            (3, "hyperv", "a_long_test_name")
+        );
+        assert_eq!(cfg.params["n"], 5);
+
+        let short = br#"{"backend":"b","test":"t"}"#;
+        patch_opentmk_config(&mut image, short).unwrap();
+        let region = region_of(&image);
+        assert!(region.json[short.len()..].iter().all(|&b| b == 0));
+        let cfg = region.parse().unwrap();
+        assert_eq!((cfg.version, cfg.params.is_null()), (0, true));
+
+        let valid = OpenTmkConfig::read_from_bytes(region.as_bytes()).unwrap();
+        let mut bad = OpenTmkConfig::read_from_bytes(valid.as_bytes()).unwrap();
+        bad.magic[0] ^= 1;
+        assert!(bad.parse().is_none());
+        let mut bad = OpenTmkConfig::read_from_bytes(valid.as_bytes()).unwrap();
+        bad.json_len = U32::new(OPENTMK_CONFIG_JSON_SIZE as u32 + 1);
+        assert!(bad.parse().is_none());
+        let mut bad = OpenTmkConfig::read_from_bytes(valid.as_bytes()).unwrap();
+        bad.json[0] = 0xff;
+        assert!(bad.parse().is_none());
+        let mut bad = OpenTmkConfig::read_from_bytes(valid.as_bytes()).unwrap();
+        bad.json[..4].copy_from_slice(b"null");
+        bad.json_len = U32::new(4);
+        assert!(bad.parse().is_none());
+    }
+
+    // Test: Patch with non-UTF-8 bytes, with valid JSON one byte larger than
+    //       the payload area, and into an image whose config section points
+    //       past the end of the file.
+    // Expected: Each fails with its specific error and the image is unchanged.
+    #[test]
+    fn patch_rejects_bad_payloads_and_sections() {
+        let original = image_with_region();
+        let mut image = original.clone();
+        assert!(matches!(
+            patch_opentmk_config(&mut image, &[0xff, 0xfe]),
+            Err(PatchError::InvalidUtf8)
+        ));
+
+        let prefix = br#"{"backend":"b","test":"t","params":""#;
+        let suffix = br#""}"#;
+        let fill = OPENTMK_CONFIG_JSON_SIZE + 1 - prefix.len() - suffix.len();
+        let mut big = prefix.to_vec();
+        big.extend(core::iter::repeat_n(b'x', fill));
+        big.extend_from_slice(suffix);
+        assert!(matches!(
+            patch_opentmk_config(&mut image, &big),
+            Err(PatchError::JsonTooLarge { len, max }) if len == OPENTMK_CONFIG_JSON_SIZE + 1 && max == OPENTMK_CONFIG_JSON_SIZE
+        ));
+        assert_eq!(image, original);
+
+        let mut truncated = original.clone();
+        truncated.truncate(truncated.len() - 1);
+        assert!(matches!(
+            patch_opentmk_config(&mut truncated, br#"{"backend":"b","test":"t"}"#),
+            Err(PatchError::MagicNotFound)
+        ));
+    }
 }
