@@ -255,3 +255,90 @@ fn parse_parameter_set<'a>(
     anyhow::ensure!(!parameters.is_empty(), "{context} cannot be empty");
     Ok(parameters)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Serialize trimmed overrides with embedded equals signs, spaces and
+    //       an explicitly empty value, including the absent-override case.
+    // Expected: Overrides retain their full values in the harness JSON object;
+    //       no supplied overrides remains absent rather than an empty replacement.
+    #[test]
+    fn parameter_overrides_preserve_values_and_absence() {
+        assert!(serialize_parameters(&[]).unwrap().is_none());
+        let overrides = [
+            " threads = 4 ",
+            "command=a=b=c",
+            "reset=",
+            "label=hello world",
+        ]
+        .map(String::from);
+        let json = serialize_parameters(&overrides).unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::json!({
+                "threads": "4", "command": "a=b=c",
+                "reset": "", "label": "hello world",
+            })
+        );
+    }
+
+    // Test: Serialize two VM parameter sets sharing keys but different values.
+    // Expected: The ordered matrix contains two independent parameter objects,
+    //       not merged overrides, and an absent matrix retains the harness default.
+    #[test]
+    fn vm_sizes_preserve_order_and_independent_parameter_sets() {
+        assert!(serialize_vm_sizes(&[]).unwrap().is_none());
+        let sizes = [
+            " cpus=1, memory=512 ",
+            "memory=2048,cpus=4,label=second=variant",
+        ]
+        .map(String::from);
+        let json = serialize_vm_sizes(&sizes).unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::json!([
+                { "parameters": { "cpus": "1", "memory": "512" } },
+                { "parameters": {
+                    "cpus": "4", "memory": "2048", "label": "second=variant",
+                } },
+            ])
+        );
+    }
+
+    // Test: Supply malformed overrides, whitespace-normalized duplicate keys and
+    //       a malformed second VM parameter set.
+    // Expected: Each input reports its specific error and CLI/row context rather
+    //       than replacing an earlier value or producing a partial valid matrix.
+    #[test]
+    fn invalid_parameter_sets_report_duplicate_syntax_and_row_context() {
+        for (values, expected) in [
+            (vec!["cpus"], "must use KEY=VALUE"),
+            (vec![" =4"], "empty parameter name"),
+            (vec!["cpus=1", " cpus =2"], "duplicate parameter \"cpus\""),
+        ] {
+            let error =
+                serialize_parameters(&values.into_iter().map(String::from).collect::<Vec<_>>())
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains("--vmm-perf-parameter"), "{error}");
+            assert!(error.contains(expected), "{error}");
+        }
+        for (second, expected) in [
+            ("cpus=2, cpus =3", "duplicate parameter \"cpus\""),
+            ("cpus=2,", "must use KEY=VALUE"),
+            ("", "must use KEY=VALUE"),
+        ] {
+            let error = serialize_vm_sizes(&["cpus=1".into(), second.into()])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("--vmm-perf-vmsizes at position 2"),
+                "{error}"
+            );
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+}

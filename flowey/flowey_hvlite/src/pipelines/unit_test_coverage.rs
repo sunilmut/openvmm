@@ -128,3 +128,69 @@ impl IntoPipeline for UnitTestCoverageCli {
         Ok(pipeline)
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    fn coverage_cli(packages: &[&str]) -> UnitTestCoverageCli {
+        UnitTestCoverageCli {
+            packages: packages.iter().map(|s| (*s).into()).collect(),
+            filter: None,
+            base: None,
+            output: None,
+            install_missing_deps: false,
+        }
+    }
+
+    // Test: Request local unit coverage through either cloud pipeline backend.
+    // Expected: Both backends are rejected before creating coverage jobs, with
+    //       the supported local Linux scope explained in the error.
+    #[test]
+    fn coverage_pipeline_rejects_cloud_backends() {
+        for backend in [PipelineBackendHint::Github, PipelineBackendHint::Ado] {
+            let error = match coverage_cli(&["flowey_hvlite"]).into_pipeline(backend) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("local coverage unexpectedly accepted a cloud backend"),
+            };
+            assert!(
+                error.contains("requires local x64 or ARM64 Linux"),
+                "{error}"
+            );
+        }
+    }
+
+    // Test: Supply package globs, version selectors, paths, punctuation and empty
+    //       names to the native local coverage pipeline.
+    // Expected: Each non-exact package selector is rejected explicitly before
+    //       constructing a successful coverage job for the wrong package scope.
+    #[test]
+    fn coverage_pipeline_rejects_non_exact_package_selectors() {
+        for package in ["pkg*", "pkg@1", "../pkg", "pkg.name", "pkg name", ""] {
+            let error = match coverage_cli(&[package]).into_pipeline(PipelineBackendHint::Local) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("non-exact package selector unexpectedly succeeded: {package:?}"),
+            };
+            assert!(
+                error.contains("use an exact workspace package name"),
+                "{error}"
+            );
+        }
+    }
+
+    // Test: Request coverage output in the already-existing package directory.
+    // Expected: The existing directory is rejected with a freshness error rather
+    //       than yielding jobs that could overwrite prior coverage or source data.
+    #[test]
+    fn coverage_pipeline_rejects_existing_output_directory() {
+        let mut cli = coverage_cli(&["flowey_hvlite"]);
+        cli.output = Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+        let error = match cli.into_pipeline(PipelineBackendHint::Local) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("coverage unexpectedly accepted an existing output directory"),
+        };
+        assert!(error.contains("coverage output already exists"), "{error}");
+        assert!(error.contains(env!("CARGO_MANIFEST_DIR")), "{error}");
+    }
+}

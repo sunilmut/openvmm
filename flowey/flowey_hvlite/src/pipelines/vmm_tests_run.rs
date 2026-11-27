@@ -917,6 +917,95 @@ mod tests {
     use petri_artifacts_vmm_test::artifacts::vmfw_dll;
     use test_with_tracing::test;
 
+    // Test: Parse multiple nextest suites with matching, filtered, unspecified
+    //       and unknown filter states, including an ignored but matching test.
+    // Expected: Only explicit matches survive in their original binary suite;
+    //       empty suites disappear without losing names or changing binary paths.
+    #[test]
+    fn nextest_listing_retains_only_matches_in_their_binary_suites() {
+        let json = serde_json::json!({
+            "rust-suites": {
+                "z-suite": {
+                    "binary-path": "/owned/z binary",
+                    "testcases": {
+                        "suite::zeta": { "filter-match": { "status": "matches" } },
+                        "suite::alpha": { "filter-match": { "status": "matches" } },
+                        "ignored": { "ignored": true, "filter-match": { "status": "matches" } },
+                        "excluded": { "filter-match": { "status": "mismatch" } },
+                        "unspecified": {},
+                        "unknown": { "filter-match": { "status": "future-status" } },
+                    },
+                },
+                "a-suite": {
+                    "binary-path": "/owned/a",
+                    "testcases": {
+                        "one": { "filter-match": { "status": "matches" } },
+                    },
+                },
+                "empty": { "binary-path": "/owned/empty", "testcases": {} },
+                "filtered": {
+                    "binary-path": "/owned/filtered",
+                    "testcases": { "excluded": { "filter-match": { "status": "mismatch" } } },
+                },
+            },
+        });
+        let suites = parse_nextest_output(&json.to_string()).unwrap();
+        assert_eq!(
+            suites.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["a-suite", "z-suite"]
+        );
+        assert_eq!(suites["a-suite"].binary_path, PathBuf::from("/owned/a"));
+        assert_eq!(suites["a-suite"].testcases, ["one"]);
+        assert_eq!(
+            suites["z-suite"].binary_path,
+            PathBuf::from("/owned/z binary")
+        );
+        assert_eq!(
+            suites["z-suite"].testcases,
+            ["ignored", "suite::alpha", "suite::zeta"]
+        );
+    }
+
+    // Test: Parse invalid JSON and listings with absent or wrongly typed suite,
+    //       binary-path and testcase fields, alongside a valid empty listing.
+    // Expected: Malformed listings retain distinct schema/parse errors; only a
+    //       structurally valid empty suite object yields an empty successful result.
+    #[test]
+    fn nextest_listing_rejects_invalid_required_fields_without_empty_fallback() {
+        for (json, expected) in [
+            ("not-json", "failed to parse nextest JSON output"),
+            ("{}", "no rust-suites object"),
+            (r#"{"rust-suites":[]}"#, "no rust-suites object"),
+            (
+                r#"{"rust-suites":{"suite":{"testcases":{}}}}"#,
+                "no binary-path str",
+            ),
+            (
+                r#"{"rust-suites":{"suite":{"binary-path":9,"testcases":{}}}}"#,
+                "no binary-path str",
+            ),
+            (
+                r#"{"rust-suites":{"suite":{"binary-path":"/owned/bin"}}}"#,
+                "no testcases object",
+            ),
+            (
+                r#"{"rust-suites":{"suite":{"binary-path":"/owned/bin","testcases":[]}}}"#,
+                "no testcases object",
+            ),
+        ] {
+            let error = match parse_nextest_output(json) {
+                Err(error) => error.to_string(),
+                Ok(_) => panic!("malformed nextest listing unexpectedly succeeded"),
+            };
+            assert!(error.contains(expected), "{error}");
+        }
+        assert!(
+            parse_nextest_output(r#"{"rust-suites":{}}"#)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn linux_targets_resolve() {
         use clap::ValueEnum;
