@@ -573,6 +573,52 @@ async fn guest_tx_basic(driver: DefaultDriver) {
     assert_eq!(written, payload);
 }
 
+// Test: Transmit a noncontiguous descriptor chain through a backend accepting short writes.
+// Expected: The host receives exact concatenated bytes, one zero-length completion, and no gap bytes.
+#[async_test]
+async fn guest_tx_noncontiguous_chain_preserves_binary_order(driver: DefaultDriver) {
+    let mut h = TestHarness::new(&driver);
+    h.enable().await;
+    h.handle.set_max_write_size(7);
+    let first = [0, 0xaa, 0xff];
+    let second: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+    let first_gpa = h.alloc_data(first.len() as u32);
+    let gap_gpa = h.alloc_data(32);
+    let second_gpa = h.alloc_data(second.len() as u32);
+    h.mem.write_at(first_gpa, &first).unwrap();
+    h.mem.write_at(gap_gpa, &[0x5a; 32]).unwrap();
+    h.mem.write_at(second_gpa, &second).unwrap();
+    write_descriptor(
+        &h.mem,
+        TX_DESC_ADDR,
+        4,
+        first_gpa,
+        first.len() as u32,
+        DescriptorFlags::new().with_next(true),
+        9,
+    );
+    write_descriptor(
+        &h.mem,
+        TX_DESC_ADDR,
+        9,
+        second_gpa,
+        second.len() as u32,
+        DescriptorFlags::new(),
+        0,
+    );
+    make_available(&h.mem, TX_AVAIL_ADDR, QUEUE_SIZE, 4, &mut h.tx_avail_idx);
+    h.tx_event.signal();
+    assert_eq!(h.wait_for_tx_used().await, (4, 0));
+    assert_eq!(
+        h.handle.take_tx_data(),
+        [first.as_slice(), &second].concat()
+    );
+    let mut gap = [0; 32];
+    h.mem.read_at(gap_gpa, &mut gap).unwrap();
+    assert_eq!(gap, [0x5a; 32]);
+    h.disable().await;
+}
+
 /// Backend injects data; guest receives it via the receiveq.
 #[async_test]
 async fn guest_rx_basic(driver: DefaultDriver) {
