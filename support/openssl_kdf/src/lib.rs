@@ -9,9 +9,11 @@
 //! This crate can be removed once these capabilities are added to the upstream
 //! openssl crate. They are included here instead of in a fork of the openssl
 //! crate to avoid unnecessary forking.
+//!
+//! Bindings are enabled by default on Unix. On Windows, enable the `openssl`
+//! feature; native Windows workspace builds do not otherwise require OpenSSL.
 
-// Currently this crate is only consumed by other cfg(unix) crates.
-#![cfg(unix)]
+#![cfg(any(unix, all(windows, feature = "openssl")))]
 #![expect(missing_docs)]
 // UNSAFETY: Calls into openssl.
 #![expect(unsafe_code)]

@@ -24,7 +24,7 @@ vendored = ["openssl?/vendored"]
 native = []
 
 # Use OpenSSL.
-openssl = ["dep:openssl", "dep:openssl_kdf"]
+openssl = ["dep:openssl", "dep:openssl_kdf", "openssl_kdf/openssl"]
 
 # Use Symcrypt.
 # Note that the symcrypt backend does not support vendoring, enabling both
