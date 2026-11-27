@@ -23,5 +23,8 @@ tracing.workspace = true
 x86defs.workspace = true
 sev_guest_device_tio.workspace = true
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

@@ -478,3 +478,6 @@ impl SevGuestDevice {
         self.tio_guest_request(msg_type, guest_device_id, req)
     }
 }
+
+#[cfg(test)]
+mod tests;
