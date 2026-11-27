@@ -11207,6 +11207,7 @@ dependencies = [
  "disk_backend",
  "disk_vhd1",
  "futures",
+ "tempfile",
  "vmgs",
  "vmgs_format",
 ]

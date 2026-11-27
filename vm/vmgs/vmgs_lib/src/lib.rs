@@ -392,3 +392,281 @@ async fn do_query_size(file_path: &str, file_id: FileId) -> Result<u64, VmgsErro
 
     Ok(info.valid_bytes)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::ptr::null;
+    use std::ptr::null_mut;
+
+    const KEY: &[u8; VMGS_ENCRYPTION_KEY_SIZE] = b"0123456789abcdef0123456789ABCDEF";
+
+    fn c(s: impl AsRef<std::ffi::OsStr>) -> CString {
+        CString::new(s.as_ref().to_str().unwrap()).unwrap()
+    }
+
+    fn code(e: VmgsError) -> u32 {
+        e as u32
+    }
+
+    fn create(path: &CString, size: u64, force: bool, key: Option<&CString>) -> u32 {
+        // SAFETY: all pointers are valid NUL-terminated strings or null.
+        code(unsafe {
+            create_vmgs(
+                path.as_ptr(),
+                size,
+                force,
+                key.map_or(null(), |k| k.as_ptr()),
+                key.is_some(),
+            )
+        })
+    }
+
+    fn write(path: &CString, data: &CString, id: FileId, key: Option<&CString>) -> u32 {
+        // SAFETY: all pointers are valid NUL-terminated strings or null.
+        code(unsafe {
+            write_vmgs(
+                path.as_ptr(),
+                data.as_ptr(),
+                id,
+                key.map_or(null(), |k| k.as_ptr()),
+                key.is_some(),
+            )
+        })
+    }
+
+    fn read(path: &CString, id: FileId, key: Option<&CString>, buf: &mut [u8]) -> u32 {
+        // SAFETY: the pointers are valid strings or null and `buf` has `buf.len()` bytes.
+        code(unsafe {
+            read_vmgs(
+                path.as_ptr(),
+                id,
+                key.map_or(null(), |k| k.as_ptr()),
+                key.is_some(),
+                buf.as_mut_ptr(),
+                buf.len() as u64,
+            )
+        })
+    }
+
+    fn size(path: &CString, id: FileId) -> Result<u64, u32> {
+        let mut out = 0;
+        // SAFETY: `path` is a valid string and `out` is a valid u64.
+        match code(unsafe { query_size_vmgs(path.as_ptr(), id, &mut out) }) {
+            0 => Ok(out),
+            e => Err(e),
+        }
+    }
+
+    // Test: Create a default-size VMGS file, write a data file into a file ID,
+    //       query its size and read it back with exact and wrong buffer sizes.
+    // Expected: The round trip returns the exact bytes; a wrong buffer size
+    //       fails without partial data, and an unwritten ID is unallocated.
+    #[test]
+    fn plain_files_round_trip_through_the_c_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let vmgs = c(dir.path().join("a.vmgs"));
+        let data_path = dir.path().join("data.bin");
+        let payload: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        std::fs::write(&data_path, &payload).unwrap();
+
+        assert_eq!(create(&vmgs, 0, false, None), code(VmgsError::Ok));
+        assert_eq!(
+            std::fs::metadata(dir.path().join("a.vmgs")).unwrap().len(),
+            VMGS_DEFAULT_CAPACITY + 512
+        );
+        assert_eq!(
+            size(&vmgs, FileId::BIOS_NVRAM),
+            Err(code(VmgsError::FileInfoNotAllocated))
+        );
+        assert_eq!(
+            write(&vmgs, &c(&data_path), FileId::BIOS_NVRAM, None),
+            code(VmgsError::Ok)
+        );
+        assert_eq!(size(&vmgs, FileId::BIOS_NVRAM), Ok(payload.len() as u64));
+
+        let mut buf = vec![0u8; payload.len()];
+        assert_eq!(
+            read(&vmgs, FileId::BIOS_NVRAM, None, &mut buf),
+            code(VmgsError::Ok)
+        );
+        assert_eq!(buf, payload);
+        let mut short = vec![0xeeu8; payload.len() - 1];
+        assert_eq!(
+            read(&vmgs, FileId::BIOS_NVRAM, None, &mut short),
+            code(VmgsError::InvalidBufSize)
+        );
+        assert!(short.iter().all(|&b| b == 0xee));
+        assert_eq!(
+            read(&vmgs, FileId::TPM_PPI, None, &mut buf),
+            code(VmgsError::FileInfoNotAllocated)
+        );
+    }
+
+    // Test: Create an encrypted VMGS file, write encrypted data, and read it
+    //       with the right key, a wrong key, a key of the wrong length and no key.
+    // Expected: Only the right key returns the plaintext; a wrong key fails to
+    //       decrypt, a wrong-length key is rejected, writing with a wrong key
+    //       fails, and reading without a key fails without returning data.
+    #[test]
+    fn encrypted_files_require_the_right_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let vmgs = c(dir.path().join("e.vmgs"));
+        let data_path = dir.path().join("secret.bin");
+        std::fs::write(&data_path, b"secret payload").unwrap();
+        let key = CString::new(KEY.as_slice()).unwrap();
+        let wrong = CString::new(b"ffffffffffffffffffffffffffffffff".as_slice()).unwrap();
+        let short = CString::new(b"short".as_slice()).unwrap();
+
+        assert_eq!(create(&vmgs, 0, false, Some(&key)), code(VmgsError::Ok));
+        assert_eq!(
+            write(&vmgs, &c(&data_path), FileId::GUEST_SECRET_KEY, Some(&key)),
+            code(VmgsError::Ok)
+        );
+
+        let mut buf = vec![0u8; 14];
+        assert_eq!(
+            read(&vmgs, FileId::GUEST_SECRET_KEY, Some(&key), &mut buf),
+            code(VmgsError::Ok)
+        );
+        assert_eq!(&buf, b"secret payload");
+        assert_eq!(
+            read(&vmgs, FileId::GUEST_SECRET_KEY, Some(&wrong), &mut buf),
+            code(VmgsError::DecryptionFailed)
+        );
+        assert_eq!(
+            read(&vmgs, FileId::GUEST_SECRET_KEY, Some(&short), &mut buf),
+            code(VmgsError::InvalidString)
+        );
+        assert_eq!(
+            write(
+                &vmgs,
+                &c(&data_path),
+                FileId::GUEST_SECRET_KEY,
+                Some(&wrong)
+            ),
+            code(VmgsError::DecryptionFailed)
+        );
+        let mut plain = vec![0u8; 14];
+        let result = read(&vmgs, FileId::GUEST_SECRET_KEY, None, &mut plain);
+        assert_eq!(result, code(VmgsError::CantReadFile));
+        assert!(plain.iter().all(|&b| b == 0));
+    }
+
+    // Test: Create files with invalid sizes, over an existing file with and
+    //       without force, and pass null, non-UTF-8 and missing-file arguments.
+    // Expected: Each request returns its specific error code, existing files
+    //       are only replaced when forced, and non-VMGS files are rejected.
+    #[test]
+    fn invalid_arguments_return_specific_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let vmgs = c(dir.path().join("x.vmgs"));
+        for bad_size in [512u64, (VMGS_BYTES_PER_BLOCK * 4) as u64 + 1, 1] {
+            assert_eq!(
+                create(&vmgs, bad_size, false, None),
+                code(VmgsError::InvalidFileSize),
+                "{bad_size}"
+            );
+        }
+        assert_eq!(
+            create(&vmgs, (VMGS_BYTES_PER_BLOCK * 4) as u64 * 64, false, None),
+            code(VmgsError::Ok)
+        );
+        assert_eq!(create(&vmgs, 0, false, None), code(VmgsError::FileExists));
+        assert_eq!(create(&vmgs, 0, true, None), code(VmgsError::Ok));
+
+        let mut out = 0;
+        let mut buf = [0u8; 4];
+        // SAFETY: null pointers are rejected before any access.
+        unsafe {
+            assert_eq!(
+                code(create_vmgs(null(), 0, false, null(), false)),
+                code(VmgsError::NullParam)
+            );
+            assert_eq!(
+                code(query_size_vmgs(
+                    vmgs.as_ptr(),
+                    FileId::BIOS_NVRAM,
+                    null_mut()
+                )),
+                code(VmgsError::NullParam)
+            );
+            assert_eq!(
+                code(query_size_vmgs(null(), FileId::BIOS_NVRAM, &mut out)),
+                code(VmgsError::NullParam)
+            );
+            assert_eq!(
+                code(read_vmgs(
+                    vmgs.as_ptr(),
+                    FileId::BIOS_NVRAM,
+                    null(),
+                    false,
+                    null_mut(),
+                    4
+                )),
+                code(VmgsError::NullParam)
+            );
+            assert_eq!(
+                code(read_vmgs(
+                    vmgs.as_ptr(),
+                    FileId::BIOS_NVRAM,
+                    null(),
+                    true,
+                    buf.as_mut_ptr(),
+                    4
+                )),
+                code(VmgsError::NullParam)
+            );
+            assert_eq!(
+                code(write_vmgs(
+                    vmgs.as_ptr(),
+                    null(),
+                    FileId::BIOS_NVRAM,
+                    null(),
+                    false
+                )),
+                code(VmgsError::NullParam)
+            );
+            assert_eq!(
+                code(write_vmgs(
+                    vmgs.as_ptr(),
+                    vmgs.as_ptr(),
+                    FileId::BIOS_NVRAM,
+                    null(),
+                    true
+                )),
+                code(VmgsError::NullParam)
+            );
+        }
+        let non_utf8 = CString::new(vec![0xff, 0xfe]).unwrap();
+        assert_eq!(
+            create(&non_utf8, 0, false, None),
+            code(VmgsError::InvalidString)
+        );
+        assert_eq!(
+            size(&non_utf8, FileId::BIOS_NVRAM),
+            Err(code(VmgsError::InvalidString))
+        );
+
+        assert_eq!(
+            write(
+                &vmgs,
+                &c(dir.path().join("missing")),
+                FileId::BIOS_NVRAM,
+                None
+            ),
+            code(VmgsError::CantOpenFile)
+        );
+        assert_eq!(
+            size(&c(dir.path().join("missing")), FileId::BIOS_NVRAM),
+            Err(code(VmgsError::FileDisk))
+        );
+        let junk = dir.path().join("junk.vmgs");
+        std::fs::write(&junk, vec![0u8; 1024 * 1024]).unwrap();
+        assert_eq!(
+            size(&c(&junk), FileId::BIOS_NVRAM),
+            Err(code(VmgsError::FileDisk))
+        );
+    }
+}
