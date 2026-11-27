@@ -86,3 +86,57 @@ fn build_with_artifacts<R>(mut f: impl FnMut(ArtifactResolver<'_>) -> R) -> anyh
     let artifacts = requirements.resolve(&resolver)?;
     Ok(f(ArtifactResolver::resolver(&artifacts)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn parse(args: &[&str]) -> Result<CliArgs, clap::Error> {
+        CliArgs::try_parse_from(std::iter::once("petri-tool").chain(args.iter().copied()))
+    }
+
+    // Test: Validate the command definition and parse cloud-init invocations
+    //       for both architectures, with an unknown spelling and missing values.
+    // Expected: The definition is consistent; `x86_64` and `aarch64` select
+    //       their architecture with the output path; other spellings and a
+    //       missing arch or output are rejected.
+    #[test]
+    fn cloud_init_arguments_are_validated() {
+        CliArgs::command().debug_assert();
+        for (arch, expected) in [("x86_64", "X86_64"), ("aarch64", "Aarch64")] {
+            match parse(&["cloud-init", "--arch", arch, "out.img"])
+                .unwrap()
+                .command
+            {
+                Command::CloudInit { arch, output } => {
+                    assert_eq!(format!("{arch:?}"), expected);
+                    assert_eq!(output, std::path::Path::new("out.img"));
+                }
+            }
+        }
+        for bad in [
+            &["cloud-init", "--arch", "x86-64", "out.img"][..],
+            &["cloud-init", "--arch", "x86_64"],
+            &["cloud-init", "out.img"],
+            &[],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    // Test: Run the two-phase artifact helper with a closure that requires no
+    //       artifacts.
+    // Expected: The closure runs once to collect requirements and once to
+    //       resolve them, and the resolving call's result is returned.
+    #[test]
+    fn artifact_helper_collects_then_resolves() {
+        let mut calls = 0;
+        let result = build_with_artifacts(|_resolver: ArtifactResolver<'_>| {
+            calls += 1;
+            calls
+        })
+        .unwrap();
+        assert_eq!((calls, result), (2, 2));
+    }
+}
