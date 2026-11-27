@@ -954,6 +954,9 @@ fn main() {
 
 #[cfg(test)]
 mod test {
+    use super::BuildKernelCommandLineParams;
+    use super::CommandLineTooLong;
+    use super::build_kernel_command_line;
     use super::x86_boot::E820Ext;
     use super::x86_boot::build_e820_map;
     use crate::cmdline::BootCommandLineOptions;
@@ -961,6 +964,7 @@ mod test {
     use crate::host_params::MAX_CPU_COUNT;
     use crate::host_params::PartitionInfo;
     use crate::host_params::shim_params::IsolationType;
+    use crate::host_params::shim_params::ShimParams;
     use crate::memory::AddressSpaceManager;
     use crate::memory::AddressSpaceManagerBuilder;
     use arrayvec::ArrayString;
@@ -975,9 +979,12 @@ mod test {
     use loader_defs::linux::E820_RESERVED;
     use loader_defs::linux::boot_params;
     use loader_defs::linux::e820entry;
+    use loader_defs::shim::ShimParamsRaw;
+    use loader_defs::shim::SupportedIsolationType;
     use memory_range::MemoryRange;
     use memory_range::subtract_ranges;
     use sidecar_defs::PerCpuState;
+    use test_with_tracing::test;
     use zerocopy::FromZeros;
 
     const HIGH_MMIO_GAP_END: u64 = 0x1000000000; //  64 GiB
@@ -1022,6 +1029,95 @@ mod test {
             nvme_keepalive: false,
             boot_options: BootCommandLineOptions::new(),
         }
+    }
+
+    fn snp_shim_params() -> ShimParams {
+        ShimParams::new(
+            0,
+            &ShimParamsRaw {
+                supported_isolation_type: SupportedIsolationType::SNP,
+                ..ShimParamsRaw::new_zeroed()
+            },
+        )
+    }
+
+    // Test: Build a CVM kernel command line with and without trusted debugging.
+    // Expected: Untrusted host serial settings do not select a serial console;
+    //       trusted debugging does, while caller console overrides remain last.
+    #[test]
+    fn kernel_command_line_gates_host_console_and_preserves_overrides()
+    -> Result<(), CommandLineTooLong> {
+        let params = snp_shim_params();
+        let mut partition = new_partition_info(1);
+        partition.com3_serial = ComInfo::Ns16550 {
+            base: 0x3e8,
+            current_speed: 115200,
+        };
+        partition
+            .cmdline
+            .try_push_str("console=ttyS9,9600 user.setting=retained")
+            .expect("test command line fits");
+
+        for (debugging, console) in [(false, "console=ttynull"), (true, "console=ttyS2,115200")] {
+            let mut output = ArrayString::new();
+            build_kernel_command_line(BuildKernelCommandLineParams {
+                params: &params,
+                cmdline: &mut output,
+                partition_info: &partition,
+                can_trust_host: debugging,
+                is_confidential_debug: debugging,
+                sidecar: None,
+                vtl2_pool_supported: false,
+            })?;
+
+            assert_eq!(
+                output
+                    .split_whitespace()
+                    .filter(|arg| arg.starts_with("console="))
+                    .collect::<Vec<_>>(),
+                [console, "console=ttyS9,9600"]
+            );
+            assert!(output.ends_with(partition.cmdline.as_str()));
+            assert!(
+                output
+                    .split_whitespace()
+                    .any(|arg| arg == "OPENHCL_CONFIDENTIAL=1")
+            );
+            assert_eq!(
+                output
+                    .split_whitespace()
+                    .any(|arg| arg == "OPENHCL_CONFIDENTIAL_DEBUG=1"),
+                debugging
+            );
+        }
+        Ok(())
+    }
+
+    // Test: Append a maximum-sized measured command line after generated options.
+    // Expected: Insufficient output capacity returns CommandLineTooLong instead
+    //       of silently dropping or truncating the measured command line.
+    #[test]
+    fn kernel_command_line_reports_capacity_error() {
+        let params = snp_shim_params();
+        let mut partition = new_partition_info(1);
+        partition
+            .cmdline
+            .try_push_str(&"x".repeat(crate::host_params::COMMAND_LINE_SIZE))
+            .expect("measured command line fits its declared capacity");
+        let mut output = ArrayString::new();
+
+        assert!(matches!(
+            build_kernel_command_line(BuildKernelCommandLineParams {
+                params: &params,
+                cmdline: &mut output,
+                partition_info: &partition,
+                can_trust_host: false,
+                is_confidential_debug: false,
+                sidecar: None,
+                vtl2_pool_supported: false,
+            }),
+            Err(CommandLineTooLong)
+        ));
     }
 
     // ensure we can boot with a _lot_ of vcpus

@@ -1164,3 +1164,162 @@ impl PartitionInfo {
         Ok(storage)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmdline::Vtl2GpaPoolConfig;
+    use crate::memory::ReservedMemoryType;
+    use test_with_tracing::test;
+
+    fn new_address_space(ram: &[MemoryEntry]) -> AddressSpaceManager {
+        let mut address_space = AddressSpaceManager::new_const();
+        AddressSpaceManagerBuilder::new(
+            &mut address_space,
+            ram,
+            MemoryRange::new(0..0x4000),
+            MemoryRange::new(0..0x2000),
+            core::iter::empty(),
+        )
+        .init()
+        .expect("valid test address space");
+        address_space
+    }
+
+    fn pool_ranges(address_space: &AddressSpaceManager) -> Vec<MemoryRange> {
+        address_space
+            .reserved_vtl2_ranges()
+            .filter_map(|(range, kind)| (kind == ReservedMemoryType::Vtl2GpaPool).then_some(range))
+            .collect()
+    }
+
+    // Test: Allocate a private pool when NUMA node zero can hold the entire pool.
+    // Expected: The pool uses high memory on node zero, preserving bootshim memory
+    //       and leaving the other NUMA node untouched.
+    #[test]
+    fn private_pool_prefers_high_memory_on_node_zero() {
+        let ram = [
+            MemoryEntry {
+                range: MemoryRange::new(0..0x10000),
+                vnode: 0,
+                mem_type: MemoryMapEntryType::MEMORY,
+            },
+            MemoryEntry {
+                range: MemoryRange::new(0x20000..0x30000),
+                vnode: 1,
+                mem_type: MemoryMapEntryType::MEMORY,
+            },
+        ];
+        let mut address_space = new_address_space(&ram);
+
+        allocate_private_pool(
+            &mut address_space,
+            &ram,
+            0x3000,
+            false,
+            Vtl2GpaPoolConfig::Pages(3),
+            None,
+            2,
+            0x20000,
+        );
+
+        assert_eq!(
+            pool_ranges(&address_space),
+            [MemoryRange::new(0xd000..0x10000)]
+        );
+        assert_eq!(
+            address_space.free_ranges(1).collect::<Vec<_>>(),
+            [MemoryRange::new(0x20000..0x30000)]
+        );
+    }
+
+    // Test: Force a three-page pool across two nodes, one with multiple RAM ranges.
+    // Expected: Split by unique node rather than range count; the last node gets
+    //       the extra page, with allocations taken from each node's high memory.
+    #[test]
+    fn forced_pool_split_preserves_page_remainder_and_unique_nodes() {
+        let ram = [
+            MemoryEntry {
+                range: MemoryRange::new(0..0x10000),
+                vnode: 0,
+                mem_type: MemoryMapEntryType::MEMORY,
+            },
+            MemoryEntry {
+                range: MemoryRange::new(0x20000..0x30000),
+                vnode: 1,
+                mem_type: MemoryMapEntryType::MEMORY,
+            },
+            MemoryEntry {
+                range: MemoryRange::new(0x40000..0x50000),
+                vnode: 1,
+                mem_type: MemoryMapEntryType::MEMORY,
+            },
+        ];
+        let mut address_space = new_address_space(&ram);
+
+        allocate_private_pool(
+            &mut address_space,
+            &ram,
+            0x3000,
+            true,
+            Vtl2GpaPoolConfig::Pages(3),
+            None,
+            2,
+            0x30000,
+        );
+
+        assert_eq!(
+            pool_ranges(&address_space),
+            [
+                MemoryRange::new(0xf000..0x10000),
+                MemoryRange::new(0x4e000..0x50000),
+            ]
+        );
+        assert_eq!(
+            address_space.free_ranges(1).collect::<Vec<_>>(),
+            [
+                MemoryRange::new(0x20000..0x30000),
+                MemoryRange::new(0x40000..0x4e000),
+            ]
+        );
+    }
+
+    // Test: Request a pool too large for node zero alone but small enough to split.
+    // Expected: The default policy falls back to a complete, page-aligned split
+    //       rather than losing the request or allocating everything on node one.
+    #[test]
+    fn private_pool_falls_back_to_numa_split() {
+        let ram = [
+            MemoryEntry {
+                range: MemoryRange::new(0..0x6000),
+                vnode: 0,
+                mem_type: MemoryMapEntryType::MEMORY,
+            },
+            MemoryEntry {
+                range: MemoryRange::new(0x20000..0x30000),
+                vnode: 1,
+                mem_type: MemoryMapEntryType::MEMORY,
+            },
+        ];
+        let mut address_space = new_address_space(&ram);
+
+        allocate_private_pool(
+            &mut address_space,
+            &ram,
+            0x3000,
+            false,
+            Vtl2GpaPoolConfig::Pages(3),
+            None,
+            2,
+            0x16000,
+        );
+
+        assert_eq!(
+            pool_ranges(&address_space),
+            [
+                MemoryRange::new(0x5000..0x6000),
+                MemoryRange::new(0x2e000..0x30000),
+            ]
+        );
+    }
+}

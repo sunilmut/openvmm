@@ -208,6 +208,7 @@ impl BootCommandLineOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
 
     fn parse_boot_command_line(cmdline: &str) -> BootCommandLineOptions {
         let mut options = BootCommandLineOptions::new();
@@ -312,5 +313,96 @@ mod tests {
                 ..BootCommandLineOptions::new()
             }
         );
+    }
+
+    // Test: Place the legacy pool override before the manifest pool setting.
+    // Expected: The explicit override still wins, independent of token order.
+    #[test]
+    fn pool_override_wins_before_manifest_setting() {
+        assert_eq!(
+            parse_boot_command_line(
+                "OPENHCL_ENABLE_VTL2_GPA_POOL=17 OPENHCL_IGVM_VTL2_GPA_POOL_CONFIG=debug",
+            ),
+            BootCommandLineOptions {
+                enable_vtl2_gpa_pool: Vtl2GpaPoolConfig::Pages(17),
+                ..BootCommandLineOptions::new()
+            }
+        );
+    }
+
+    // Test: Parse the debug, NVMe keepalive and NUMA switches independently.
+    // Expected: Each switch changes only its own option; explicit zero values
+    //       leave debug and keepalive overrides disabled.
+    #[test]
+    fn boot_switches_remain_independent() {
+        for (cmdline, expected) in [
+            (
+                "OPENHCL_CONFIDENTIAL_DEBUG=1",
+                BootCommandLineOptions {
+                    confidential_debug: true,
+                    ..BootCommandLineOptions::new()
+                },
+            ),
+            (
+                "OPENHCL_DISABLE_NVME_KEEP_ALIVE=1",
+                BootCommandLineOptions {
+                    disable_nvme_keep_alive: true,
+                    ..BootCommandLineOptions::new()
+                },
+            ),
+            (
+                "OPENHCL_VTL2_GPA_POOL_NUMA=split",
+                BootCommandLineOptions {
+                    vtl2_gpa_pool_numa_split: true,
+                    ..BootCommandLineOptions::new()
+                },
+            ),
+            (
+                "OPENHCL_CONFIDENTIAL_DEBUG=0 OPENHCL_DISABLE_NVME_KEEP_ALIVE=0",
+                BootCommandLineOptions::new(),
+            ),
+        ] {
+            assert_eq!(parse_boot_command_line(cmdline), expected, "{cmdline}");
+        }
+    }
+
+    // Test: Append an unknown sidecar option after a recognized mode.
+    // Expected: Unknown options do not undo an explicit disable or logging mode.
+    #[test]
+    fn unknown_sidecar_options_preserve_selected_mode() {
+        for (cmdline, sidecar) in [
+            (
+                "OPENHCL_SIDECAR=off,unknown",
+                SidecarOptions::DisabledCommandLine,
+            ),
+            (
+                "OPENHCL_SIDECAR=log,unknown",
+                SidecarOptions::Enabled {
+                    enable_logging: true,
+                    cpu_threshold: SidecarOptions::DEFAULT_CPU_THRESHOLD,
+                },
+            ),
+        ] {
+            assert_eq!(
+                parse_boot_command_line(cmdline),
+                BootCommandLineOptions {
+                    sidecar,
+                    ..BootCommandLineOptions::new()
+                },
+                "{cmdline}",
+            );
+        }
+    }
+
+    // IGNORED: entry301-bug1. The parser matches the debug key by prefix, so
+    //       OPENHCL_CONFIDENTIAL_DEBUG_OTHER=1 wrongly enables debugging.
+    //       Reproduced with this regression enabled; production is unchanged.
+    //
+    // Test: Parse another environment key that merely starts with the debug key.
+    // Expected: A different key must not enable confidential debugging.
+    #[test]
+    #[ignore = "entry301-bug1: confidential debug parser accepts a different key sharing its prefix"]
+    fn confidential_debug_requires_exact_environment_key() {
+        assert!(!parse_boot_command_line("OPENHCL_CONFIDENTIAL_DEBUG_OTHER=1").confidential_debug);
     }
 }
