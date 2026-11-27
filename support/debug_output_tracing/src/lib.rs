@@ -126,3 +126,45 @@ impl<S: Subscriber> Filter<S> for DebuggerPresentFilter {
         Some(self.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use test_with_tracing::test;
+    use tracing_subscriber::Layer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[test]
+    fn writer_accepts_empty_embedded_nul_and_heap_sized_messages() {
+        let mut writer = DebugOutputWriter::new();
+        for bytes in [b"".as_slice(), b"before\0after", &[b'x'; 2048]] {
+            assert_eq!(writer.write(bytes).unwrap(), bytes.len());
+        }
+        writer.flush().unwrap();
+    }
+
+    #[test]
+    fn level_filter_prevents_field_formatting() {
+        struct CountFormats<'a>(&'a AtomicUsize);
+        impl std::fmt::Display for CountFormats<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                f.write_str("field")
+            }
+        }
+        let formats = AtomicUsize::new(0);
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(DebugOutputWriter::new)
+            .with_filter(DebuggerPresentFilter::new(LevelFilter::OFF));
+        tracing::subscriber::with_default(
+            tracing_subscriber::Registry::default().with(layer),
+            || {
+                tracing::error!(value = %CountFormats(&formats));
+                tracing::trace!(value = %CountFormats(&formats));
+            },
+        );
+        assert_eq!(formats.load(Ordering::Relaxed), 0);
+    }
+}
