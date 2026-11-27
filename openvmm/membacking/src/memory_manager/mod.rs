@@ -926,6 +926,7 @@ mod tests {
     use super::*;
     use pal_async::async_test;
     use std::error::Error as _;
+    use test_with_tracing::test;
 
     /// Build a GuestMemoryManager with the given backing range groups,
     /// and return a GuestMemory handle for read/write testing.
@@ -1219,5 +1220,101 @@ mod tests {
         let locked = gm.lock_user_gpns(guestmem::AccessType::Read, &[0]).unwrap();
         assert_eq!(locked.pages()[0][0].load(Ordering::SeqCst), 0);
         drop(locked);
+    }
+
+    // Test: Resolve read and write faults in two Windows soft-large-page windows
+    // with shared and private backing, then write through the primary mapper.
+    // Expected: Reads stay page-sized, writes resolve only their own window,
+    // and promoting the second window preserves the first window's data.
+    #[cfg(windows)]
+    #[async_test]
+    async fn test_soft_large_page_faults_preserve_neighboring_window() {
+        const LARGE_PAGE: u64 = 2 * 1024 * 1024;
+        const PAGE: u64 = hvdef::HV_PAGE_SIZE;
+        for private_memory in [false, true] {
+            let mgr = GuestMemoryBuilder::new()
+                .supports_memory_fault_resolution(true)
+                .add_backing(
+                    RamBackingRequest::new(vec![MemoryRange::new(0..2 * LARGE_PAGE)])
+                        .transparent_hugepages(true)
+                        .private_memory(private_memory),
+                )
+                .build(2 * LARGE_PAGE)
+                .await
+                .unwrap();
+            let gm = GuestMemory::new("test-primary", mgr.va_mapper.clone());
+            let resolver = mgr.memory_fault_resolver();
+            let first = MemoryRange::new(PAGE..2 * PAGE);
+            assert_eq!(resolver.resolve(first, false).unwrap(), first);
+            assert_eq!(
+                resolver.resolve(first, true).unwrap(),
+                MemoryRange::new(0..LARGE_PAGE)
+            );
+            gm.write_at(PAGE, &[0xAB, 0xCD]).unwrap();
+
+            let second = MemoryRange::new(LARGE_PAGE + PAGE..LARGE_PAGE + 2 * PAGE);
+            assert_eq!(
+                resolver.resolve(second, true).unwrap(),
+                MemoryRange::new(LARGE_PAGE..2 * LARGE_PAGE)
+            );
+            gm.write_at(second.start(), &[0x12, 0x34]).unwrap();
+            let mut bytes = [0; 2];
+            gm.read_at(PAGE, &mut bytes).unwrap();
+            assert_eq!(bytes, [0xAB, 0xCD]);
+            gm.read_at(second.start(), &mut bytes).unwrap();
+            assert_eq!(bytes, [0x12, 0x34]);
+            gm.read_at(LARGE_PAGE - PAGE, &mut bytes).unwrap();
+            assert_eq!(bytes, [0; 2]);
+        }
+    }
+
+    // Test: Resolve a Windows soft-large-page write fault at a RAM region's tail,
+    // and request faults that extend beyond the backing or span two regions.
+    // Expected: Tail promotion stays page-sized; invalid faults are rejected
+    // without discarding previously written RAM.
+    #[cfg(windows)]
+    #[async_test]
+    async fn test_soft_large_page_faults_do_not_cross_ram_regions() {
+        const LARGE_PAGE: u64 = 2 * 1024 * 1024;
+        const PAGE: u64 = hvdef::HV_PAGE_SIZE;
+        const TAIL: u64 = 64 * 1024;
+        let first = MemoryRange::new(0..LARGE_PAGE + TAIL);
+        let second = MemoryRange::new(first.end()..2 * LARGE_PAGE);
+        let mgr = GuestMemoryBuilder::new()
+            .supports_memory_fault_resolution(true)
+            .add_backing(
+                RamBackingRequest::new(vec![first])
+                    .transparent_hugepages(true)
+                    .private_memory(true),
+            )
+            .add_backing(RamBackingRequest::new(vec![second]).private_memory(true))
+            .build(second.end())
+            .await
+            .unwrap();
+        let gm = GuestMemory::new("test-primary", mgr.va_mapper.clone());
+        let resolver = mgr.memory_fault_resolver();
+        let tail_fault = MemoryRange::new(first.end() - PAGE..first.end());
+        assert_eq!(resolver.resolve(tail_fault, true).unwrap(), tail_fault);
+        gm.write_at(tail_fault.start(), &[0x56, 0x78]).unwrap();
+
+        assert!(
+            resolver
+                .resolve(
+                    MemoryRange::new(first.end() - PAGE..first.end() + PAGE),
+                    true
+                )
+                .is_err()
+        );
+        assert!(
+            resolver
+                .resolve(MemoryRange::new(second.end()..second.end() + PAGE), true)
+                .is_err()
+        );
+        let mut bytes = [0; 2];
+        gm.read_at(tail_fault.start(), &mut bytes).unwrap();
+        assert_eq!(bytes, [0x56, 0x78]);
+        gm.write_at(second.start(), &[0x9A, 0xBC]).unwrap();
+        gm.read_at(second.start(), &mut bytes).unwrap();
+        assert_eq!(bytes, [0x9A, 0xBC]);
     }
 }
