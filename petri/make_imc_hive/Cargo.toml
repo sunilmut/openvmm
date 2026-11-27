@@ -11,5 +11,8 @@ windows-sys = { workspace = true, features = ["Wdk_System_OfflineRegistry", "Win
 
 anyhow.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
