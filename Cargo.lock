@@ -5878,6 +5878,10 @@ dependencies = [
 [[package]]
 name = "openssl_crypto_only"
 version = "0.0.0"
+dependencies = [
+ "openssl",
+ "test_with_tracing",
+]
 
 [[package]]
 name = "openssl_kdf"

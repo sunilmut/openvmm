@@ -45,3 +45,40 @@ macro_rules! openssl_crypto_only {
         }
     };
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    extern crate std;
+
+    use test_with_tracing::test;
+
+    openssl_crypto_only!();
+
+    // Test: Initialize OpenSSL through its safe API and perform a digest.
+    // Expected: Cryptography works without loading the TLS library, including
+    //       after repeated initialization.
+    #[test]
+    fn safe_initialization_uses_only_crypto() {
+        openssl::init();
+        openssl::init();
+        assert_eq!(
+            openssl::sha::sha256(b"abc"),
+            [
+                0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae,
+                0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
+                0xf2, 0x00, 0x15, 0xad,
+            ]
+        );
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        assert!(
+            !maps.lines().any(|line| {
+                line.split_whitespace().last().is_some_and(|path| {
+                    path.rsplit('/')
+                        .next()
+                        .is_some_and(|name| name.starts_with("libssl.so"))
+                })
+            }),
+            "crypto-only initialization loaded libssl"
+        );
+    }
+}
