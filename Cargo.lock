@@ -7009,6 +7009,8 @@ dependencies = [
  "serde",
  "serde_json",
  "target-lexicon",
+ "tempfile",
+ "test_with_tracing",
 ]
 
 [[package]]

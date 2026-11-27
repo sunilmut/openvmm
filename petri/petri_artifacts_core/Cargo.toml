@@ -14,5 +14,9 @@ serde = { workspace = true, features = ["std", "derive"] }
 serde_json = { workspace = true, features = ["std"] }
 target-lexicon.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
