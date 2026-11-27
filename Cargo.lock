@@ -3865,6 +3865,7 @@ dependencies = [
  "anyhow",
  "linkme",
  "mesh",
+ "test_with_tracing",
  "vm_resource",
 ]
 
