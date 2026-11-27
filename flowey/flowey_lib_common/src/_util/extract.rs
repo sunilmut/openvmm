@@ -236,3 +236,150 @@ fn extract_if_new(
 
     Ok(extract_dir)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Populate an extraction cache, then request the same archive version.
+    // Expected: The existing payload and marker remain intact and a cache hit
+    //       does not attempt extraction again.
+    #[test]
+    fn same_version_reuses_the_existing_extraction() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Path::new("bundle.tar.gz");
+        let first = extract_if_new(root.path(), archive, "v1", |dir| {
+            fs_err::write(dir.join("payload"), b"original")?;
+            Ok(())
+        })
+        .unwrap();
+        let second = extract_if_new(root.path(), archive, "v1", |_| {
+            anyhow::bail!("cache hit unexpectedly attempted extraction")
+        })
+        .unwrap();
+        assert_eq!(second, first);
+        assert_eq!(fs_err::read(second.join("payload")).unwrap(), b"original");
+        assert_eq!(
+            fs_err::read_to_string(root.path().join(".flowey_info/bundle.tar.gz")).unwrap(),
+            "v1"
+        );
+    }
+
+    // Test: Replace a cached archive with a newer version containing different files.
+    // Expected: Obsolete payloads are removed and the cache marker describes
+    //       the newly extracted contents, not the previous version.
+    #[test]
+    fn newer_version_removes_obsolete_files_before_publishing() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Path::new("bundle.tar.gz");
+        extract_if_new(root.path(), archive, "v1", |dir| {
+            fs_err::write(dir.join("obsolete"), b"old")?;
+            Ok(())
+        })
+        .unwrap();
+        let path = extract_if_new(root.path(), archive, "v2", |dir| {
+            assert!(!dir.join("obsolete").exists());
+            fs_err::write(dir.join("current"), b"new")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!path.join("obsolete").exists());
+        assert_eq!(fs_err::read(path.join("current")).unwrap(), b"new");
+        assert_eq!(
+            fs_err::read_to_string(root.path().join(".flowey_info/bundle.tar.gz")).unwrap(),
+            "v2"
+        );
+    }
+
+    // Test: Fail an upgrade after writing a partial payload, then retry that version.
+    // Expected: Failure removes the old success marker and preserves error context;
+    //       retry replaces partial files before publishing a new success marker.
+    #[test]
+    fn failed_upgrade_is_not_a_cache_hit_and_retry_discards_partial_files() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Path::new("bundle.tar.gz");
+        extract_if_new(root.path(), archive, "v1", |_| Ok(())).unwrap();
+        let error = extract_if_new(root.path(), archive, "v2", |dir| {
+            fs_err::write(dir.join("partial"), b"incomplete")?;
+            anyhow::bail!("planned extraction failure")
+        })
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("failed to extract archive"));
+        assert!(message.contains("planned extraction failure"));
+        let marker = root.path().join(".flowey_info/bundle.tar.gz");
+        assert!(!marker.exists());
+        let path = extract_if_new(root.path(), archive, "v2", |dir| {
+            assert!(!dir.join("partial").exists());
+            fs_err::write(dir.join("complete"), b"ready")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fs_err::read(path.join("complete")).unwrap(), b"ready");
+        assert_eq!(fs_err::read_to_string(marker).unwrap(), "v2");
+    }
+
+    // Test: Request a cached version after its extracted directory disappears.
+    // Expected: A matching marker alone is not a cache hit; extraction restores
+    //       the requested payload before returning a usable output path.
+    #[test]
+    fn matching_marker_without_output_requires_extraction() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Path::new("bundle.tar.gz");
+        let first = extract_if_new(root.path(), archive, "v1", |dir| {
+            fs_err::write(dir.join("payload"), b"original")?;
+            Ok(())
+        })
+        .unwrap();
+        fs_err::rename(&first, root.path().join("retired")).unwrap();
+        let restored = extract_if_new(root.path(), archive, "v1", |dir| {
+            fs_err::write(dir.join("payload"), b"restored")?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(restored, first);
+        assert_eq!(fs_err::read(restored.join("payload")).unwrap(), b"restored");
+        assert_eq!(
+            fs_err::read_to_string(root.path().join(".flowey_info/bundle.tar.gz")).unwrap(),
+            "v1"
+        );
+    }
+
+    // Test: Encounter a directory where the version file belongs, or a regular
+    //       file where the extraction directory belongs.
+    // Expected: Both errors are reported before extraction and existing data
+    //       is preserved, rather than treating corrupt state as a cache miss.
+    #[test]
+    fn invalid_cache_paths_fail_without_extracting_or_removing_data() {
+        let root = tempfile::tempdir().unwrap();
+        let archive = Path::new("bundle.tar.gz");
+        let marker = root.path().join(".flowey_info/bundle.tar.gz");
+        fs_err::create_dir_all(&marker).unwrap();
+        let error = extract_if_new(root.path(), archive, "v1", |_| {
+            panic!("invalid version marker reached extraction")
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to read archive extraction version")
+        );
+        assert!(marker.is_dir());
+
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("extracted/bundle.tar.gz");
+        fs_err::create_dir_all(output.parent().unwrap()).unwrap();
+        fs_err::write(&output, b"preserve this file").unwrap();
+        let error = extract_if_new(root.path(), archive, "v1", |_| {
+            panic!("invalid extraction path reached extraction")
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("archive extraction path is not a directory")
+        );
+        assert_eq!(fs_err::read(output).unwrap(), b"preserve this file");
+    }
+}

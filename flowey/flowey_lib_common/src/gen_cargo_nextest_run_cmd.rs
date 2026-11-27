@@ -528,3 +528,129 @@ impl std::fmt::Display for Script {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cfg_cargo_common_flags::Flags;
+    use crate::run_cargo_build::CargoFeatureSet;
+    use test_with_tracing::test;
+
+    // Test: Generate a custom-profile command for explicitly selected packages,
+    //       features and per-run environment without incremental compilation.
+    // Expected: Every selector remains a separate argument, benches stay excluded,
+    //       and unrelated environment entries survive alongside the Cargo setting.
+    #[test]
+    fn explicit_package_build_preserves_selectors_and_environment() {
+        let (args, env) = cargo_nextest_build_args_and_env(
+            Flags {
+                locked: true,
+                verbose: true,
+                no_incremental: true,
+            },
+            CargoBuildProfile::Custom("coverage".into()),
+            "x86_64-unknown-linux-gnu".parse().unwrap(),
+            build_params::TestPackages::Crates {
+                crates: vec!["first".into(), "second".into()],
+            },
+            CargoFeatureSet::Specific(vec!["alpha".into(), "beta".into()]),
+            true,
+            BTreeMap::from([("RUN_LABEL".into(), "owned fixture".into())]),
+        );
+        assert_eq!(
+            args,
+            [
+                "--locked",
+                "--verbose",
+                "--cargo-profile",
+                "coverage",
+                "--target",
+                "x86_64-unknown-linux-gnu",
+                "--tests",
+                "--bins",
+                "-p",
+                "first",
+                "-p",
+                "second",
+                "--no-default-features",
+                "--features",
+                "alpha,beta",
+            ]
+        );
+        assert_eq!(
+            env,
+            BTreeMap::from([
+                ("CARGO_INCREMENTAL".into(), "0".into()),
+                ("RUN_LABEL".into(), "owned fixture".into()),
+            ])
+        );
+    }
+
+    // Test: Generate a debug workspace command with exclusions and all features,
+    //       leaving global flags disabled and a caller-supplied environment intact.
+    // Expected: Cargo's dev profile and both exclusions are explicit, no optional
+    //       flags leak in, and the helper does not alter the supplied environment.
+    #[test]
+    fn workspace_build_preserves_exclusions_and_disabled_flag_behavior() {
+        let supplied = BTreeMap::from([("CARGO_INCREMENTAL".into(), "1".into())]);
+        let (args, env) = cargo_nextest_build_args_and_env(
+            Flags {
+                locked: false,
+                verbose: false,
+                no_incremental: false,
+            },
+            CargoBuildProfile::Debug,
+            "aarch64-pc-windows-msvc".parse().unwrap(),
+            build_params::TestPackages::Workspace {
+                exclude: vec!["vm_tests".into(), "bare_metal".into()],
+            },
+            CargoFeatureSet::All,
+            false,
+            supplied.clone(),
+        );
+        assert_eq!(
+            args,
+            [
+                "--cargo-profile",
+                "dev",
+                "--target",
+                "aarch64-pc-windows-msvc",
+                "--tests",
+                "--bins",
+                "--workspace",
+                "--exclude",
+                "vm_tests",
+                "--exclude",
+                "bare_metal",
+                "--all-features",
+            ]
+        );
+        assert_eq!(env, supplied);
+    }
+
+    // Test: Render commands and environment values containing spaces,
+    //       apostrophes and newlines for Bash and PowerShell.
+    // Expected: Literal arguments stay quoted and each shell escapes apostrophes
+    //       correctly without executing the generated script.
+    #[test]
+    fn generated_scripts_preserve_literal_arguments_for_both_shells() {
+        let script = |shell| Script {
+            env: BTreeMap::from([("LABEL".into(), "agent's data".into())]),
+            commands: vec![(
+                "program with spaces".into(),
+                vec!["arg's value".into(), "line one\nline two".into()],
+            )],
+            shell,
+        };
+        assert_eq!(
+            script(CommandShell::Bash).to_string(),
+            "export LABEL='agent'\\''s data'\n\
+             'program with spaces' 'arg'\\''s value' 'line one\nline two'\n"
+        );
+        assert_eq!(
+            script(CommandShell::Powershell).to_string(),
+            "$env:LABEL='agent''s data'\n\
+             &'program with spaces' 'arg''s value' 'line one\nline two'\n"
+        );
+    }
+}
