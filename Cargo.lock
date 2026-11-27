@@ -9125,6 +9125,7 @@ dependencies = [
  "inspect",
  "ms-tcg-tpm-sys",
  "ms-tpm-20-ref",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tpm_protocol",
  "tracelimit",

@@ -2150,3 +2150,6 @@ fn export_rsa_public(public: &Tpm2bPublic) -> Result<TpmRsa2kPublic, TpmHelperUt
         modulus,
     })
 }
+
+#[cfg(test)]
+mod tests;

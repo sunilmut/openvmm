@@ -24,6 +24,7 @@ zerocopy.workspace = true
 
 [dev-dependencies]
 getrandom.workspace = true
+test_with_tracing.workspace = true
 
 [[test]]
 name = "tpm_1_38"
