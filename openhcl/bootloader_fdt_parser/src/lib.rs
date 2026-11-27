@@ -1175,4 +1175,51 @@ mod tests {
 
         assert_eq!(orig_info, parsed);
     }
+
+    // Test: Parse independently optional timestamps with values above 32 bits.
+    // Expected: Missing properties stay absent and present 64-bit values survive.
+    #[test]
+    fn sparse_boot_times_preserve_full_width_values() {
+        for mask in 0..16 {
+            let info = BootTimes {
+                start: (mask & 1 != 0).then_some(0x1_0000_0001),
+                end: (mask & 2 != 0).then_some(0x2_0000_0002),
+                sidecar_start: (mask & 4 != 0).then_some(0x3_0000_0003),
+                sidecar_end: (mask & 8 != 0).then_some(0x4_0000_0004),
+            };
+            let dt = build_boottime_dt(info).unwrap();
+            assert_eq!(BootTimes::new_from_raw(&dt).unwrap(), info);
+        }
+    }
+
+    // Test: Supply a present timestamp encoded with only one 32-bit cell.
+    // Expected: Each malformed property is rejected rather than treated as absent.
+    #[test]
+    fn short_boot_time_properties_are_rejected() {
+        for property in [
+            "reftime_boot_start",
+            "reftime_boot_end",
+            "reftime_sidecar_start",
+            "reftime_sidecar_end",
+        ] {
+            let mut buf = vec![0; 512];
+            let mut builder = Builder::new(fdt::builder::BuilderConfig {
+                blob_buffer: &mut buf,
+                string_table_cap: 128,
+                memory_reservations: &[],
+            })
+            .unwrap();
+            let name = builder.add_string(property).unwrap();
+            builder
+                .start_node("")
+                .unwrap()
+                .add_u32(name, 123)
+                .unwrap()
+                .end_node()
+                .unwrap()
+                .build(0)
+                .unwrap();
+            assert!(BootTimes::new_from_raw(&buf).is_err(), "{property}");
+        }
+    }
 }
