@@ -6003,6 +6003,7 @@ dependencies = [
  "guid",
  "opentmk_protocol",
  "tempfile",
+ "test_with_tracing",
 ]
 
 [[package]]

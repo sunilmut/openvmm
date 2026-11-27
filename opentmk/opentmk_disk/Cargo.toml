@@ -17,5 +17,8 @@ gptman.workspace = true
 guid = { workspace = true, features = ["getrandom"] }
 tempfile.workspace = true
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
