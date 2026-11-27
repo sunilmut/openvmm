@@ -80,3 +80,42 @@ impl Options {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Accept repeated setup-script values containing shell syntax and equals.
+    // Expected: Each complete value is retained in order without changing
+    //       arguments reserved for the Underhill process.
+    #[test]
+    fn setup_script_values_accumulate_without_altering_underhill_args() {
+        let mut options = Options {
+            underhill_args: vec!["--existing-argument".into()],
+            ..Options::default()
+        };
+        assert!(Options::parse_value_arg(
+            &mut options,
+            "--setup-script",
+            "printf 'X=a=b'"
+        ));
+        assert!(Options::parse_value_arg(&mut options, "--setup-script", ""));
+        assert_eq!(options.setup_script, ["printf 'X=a=b'", ""]);
+        assert_eq!(options.underhill_args, ["--existing-argument"]);
+    }
+
+    // Test: Give the init parser an option belonging to the Underhill process.
+    // Expected: It reports the option unrecognized and preserves accumulated
+    //       init values and Underhill arguments.
+    #[test]
+    fn unknown_value_option_does_not_mutate_options() {
+        let mut options = Options {
+            setup_script: vec!["existing-script".into()],
+            underhill_args: vec!["existing-argument".into()],
+        };
+        assert!(!Options::parse_value_arg(&mut options, "--memory", "4G"));
+        assert_eq!(options.setup_script, ["existing-script"]);
+        assert_eq!(options.underhill_args, ["existing-argument"]);
+    }
+}

@@ -53,3 +53,44 @@ impl SysLog {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixDatagram;
+    use std::time::Duration;
+    use test_with_tracing::test;
+
+    // Test: Emit every Rust log severity through a private datagram-backed logger.
+    // Expected: Each record is one complete write with the init facility's
+    //       kernel priority, target, message and terminating newline.
+    #[test]
+    fn log_records_preserve_priority_and_single_write_framing() {
+        let (sender, receiver) = UnixDatagram::pair().unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let fd: OwnedFd = sender.into();
+        let logger = SysLog {
+            kmsg: File::from(fd),
+        };
+        for (level, expected) in [
+            (log::Level::Error, "<19>init-test: boot phase ready\n"),
+            (log::Level::Warn, "<20>init-test: boot phase ready\n"),
+            (log::Level::Info, "<21>init-test: boot phase ready\n"),
+            (log::Level::Debug, "<22>init-test: boot phase ready\n"),
+            (log::Level::Trace, "<23>init-test: boot phase ready\n"),
+        ] {
+            let record = log::Record::builder()
+                .level(level)
+                .target("init-test")
+                .args(format_args!("boot phase ready"))
+                .build();
+            log::Log::log(&logger, &record);
+            let mut buffer = [0; 128];
+            let n = receiver.recv(&mut buffer).unwrap();
+            assert_eq!(&buffer[..n], expected.as_bytes());
+        }
+    }
+}
