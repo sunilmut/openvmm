@@ -114,3 +114,81 @@ pub enum SimpleScsiDvdRequest {
 impl ResourceId<ScsiDeviceHandleKind> for SimpleScsiDvdHandle {
     const ID: &'static str = "emulated_dvd";
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesh::payload::decode;
+    use mesh::payload::encode;
+    use test_with_tracing::test;
+
+    // Test: Serialize the default SCSI identity and decode it again.
+    // Expected: Stable field tags and fixed-width padding survive transport.
+    #[test]
+    fn default_identity_preserves_its_wire_layout_and_padding() {
+        let encoded = encode(DiskIdentity::msft());
+        assert_eq!(
+            encoded,
+            b"\x0a\x08Msft    \x12\x10Virtual Disk    \x1a\x041.0 "
+        );
+        let restored: DiskIdentity = decode(&encoded).unwrap();
+        assert_eq!(restored.vendor_id.as_bytes(), b"Msft    ");
+        assert_eq!(restored.product_id.as_bytes(), b"Virtual Disk    ");
+        assert_eq!(restored.product_revision_level.as_bytes(), b"1.0 ");
+        assert!(restored.model_number.is_empty());
+    }
+
+    // Test: Transport independent disk identity, geometry and feature policies.
+    // Expected: Binary values and explicit false overrides remain distinct
+    //       from omitted policies, with every field preserving its own value.
+    #[test]
+    fn disk_parameters_preserve_independent_optional_policies() {
+        let parameters = DiskParameters {
+            disk_id: Some([0x5a; 16]),
+            identity: Some(DiskIdentity {
+                vendor_id: (*b"Vendor  ").into(),
+                product_id: (*b"Different Disk  ").into(),
+                product_revision_level: (*b"2.1 ").into(),
+                model_number: vec![0, 0xff, 1],
+            }),
+            serial_number: vec![0xff, 0, 0x80],
+            medium_rotation_rate: Some(7_200),
+            physical_sector_size: Some(4_096),
+            fua: Some(false),
+            write_cache: Some(true),
+            scsi_disk_size_in_bytes: Some(1u64 << 40),
+            odx: Some(false),
+            unmap: Some(true),
+            max_transfer_length: Some(65_536),
+            optimal_unmap_sectors: Some(128),
+            get_lba_status: true,
+        };
+        let restored: DiskParameters = decode(&encode(parameters)).unwrap();
+        assert_eq!(restored.disk_id, Some([0x5a; 16]));
+        let identity = restored.identity.unwrap();
+        assert_eq!(identity.vendor_id.as_bytes(), b"Vendor  ");
+        assert_eq!(identity.product_id.as_bytes(), b"Different Disk  ");
+        assert_eq!(identity.product_revision_level.as_bytes(), b"2.1 ");
+        assert_eq!(identity.model_number, [0, 0xff, 1]);
+        assert_eq!(restored.serial_number, [0xff, 0, 0x80]);
+        assert_eq!(restored.medium_rotation_rate, Some(7_200));
+        assert_eq!(restored.physical_sector_size, Some(4_096));
+        assert_eq!(restored.fua, Some(false));
+        assert_eq!(restored.write_cache, Some(true));
+        assert_eq!(restored.scsi_disk_size_in_bytes, Some(1u64 << 40));
+        assert_eq!(restored.odx, Some(false));
+        assert_eq!(restored.unmap, Some(true));
+        assert_eq!(restored.max_transfer_length, Some(65_536));
+        assert_eq!(restored.optimal_unmap_sectors, Some(128));
+        assert!(restored.get_lba_status);
+
+        let omitted: DiskParameters = decode(&encode(DiskParameters::default())).unwrap();
+        assert!(omitted.fua.is_none());
+        assert!(omitted.write_cache.is_none());
+        assert!(omitted.odx.is_none());
+        assert!(omitted.unmap.is_none());
+        assert!(omitted.identity.is_none());
+        assert!(omitted.serial_number.is_empty());
+        assert!(!omitted.get_lba_status);
+    }
+}

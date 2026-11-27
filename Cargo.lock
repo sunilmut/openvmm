@@ -7831,6 +7831,7 @@ dependencies = [
  "inspect",
  "mesh",
  "storage_string",
+ "test_with_tracing",
  "vm_resource",
 ]
 
