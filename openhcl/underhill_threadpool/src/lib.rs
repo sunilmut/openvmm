@@ -780,3 +780,6 @@ impl pal_async::io_uring::IoUringDriver for RetargetableDriver {
         Some(self.inner.current_driver().initiator())
     }
 }
+
+#[cfg(test)]
+mod tests;
