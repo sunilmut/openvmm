@@ -11361,6 +11361,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "pal",
+ "test_with_tracing",
  "tracing",
 ]
 

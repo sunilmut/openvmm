@@ -149,3 +149,67 @@ pub fn start_rpc_server(rpc_server_path: &Path) -> anyhow::Result<RpcServerGuard
 
     Ok(RpcServerGuard(child))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn missing_server_reports_spawn_context_and_io_cause() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("missing-test-rpc-server.exe");
+        assert!(!path.exists());
+        let error = start_rpc_server(&path).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            format!("failed to spawn {}", path.display())
+        );
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound,
+        );
+    }
+
+    #[test]
+    fn autostart_requires_explicit_opt_in() {
+        const CHILD_EXPECTED: &str = "VMM_TEST_IGVM_AGENT_UNIT_TEST_EXPECTED_AUTOSTART";
+        if let Ok(expected) = env::var(CHILD_EXPECTED) {
+            assert_eq!(local_autostart_enabled(), expected == "true");
+            return;
+        }
+        // Give each case its own process instead of mutating shared environment.
+        for (value, expected) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("TRUE"), false),
+            (Some("enable"), false),
+            (Some("1"), true),
+            (Some("\ttrue\n"), true),
+            (Some(" yes "), true),
+            (Some("on"), true),
+        ] {
+            let mut command = Command::new(env::current_exe().unwrap());
+            command
+                .args(["--exact", "tests::autostart_requires_explicit_opt_in"])
+                .env(CHILD_EXPECTED, expected.to_string());
+            match value {
+                Some(value) => {
+                    command.env(LOCAL_AUTOSTART_ENV, value);
+                }
+                None => {
+                    command.env_remove(LOCAL_AUTOSTART_ENV);
+                }
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "autostart case {value:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+}
