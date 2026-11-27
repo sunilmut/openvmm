@@ -969,4 +969,60 @@ mod tests {
         //unmap zero sector
         disk.unmap(1000, 0, false).await.unwrap();
     }
+
+    // Test: Write and unmap a partial stripe spanning three disks and two stripe rows.
+    // Expected: Each lower disk receives the correct sectors; untouched sectors retain
+    //       their original bytes, independently of the striped read mapping.
+    #[async_test]
+    async fn partial_stripe_updates_only_expected_lower_sectors() {
+        let devices: Vec<_> = (0..3)
+            .map(|_| disklayer_ram::ram_disk(4096, false).unwrap())
+            .collect();
+        let mem = GuestMemory::allocate(4096);
+        let buffers = OwnedRequestBuffers::linear(0, 4096, true);
+        for (index, disk) in devices.iter().enumerate() {
+            mem.write_at(0, &[0xa0 + index as u8; 4096]).unwrap();
+            disk.write_vectored(&buffers.buffer(&mem), 0, false)
+                .await
+                .unwrap();
+        }
+        let striped =
+            Disk::new(StripedDisk::new(devices.clone(), Some(1024), None).unwrap()).unwrap();
+        for sector in 0..6 {
+            mem.write_at(sector * 512, &[0x20 + sector as u8; 512])
+                .unwrap();
+        }
+        striped
+            .write_vectored(
+                &OwnedRequestBuffers::linear(0, 6 * 512, false).buffer(&mem),
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+        let updates = [
+            [(1, 0x20), (2, 0x25)],
+            [(0, 0x21), (1, 0x22)],
+            [(0, 0x23), (1, 0x24)],
+        ];
+        for after_unmap in [false, true] {
+            if after_unmap {
+                striped.unmap(1, 6, false).await.unwrap();
+            }
+            for (index, disk) in devices.iter().enumerate() {
+                disk.read_vectored(&buffers.buffer(&mem), 0).await.unwrap();
+                let mut actual = [0; 4096];
+                mem.read_at(0, &mut actual).unwrap();
+                let mut expected = [0xa0 + index as u8; 4096];
+                for (sector, value) in updates[index] {
+                    expected[sector * 512..(sector + 1) * 512].fill(if after_unmap {
+                        0
+                    } else {
+                        value
+                    });
+                }
+                assert_eq!(actual, expected, "disk {index}, unmapped {after_unmap}");
+            }
+        }
+    }
 }
