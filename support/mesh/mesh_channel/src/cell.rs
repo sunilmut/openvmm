@@ -328,9 +328,9 @@ mod tests {
     use pal_async::DefaultDriver;
     use pal_async::async_test;
     use pal_async::task::Spawn;
-    use std::future::poll_fn;
-    use std::task::Poll;
 
+    // Test: Update a cell through its updater and read it through with.
+    // Expected: The cell exposes the updated string.
     #[async_test]
     async fn cell() {
         let (mut updater, cell) = super::cell("hey".to_string());
@@ -338,6 +338,8 @@ mod tests {
         cell.with(|val| assert_eq!(&val, &"hello"));
     }
 
+    // Test: Create and clone cells before and after an updater changes its value.
+    // Expected: Every existing and newly created cell exposes the latest value.
     #[async_test]
     async fn multi_cell() {
         let mut updater = CellUpdater::new(0);
@@ -356,29 +358,25 @@ mod tests {
         assert_eq!(c6.get(), 5);
     }
 
+    // Test: Register a pending cell waiter before each update in a repeated sequence.
+    // Expected: Each wait blocks first, wakes on the update, and reads that value.
     #[async_test]
     async fn wait_next(driver: DefaultDriver) {
         let mut updater = CellUpdater::new(0);
         let mut c = updater.cell();
         for i in 1..100 {
-            let t = driver.spawn("test", async {
-                c.wait_next().await;
+            let (ready, started) = crate::oneshot();
+            let t = driver.spawn("wait-next", async {
+                {
+                    let mut pending = std::pin::pin!(c.wait_next());
+                    assert!(futures::poll!(pending.as_mut()).is_pending());
+                    ready.send(());
+                    pending.await;
+                }
                 c
             });
 
-            // Yield so that `t` runs until it blocks.
-            let mut yielded = false;
-            poll_fn(|cx| {
-                if yielded {
-                    Poll::Ready(())
-                } else {
-                    cx.waker().wake_by_ref();
-                    yielded = true;
-                    Poll::Pending
-                }
-            })
-            .await;
-
+            started.await.unwrap();
             drop(updater.set(i));
             c = t.await;
             assert_eq!(c.get(), i);
@@ -386,8 +384,8 @@ mod tests {
     }
 
     // Test: Transfer cells and their updater, mutate one cell, then drop subscribers.
-    // Expected: Local edits stay local, remote updates reach both cells, and cleanup
-    //           leaves the updater usable for newly created cells.
+    // Expected: Local edits stay local, updates reach both cells, and cleanup
+    //       leaves the updater usable for newly created cells.
     #[async_test]
     async fn serialized_cells_and_updater_preserve_update_behavior() {
         use futures::FutureExt;

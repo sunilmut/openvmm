@@ -499,25 +499,33 @@ mod tests {
     use pal_async::async_test;
     use test_with_tracing::test;
 
+    // Test: Poll a context with no cancellation source or deadline.
+    // Expected: Waiting for cancellation stays pending.
     #[async_test]
     async fn no_cancel() {
         assert!(futures::poll!(CancelContext::new().cancelled()).is_pending());
     }
 
+    // Test: Cancel a context through its owned notifier.
+    // Expected: The waiting context reports Cancelled, not DeadlineExceeded.
     #[async_test]
     async fn basic_cancel() {
         let (mut ctx, mut cancel) = CancelContext::new().with_cancel();
         cancel.cancel();
-        assert!(futures::poll!(ctx.cancelled()).is_ready());
+        assert_eq!(ctx.cancelled().await, CancelReason::Cancelled);
     }
 
+    /// Checks the cancellation reason through two deep chains of cloned contexts.
     #[expect(clippy::redundant_clone, reason = "explicitly testing chained clones")]
-    async fn chain(use_cancel: bool) {
+    async fn chain(reason: CancelReason) {
         let ctx = CancelContext::new();
-        let (mut ctx, mut cancel) = ctx.with_cancel();
-        if !use_cancel {
-            ctx = ctx.with_timeout(std::time::Duration::from_millis(15));
-        }
+        let (ctx, mut cancel) = ctx.with_cancel();
+        let ctx = match reason {
+            CancelReason::Cancelled => ctx,
+            CancelReason::DeadlineExceeded => {
+                ctx.with_timeout(std::time::Duration::from_millis(15))
+            }
+        };
         let ctx = ctx.clone();
         let ctx = ctx.clone();
         let ctx = ctx.clone();
@@ -542,24 +550,31 @@ mod tests {
             .clone()
             .clone()
             .clone();
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if use_cancel {
+        if reason == CancelReason::Cancelled {
+            assert!(futures::poll!(ctx.cancelled()).is_pending());
+            assert!(futures::poll!(ctx2.cancelled()).is_pending());
             cancel.cancel();
         }
-        assert!(futures::poll!(ctx.cancelled()).is_ready());
-        assert!(futures::poll!(ctx2.cancelled()).is_ready());
+        assert_eq!(ctx.cancelled().await, reason);
+        assert_eq!(ctx2.cancelled().await, reason);
     }
 
+    // Test: Cancel two deep clone chains through their shared notifier.
+    // Expected: Both remain pending until cancellation, then report Cancelled.
     #[async_test]
     async fn chain_cancel() {
-        chain(true).await
+        chain(CancelReason::Cancelled).await
     }
 
+    // Test: Inherit a short deadline through two deep clone chains.
+    // Expected: Both report DeadlineExceeded without an explicit cancellation.
     #[async_test]
     async fn chain_deadline() {
-        chain(false).await
+        chain(CancelReason::DeadlineExceeded).await
     }
 
+    // Test: Wait for an immediate deadline and a later timeout.
+    // Expected: Both waits complete with DeadlineExceeded.
     #[async_test]
     async fn cancel_deadline() {
         let mut ctx = CancelContext::new().with_timeout(std::time::Duration::from_millis(0));
@@ -568,6 +583,8 @@ mod tests {
         assert_eq!(ctx.cancelled().await, CancelReason::DeadlineExceeded);
     }
 
+    // Test: Round-trip monotonic and pre/post-epoch deadlines through timestamps.
+    // Expected: Every decoded deadline compares equal to its original.
     #[test]
     fn test_encode_deadline() {
         let check = |deadline: Deadline| {

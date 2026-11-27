@@ -21,7 +21,7 @@ async fn split_rpc_preserves_input_and_response() {
 }
 
 // Test: Handle requests synchronously, asynchronously, and without a result listener.
-// Expected: Handlers receive the input exactly once and connected callers get results.
+// Expected: Callers receive computed results and the detached handler still runs.
 #[async_test]
 async fn handlers_deliver_results_and_detached_work_runs() {
     let (send, request) = oneshot::<Rpc<u32, u32>>();

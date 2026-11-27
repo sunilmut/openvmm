@@ -421,8 +421,12 @@ mod tests {
     use futures::FutureExt;
     use futures_concurrency::future::TryJoin;
     use mesh_node::resource::SerializedMessage;
+    use pal_async::DefaultDriver;
     use pal_async::async_test;
+    use pal_async::task::Spawn;
 
+    // Test: Stream a megabyte through a pipe while reading and writing concurrently.
+    // Expected: The reader drains every byte in order and finishes when writing closes.
     #[async_test]
     async fn test_pipe() {
         let (mut read, mut write) = pipe();
@@ -438,19 +442,36 @@ mod tests {
         assert_eq!(buf, v);
     }
 
+    // Test: Fill the message quota, block a writer, and consume a queued byte.
+    // Expected: Consumption wakes the writer; draining preserves bytes before EOF.
     #[async_test]
-    async fn test_message_backpressure() {
+    async fn test_message_backpressure(driver: DefaultDriver) {
         let (mut read, mut write) = pipe();
-        let mut n = 0;
-        while write.write(&[0]).now_or_never().is_some() {
-            n += 1;
+        for byte in 0u8..64 {
+            assert_eq!(write.write(&[byte]).now_or_never().unwrap().unwrap(), 1);
         }
-        assert_eq!(n, 64);
-        let mut b = [0];
-        read.read(&mut b).now_or_never().unwrap().unwrap();
-        write.write(&[0]).now_or_never().unwrap().unwrap();
+        let (ready, started) = crate::oneshot();
+        let writer = driver.spawn("blocked-write", async move {
+            {
+                let mut pending = std::pin::pin!(write.write(&[0xa5]));
+                assert!(pending.as_mut().now_or_never().is_none());
+                ready.send(());
+                assert_eq!(pending.await.unwrap(), 1);
+            }
+            write.close().await.unwrap();
+        });
+        started.await.unwrap();
+        let mut first = [0xff];
+        assert_eq!(read.read(&mut first).await.unwrap(), 1);
+        assert_eq!(first, [0]);
+        let mut remaining = Vec::new();
+        read.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(remaining, (1u8..64).chain([0xa5]).collect::<Vec<_>>());
+        writer.await;
     }
 
+    // Test: Transfer both pipe endpoints after a buffered write, then write and close.
+    // Expected: The moved reader drains old and new bytes in order before EOF.
     #[async_test]
     async fn test_encoding() {
         let (read, mut write) = pipe();
@@ -493,16 +514,22 @@ mod tests {
     // Test: Drop the reader while retaining a pending write to a full pipe.
     // Expected: That blocked write completes with BrokenPipe rather than hanging.
     #[async_test]
-    async fn reader_drop_releases_blocked_writer() {
+    async fn reader_drop_releases_blocked_writer(driver: DefaultDriver) {
         let (reader, mut writer) = pipe();
         writer.write_nonblocking(&vec![0x5a; 131072]).unwrap();
-        let mut pending = std::pin::pin!(writer.write(b"tail"));
-        assert!(pending.as_mut().now_or_never().is_none());
+        let (ready, started) = crate::oneshot();
+        let blocked = driver.spawn("reader-drop", async move {
+            let mut pending = std::pin::pin!(writer.write(b"tail"));
+            assert!(pending.as_mut().now_or_never().is_none());
+            ready.send(());
+            assert_eq!(
+                pending.await.unwrap_err().kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+        });
+        started.await.unwrap();
         drop(reader);
-        assert_eq!(
-            pending.await.unwrap_err().kind(),
-            std::io::ErrorKind::BrokenPipe
-        );
+        blocked.await;
     }
 
     mod reference_tests;

@@ -339,6 +339,8 @@ mod tests {
     use std::task::Waker;
     use test_with_tracing::test;
 
+    // Test: Poll an empty channel before and after sending a value.
+    // Expected: Polling is pending until the value arrives, then pending again.
     #[test]
     fn poll_recv_open() {
         let (sender, mut receiver) = Channel::<u32, u32>::new_pair();
@@ -349,6 +351,8 @@ mod tests {
         assert_matches!(receiver.poll_recv(&mut cx), Poll::Pending);
     }
 
+    // Test: Send a value and close the sender before polling the receiver.
+    // Expected: The buffered value arrives before the Closed result.
     #[test]
     fn poll_recv_closed_drains_messages() {
         let (sender, mut receiver) = Channel::<u32, u32>::new_pair();

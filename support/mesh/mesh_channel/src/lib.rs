@@ -56,6 +56,8 @@ mod tests {
     use pal_event::Event;
     use test_with_tracing::test;
 
+    // Test: Send a tuple of distinct strings through a local channel.
+    // Expected: Both strings arrive intact and in their original positions.
     #[test]
     fn test() {
         let (send, mut recv) = channel::<(String, String)>();
@@ -66,6 +68,8 @@ mod tests {
         );
     }
 
+    // Test: Send a receiver through another channel, then use the moved endpoint.
+    // Expected: The original peer still delivers its value to the moved receiver.
     #[test]
     fn test_send_port() {
         let (send, mut recv) = channel::<Receiver<u32>>();
@@ -76,6 +80,8 @@ mod tests {
         assert_eq!(recvi.try_recv().unwrap(), 0xf00d);
     }
 
+    // Test: Send an event handle through a channel and signal the received handle.
+    // Expected: The original event observes the signal.
     #[test]
     fn test_send_resource() {
         let (send, mut recv) = channel::<Event>();
@@ -86,6 +92,8 @@ mod tests {
         event.wait();
     }
 
+    // Test: Send through original and serialized sender clones, then close them.
+    // Expected: Both values arrive and closure follows the buffered messages.
     #[async_test]
     async fn test_mpsc() {
         let (send, mut recv) = mpsc_channel::<u32>();
@@ -100,6 +108,8 @@ mod tests {
         assert_eq!(&s, &[5, 6]);
     }
 
+    // Test: Send a value after the receiving endpoint has been dropped.
+    // Expected: Fire-and-forget sending to a closed receiver does not panic.
     #[async_test]
     async fn test_mpsc_again() {
         let (send, recv) = mpsc_channel::<u32>();

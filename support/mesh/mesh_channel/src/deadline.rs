@@ -188,6 +188,8 @@ mod tests {
     use std::future::poll_fn;
     use std::time::Duration;
 
+    // Test: Wait for a future deadline through a dedicated deadline set.
+    // Expected: Waiting finishes no earlier than the requested deadline.
     #[async_test]
     async fn deadline_set() {
         let set = DeadlineSet::new();
