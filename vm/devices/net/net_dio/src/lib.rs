@@ -217,6 +217,51 @@ mod tests {
     use test_with_tracing::test;
 
     #[async_test]
+    async fn disconnected_queue_does_not_complete_receive_buffers(driver: DefaultDriver) {
+        let mut queue = DioQueue::new(&driver, Arc::new(Mutex::new(None)));
+        let mut pool = net_backend::tests::Bufs::new(guestmem::GuestMemory::allocate(4096));
+        let mut completed = [RxId(99)];
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(queue.poll_ready(&mut cx, &mut pool).is_pending());
+        queue.rx_avail(&mut pool, &[RxId(1), RxId(0)]);
+        assert!(queue.poll_ready(&mut cx, &mut pool).is_pending());
+        assert_eq!(queue.rx_poll(&mut pool, &mut completed).unwrap(), 0);
+        assert_eq!(completed[0].0, 99);
+        assert!(pool.rx_metadata(RxId(1)).is_none());
+        assert!(pool.rx_metadata(RxId(0)).is_none());
+    }
+
+    #[async_test]
+    async fn disconnected_transmit_completes_segments_synchronously(driver: DefaultDriver) {
+        use net_backend::{TxMetadata, TxSegmentType};
+        let mut queue = DioQueue::new(&driver, Arc::new(Mutex::new(None)));
+        let mut pool = net_backend::tests::Bufs::new(guestmem::GuestMemory::allocate(4096));
+        let segments = [
+            TxSegment {
+                ty: TxSegmentType::Head(TxMetadata {
+                    id: TxId(7),
+                    segment_count: 2,
+                    len: 64,
+                    ..Default::default()
+                }),
+                gpa: u64::MAX - 64,
+                len: 32,
+            },
+            TxSegment {
+                ty: TxSegmentType::Tail,
+                gpa: u64::MAX - 32,
+                len: 32,
+            },
+        ];
+        assert_eq!(queue.tx_avail(&mut pool, &[]).unwrap(), (true, 0));
+        // A disconnected queue discards data without reading guest memory.
+        assert_eq!(queue.tx_avail(&mut pool, &segments).unwrap(), (true, 2));
+        let mut completed = [TxId(99)];
+        assert_eq!(queue.tx_poll(&mut pool, &mut completed).unwrap(), 0);
+        assert_eq!(completed[0].0, 99);
+    }
+
+    #[async_test]
     async fn disconnected_queue_can_stop_and_restart(driver: DefaultDriver) {
         // Model the disconnected NIC state left by a receive error.
         let mut endpoint = DioEndpoint {

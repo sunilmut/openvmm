@@ -23,6 +23,7 @@ parking_lot.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
+guestmem.workspace = true
 test_with_tracing.workspace = true
 
 [lints]
