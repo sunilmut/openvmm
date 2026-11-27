@@ -12,6 +12,7 @@ pal.workspace = true
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Power"] }
 
 [target.'cfg(windows)'.dev-dependencies]
+test_with_tracing.workspace = true
 criterion = { workspace = true, features = ["rayon", "cargo_bench_support"] }
 windows-sys = { workspace = true, features = ["Win32_System_Memory", "Win32_System_Threading"] }
 

@@ -1945,3 +1945,77 @@ macro_rules! get_registers {
     };
     (@def $_:expr) => { Default::default() };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn hresult_errors_preserve_native_codes_and_hypervisor_facility() {
+        for success in [0, 1, i32::MAX] {
+            check_hresult(success).unwrap();
+        }
+        let hypervisor_error = check_hresult(0x80350005u32 as i32).unwrap_err();
+        assert_eq!(hypervisor_error.hv_result().unwrap().get(), 5);
+        let error: std::io::Error = hypervisor_error.into();
+        assert_eq!(error.raw_os_error(), Some(0x80350005u32 as i32));
+        for code in [0x80070057u32 as i32, 0x80370005u32 as i32] {
+            let error = check_hresult(code).unwrap_err();
+            assert!(error.hv_result().is_none());
+            let error: std::io::Error = error.into();
+            assert_eq!(error.raw_os_error(), Some(code));
+        }
+    }
+
+    #[test]
+    fn doorbell_zero_value_match_is_distinct_from_wildcard() {
+        for (value, length, flags) in [
+            (None, None, 0),
+            (Some(0), None, 1),
+            (None, Some(4), 2),
+            (Some(0), Some(4), 3),
+        ] {
+            let data = DoorbellMatch {
+                guest_address: 0x1000,
+                value,
+                length,
+            }
+            .data();
+            assert_eq!(data.GuestAddress, 0x1000);
+            assert_eq!(data.Value, 0);
+            assert_eq!(data.Length, length.unwrap_or(0));
+            assert_eq!(data.Flags, flags);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn arm64_unknown_exit_forwards_reason_and_complete_message() {
+        let mut context = abi::WHV_RUN_VP_EXIT_CONTEXT {
+            ExitReason: abi::WHvRunVpExitReasonNone,
+            Reserved: 0,
+            Reserved1: 0,
+            u: abi::WHV_RUN_VP_EXIT_CONTEXT_u {
+                message: [0xa5; 240],
+                extra: [0x5a; 16],
+            },
+        };
+        assert!(matches!(
+            ExitReason::from_context(&context),
+            ExitReason::None
+        ));
+        context.ExitReason = abi::WHvRunVpExitReasonCanceled;
+        assert!(matches!(
+            ExitReason::from_context(&context),
+            ExitReason::Canceled
+        ));
+        context.ExitReason = abi::WHV_RUN_VP_EXIT_REASON(0x80001234);
+        let ExitReason::Hypervisor(reason, message) = ExitReason::from_context(&context) else {
+            panic!("unknown ARM64 exits must be forwarded to the hypervisor message handler");
+        };
+        assert_eq!(reason, 0x80001234);
+        assert_eq!(message.message, [0xa5; 240]);
+        assert_eq!(message.extra, [0x5a; 16]);
+    }
+}

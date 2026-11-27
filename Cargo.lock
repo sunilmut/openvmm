@@ -11976,6 +11976,7 @@ dependencies = [
  "criterion",
  "guid",
  "pal",
+ "test_with_tracing",
  "windows-sys 0.61.0",
 ]
 
