@@ -120,3 +120,70 @@ impl std::io::Read for NonBlockingFile {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::fcntl::FcntlArg;
+    use nix::fcntl::OFlag;
+    use nix::fcntl::fcntl;
+    use std::io::Read;
+    use std::io::Write;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use test_with_tracing::test;
+
+    // Test: Open an owned note file and read binary contents through EOF.
+    // Expected: The descriptor is nonblocking and preserves every byte,
+    //       including NUL/non-UTF-8 data, across short reads.
+    #[test]
+    fn constructor_opens_nonblocking_and_preserves_note_bytes() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"note\0\xfftail").unwrap();
+        let mut reader = NonBlockingFile::new(file.path()).unwrap();
+        let flags = fcntl(&reader.0, FcntlArg::F_GETFL).unwrap();
+        assert!(OFlag::from_bits_truncate(flags).contains(OFlag::O_NONBLOCK));
+
+        let mut prefix = [0; 2];
+        assert_eq!(reader.read(&mut prefix).unwrap(), 2);
+        assert_eq!(&prefix, b"no");
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining).unwrap();
+        assert_eq!(remaining, b"te\0\xfftail");
+        assert_eq!(reader.read(&mut prefix).unwrap(), 0);
+    }
+
+    // Test: Drain a live nonblocking stream, then append another note.
+    // Expected: WouldBlock ends only the current drain without losing bytes
+    //       or preventing later reads while the producer remains connected.
+    #[test]
+    fn would_block_ends_current_drain_and_allows_later_data() {
+        let (stream, mut producer) = UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        let mut reader = NonBlockingFile(File::from(OwnedFd::from(stream)));
+        producer.write_all(b"first\n").unwrap();
+
+        let mut notes = b"prefix\n".to_vec();
+        assert_eq!(reader.read_to_end(&mut notes).unwrap(), 6);
+        assert_eq!(notes, b"prefix\nfirst\n");
+        producer.write_all(b"second\n").unwrap();
+        assert_eq!(reader.read_to_end(&mut notes).unwrap(), 7);
+        assert_eq!(notes, b"prefix\nfirst\nsecond\n");
+    }
+
+    // Test: Open a missing note and read a descriptor that names a directory.
+    // Expected: Both failures retain their OS errors rather than becoming
+    //       empty successful notes or being retried indefinitely.
+    #[test]
+    fn open_and_nonretryable_read_errors_are_preserved() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = NonBlockingFile::new(directory.path().join("missing"))
+            .err()
+            .expect("missing note unexpectedly opened");
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+
+        let mut reader = NonBlockingFile::new(directory.path()).unwrap();
+        let error = reader.read(&mut [0; 1]).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EISDIR));
+    }
+}

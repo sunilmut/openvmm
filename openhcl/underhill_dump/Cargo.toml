@@ -16,5 +16,10 @@ libc.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nix = { workspace = true, features = ["fs"] }
+tempfile.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
