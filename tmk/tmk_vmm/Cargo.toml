@@ -50,5 +50,8 @@ virt_hvf.workspace = true
 [build-dependencies]
 build_rs_guest_arch.workspace = true
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

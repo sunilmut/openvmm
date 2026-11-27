@@ -634,3 +634,176 @@ impl<P: Processor> Runner<'_, P> {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    const CMD_GPA: u64 = 0x1000;
+    const STR_GPA: u64 = 0x2000;
+    const FILE_GPA: u64 = 0x3000;
+
+    /// Encodes a command using the `repr(u32)` enum layout: a 4-byte tag,
+    /// then the variant payload at its natural alignment.
+    fn command(tag: u32, payload: &[(usize, &[u8])]) -> [u8; 48] {
+        assert_eq!(size_of::<tmk_protocol::Command>(), 48);
+        let mut bytes = [0; 48];
+        bytes[..4].copy_from_slice(&tag.to_ne_bytes());
+        for (offset, data) in payload {
+            bytes[*offset..*offset + data.len()].copy_from_slice(data);
+        }
+        bytes
+    }
+
+    fn str_desc(gpa: u64, len: u64) -> [u8; 16] {
+        let mut b = [0; 16];
+        b[..8].copy_from_slice(&gpa.to_ne_bytes());
+        b[8..].copy_from_slice(&len.to_ne_bytes());
+        b
+    }
+
+    struct Fixture {
+        memory: GuestMemory,
+        send: mesh::Sender<VpEvent>,
+        recv: mesh::Receiver<VpEvent>,
+        stop: StopVpSource,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let (send, recv) = mesh::channel();
+            Self {
+                memory: GuestMemory::allocate(0x10000),
+                send,
+                recv,
+                stop: StopVpSource::new(),
+            }
+        }
+
+        fn run(&self, cmd: &[u8]) -> anyhow::Result<()> {
+            self.memory.write_at(CMD_GPA, cmd).unwrap();
+            IoHandler {
+                guest_memory: &self.memory,
+                event_send: &self.send,
+                stop: &self.stop,
+            }
+            .handle_command(CMD_GPA)
+        }
+
+        fn completion(&mut self) -> Option<bool> {
+            match self.recv.try_recv() {
+                Ok(VpEvent::TestComplete { success }) => Some(success),
+                Ok(VpEvent::Halt { .. }) => panic!("unexpected halt"),
+                Err(_) => None,
+            }
+        }
+    }
+
+    // Test: Send successful and failed completion commands from guest memory.
+    // Expected: Each reports exactly one completion with the guest's status and
+    //       requests the VP stop.
+    #[test]
+    fn completion_commands_report_status_and_stop_vp() {
+        for success in [true, false] {
+            let mut f = Fixture::new();
+            f.run(&command(2, &[(4, &[success as u8])])).unwrap();
+            assert_eq!(f.completion(), Some(success));
+            assert_eq!(f.completion(), None);
+            assert!(f.stop.is_stopping());
+        }
+    }
+
+    // Test: Send log commands with valid UTF-8, invalid UTF-8 and an
+    //       out-of-range address, and a panic with and without a filename.
+    // Expected: Logs never complete the test; invalid strings return errors;
+    //       a panic always reports failure and stops the VP.
+    #[test]
+    fn log_and_panic_commands_validate_guest_strings() {
+        let mut f = Fixture::new();
+        f.memory.write_at(STR_GPA, b"hello").unwrap();
+        f.run(&command(0, &[(8, &str_desc(STR_GPA, 5))])).unwrap();
+        assert_eq!((f.completion(), f.stop.is_stopping()), (None, false));
+
+        f.memory.write_at(STR_GPA, &[0xff, 0xfe]).unwrap();
+        let error = f
+            .run(&command(0, &[(8, &str_desc(STR_GPA, 2))]))
+            .unwrap_err();
+        assert_eq!(format!("{error}"), "string not utf-8");
+        let error = f
+            .run(&command(0, &[(8, &str_desc(0x10_0000, 4))]))
+            .unwrap_err();
+        assert_eq!(format!("{error}"), "failed to read string");
+        assert!(!f.stop.is_stopping());
+
+        for filename_len in [0, 4] {
+            let mut f = Fixture::new();
+            f.memory.write_at(STR_GPA, b"boom").unwrap();
+            f.memory.write_at(FILE_GPA, b"a.rs").unwrap();
+            f.run(&command(
+                1,
+                &[
+                    (8, &str_desc(STR_GPA, 4)),
+                    (24, &str_desc(FILE_GPA, filename_len)),
+                    (40, &7u32.to_ne_bytes()),
+                ],
+            ))
+            .unwrap();
+            assert_eq!(f.completion(), Some(false));
+            assert!(f.stop.is_stopping());
+        }
+    }
+
+    // Test: Send commands with an unknown tag, an invalid boolean, and a
+    //       command address outside guest memory.
+    // Expected: Each is rejected with an error and neither completes the test
+    //       nor stops the VP.
+    #[test]
+    fn malformed_commands_are_rejected_without_completion() {
+        let mut f = Fixture::new();
+        assert_eq!(
+            format!("{}", f.run(&command(3, &[])).unwrap_err()),
+            "bad command"
+        );
+        assert_eq!(
+            format!("{}", f.run(&command(2, &[(4, &[2])])).unwrap_err()),
+            "bad command"
+        );
+        let error = IoHandler {
+            guest_memory: &f.memory,
+            event_send: &f.send,
+            stop: &f.stop,
+        }
+        .handle_command(0x10_0000)
+        .unwrap_err();
+        assert_eq!(format!("{error}"), "failed to read command");
+        assert_eq!((f.completion(), f.stop.is_stopping()), (None, false));
+    }
+
+    // IGNORED: entry329-bug1; a guest log length near u64::MAX makes the host
+    //       allocate `vec![0; len]`, which panics (or aborts on large but valid
+    //       sizes) instead of returning an error. Keep until an authorized fix.
+    //
+    // Test: Send a log command whose guest-supplied length exceeds guest memory.
+    // Expected: The command is rejected with an error rather than panicking
+    //       the host process on an unbounded allocation.
+    #[test]
+    #[ignore = "entry329-bug1: guest string length drives an unbounded host allocation"]
+    fn oversized_guest_string_is_rejected_without_panic() {
+        let f = Fixture::new();
+        assert!(
+            f.run(&command(0, &[(8, &str_desc(STR_GPA, u64::MAX))]))
+                .is_err()
+        );
+    }
+
+    // Test: Widen 1-, 2-, 4- and 8-byte MMIO/IO write payloads.
+    // Expected: The bytes are zero-extended in native byte order.
+    #[test]
+    fn widen_zero_extends_native_payloads() {
+        assert_eq!(widen(&[0xab]), 0xab);
+        assert_eq!(widen(&0x1234u16.to_ne_bytes()), 0x1234);
+        assert_eq!(widen(&0xdead_beefu32.to_ne_bytes()), 0xdead_beef);
+        assert_eq!(widen(&u64::MAX.to_ne_bytes()), u64::MAX);
+    }
+}

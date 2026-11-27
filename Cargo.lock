@@ -8956,6 +8956,7 @@ dependencies = [
  "page_table",
  "pal_async",
  "pal_uring",
+ "test_with_tracing",
  "tmk_protocol",
  "tracing",
  "tracing-subscriber",
