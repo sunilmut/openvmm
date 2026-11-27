@@ -128,7 +128,9 @@ fn utf16le_eq(utf16le: &[u8], ascii: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::read_igvm_image;
     use super::utf16le_eq;
+    use test_with_tracing::test;
 
     fn utf16le(s: &str) -> Vec<u8> {
         s.encode_utf16().flat_map(u16::to_le_bytes).collect()
@@ -146,5 +148,37 @@ mod tests {
         assert!(!utf16le_eq(&utf16le("VMFWX"), "VMFW"));
         // Odd-length (truncated) UTF-16 buffers never match.
         assert!(!utf16le_eq(&[0x56, 0x00, 0x4d], "VM"));
+    }
+
+    // Test: Read empty, single-prefix-byte, and binary raw inputs from a filename containing spaces.
+    // Expected: Non-PE inputs return every byte unchanged, including NUL and non-ASCII bytes.
+    #[test]
+    fn raw_firmware_input_preserves_binary_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firmware image.bin");
+        for bytes in [b"".as_slice(), b"M", b"IGVM\0\xff\x80MZ\r\n"] {
+            fs_err::write(&path, bytes).unwrap();
+            assert_eq!(read_igvm_image(&path).unwrap(), bytes);
+        }
+    }
+
+    // Test: Read a missing input and truncated PE-prefixed files through the public loader.
+    // Expected: Missing-file cause survives context, and malformed DLLs fail instead of falling back to raw input.
+    #[test]
+    fn missing_and_malformed_dll_inputs_report_contextual_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firmware image.dll");
+        let error = read_igvm_image(&path).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(error.to_string().contains("reading input file"));
+        for bytes in [b"MZ".as_slice(), b"MZ\0\0\xff\xff"] {
+            fs_err::write(&path, bytes).unwrap();
+            let error = read_igvm_image(&path).unwrap_err();
+            assert!(error.to_string().contains("firmware image.dll"));
+            assert!(format!("{error:#}").contains("parsing PE image"));
+        }
     }
 }
