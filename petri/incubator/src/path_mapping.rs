@@ -298,6 +298,56 @@ mod tests {
             .collect()
     }
 
+    // Test: Create mappers with trailing-slash, root, relative and empty guest
+    //       roots, and map dot components and a root-level guest share.
+    // Expected: Trailing slashes are trimmed, the root guest share yields
+    //       single-slash paths, and relative or empty guest roots are rejected.
+    #[test]
+    fn guest_roots_are_normalized_and_validated() {
+        let mapper = HostPathMapper::new("/host/share/", "/mnt/share///").unwrap();
+        assert_eq!(
+            mapper.map_path("/host/share/./a/./b").unwrap(),
+            "/mnt/share/a/b"
+        );
+        let root = HostPathMapper::new("/host/share", "/").unwrap();
+        assert_eq!(root.map_path("/host/share/a").unwrap(), "/a");
+        assert_eq!(root.map_path("/host/share").unwrap(), "/");
+        for (guest, expected) in [("", "must not be empty"), ("mnt/share", "must be absolute")] {
+            let error = HostPathMapper::new("/host/share", guest)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        let error = HostPathMapper::new("/..", "/mnt").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("escapes the filesystem root"),
+            "{error:#}"
+        );
+    }
+
+    // Test: Map empty, single-entry and multi-entry path lists, and a list with
+    //       one entry outside the share.
+    // Expected: Entries keep their order joined by ':'; an empty value stays
+    //       empty; an outside entry fails naming the entry and variable.
+    #[test]
+    fn path_lists_map_each_entry_or_report_the_offender() {
+        let mapper = HostPathMapper::new("/host/share", "/g").unwrap();
+        assert_eq!(map_path_list("V", "", &mapper).unwrap(), "");
+        assert_eq!(
+            map_path_list("V", "/host/share/a", &mapper).unwrap(),
+            "/g/a"
+        );
+        assert_eq!(
+            map_path_list("V", "/host/share/b:/host/share/a", &mapper).unwrap(),
+            "/g/b:/g/a"
+        );
+        let error = map_path_list("LIBS", "/host/share/a:/elsewhere", &mapper).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "path-list entry '/elsewhere' in environment variable LIBS is not in the host share"
+        );
+    }
+
     #[test]
     fn maps_host_paths_under_share_root() {
         let mapper = HostPathMapper::new("/host/test-content", GUEST_SHARE_ROOT).unwrap();

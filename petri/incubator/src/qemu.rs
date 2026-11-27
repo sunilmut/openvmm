@@ -183,3 +183,87 @@ pub async fn setup_vfio_devices(
 
     Ok(env)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::EduDeviceConfig;
+    use crate::profile::IvshmemPlainDeviceConfig;
+    use crate::profile::VirtioBlkDeviceConfig;
+    use test_with_tracing::test;
+
+    fn edu(dma_mask: Option<&str>) -> DeviceConfig {
+        DeviceConfig::Edu(EduDeviceConfig {
+            name: "edu-initiator".into(),
+            dma_mask: dma_mask.map(Into::into),
+            vfio: true,
+        })
+    }
+
+    // Test: Convert one device of each kind, including hex, decimal and absent
+    //       edu DMA masks, into petri device configurations.
+    // Expected: Order, names, VFIO flags and parsed sizes are preserved, and
+    //       both DMA mask notations decode to the same value.
+    #[test]
+    fn devices_convert_in_order_with_parsed_sizes_and_masks() {
+        use petri::qemu::devices as p;
+        let devices = [
+            DeviceConfig::VirtioBlk(VirtioBlkDeviceConfig {
+                name: "disk".into(),
+                size: "64M".into(),
+                vfio: false,
+            }),
+            edu(Some("0xffffffffffff")),
+            edu(Some("281474976710655")),
+            edu(None),
+            DeviceConfig::IvshmemPlain(IvshmemPlainDeviceConfig {
+                name: "shm".into(),
+                size: "4MB".into(),
+                vfio: true,
+            }),
+        ];
+        let converted = petri_devices(&devices).unwrap();
+        assert_eq!(converted.len(), 5);
+        match &converted[0] {
+            p::DeviceConfig::VirtioBlk(c) => {
+                assert_eq!((c.name.as_str(), c.size, c.vfio), ("disk", 64 << 20, false))
+            }
+            _ => panic!("wrong kind"),
+        }
+        for (i, mask) in [
+            (1, Some(0xffff_ffff_ffff)),
+            (2, Some(0xffff_ffff_ffff)),
+            (3, None),
+        ] {
+            match &converted[i] {
+                p::DeviceConfig::Edu(c) => assert_eq!(
+                    (c.name.as_str(), c.dma_mask, c.vfio),
+                    ("edu-initiator", mask, true)
+                ),
+                _ => panic!("wrong kind"),
+            }
+        }
+        match &converted[4] {
+            p::DeviceConfig::IvshmemPlain(c) => assert_eq!((c.size, c.vfio), (4 << 20, true)),
+            _ => panic!("wrong kind"),
+        }
+    }
+
+    // Test: Convert devices with malformed DMA masks or sizes.
+    // Expected: The whole conversion fails with the specific field error rather
+    //       than dropping or defaulting the bad device.
+    #[test]
+    fn invalid_device_fields_fail_conversion() {
+        for mask in ["0xg", "0x", "-1", "ff"] {
+            let error = petri_devices(&[edu(Some(mask))]).unwrap_err();
+            assert_eq!(format!("{error}"), "invalid DMA mask", "{mask}");
+        }
+        let error = petri_devices(&[DeviceConfig::VirtioBlk(VirtioBlkDeviceConfig {
+            name: "disk".into(),
+            size: "64Q".into(),
+            vfio: false,
+        })])
+        .unwrap_err();
+        assert_eq!(format!("{error}"), "invalid size '64Q'");
+    }
+}

@@ -221,3 +221,30 @@ fn kernel_or_initrd_from_env(arch: incubator::Arch, base_name: &str) -> anyhow::
 fn non_empty_env(var: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(var).filter(|value| !value.is_empty())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+    use test_with_tracing::test;
+
+    // Test: Parse guest environment assignments with empty, equals-containing
+    //       and missing values, and with a missing or empty name.
+    // Expected: Only the first '=' splits the pair, empty values are kept, and
+    //       a missing separator or empty name is rejected with a clear message.
+    #[test]
+    fn guest_env_assignments_split_on_first_equals() {
+        for (text, key, value) in [("K=V", "K", "V"), ("K=", "K", ""), ("K=a=b", "K", "a=b")] {
+            let env = GuestEnv::from_str(text).unwrap();
+            assert_eq!((env.key.as_str(), env.value.as_str()), (key, value));
+        }
+        assert_eq!(
+            GuestEnv::from_str("KV").err().unwrap(),
+            "expected KEY=VALUE"
+        );
+        assert_eq!(
+            GuestEnv::from_str("=V").err().unwrap(),
+            "environment variable name must not be empty"
+        );
+    }
+}

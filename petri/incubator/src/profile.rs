@@ -310,6 +310,67 @@ mod tests {
     use super::*;
     use test_with_tracing::test;
 
+    // Test: Parse sizes with and without units and the optional B suffix, at
+    //       the u64 overflow boundary, and with malformed text.
+    // Expected: Binary multipliers apply exactly; overflow, missing digits,
+    //       unknown units, negative and lower-case values are rejected.
+    #[test]
+    fn sizes_use_binary_units_and_reject_malformed_text() {
+        for (text, expected) in [
+            ("0", 0),
+            ("512", 512),
+            ("512B", 512),
+            ("4K", 4 << 10),
+            ("4KB", 4 << 10),
+            ("64M", 64 << 20),
+            ("2G", 2 << 30),
+            ("1T", 1 << 40),
+            ("16777215T", 16777215 << 40),
+        ] {
+            assert_eq!(parse_size(text).unwrap(), expected, "{text}");
+        }
+        for text in [
+            "",
+            "B",
+            "K",
+            "KB",
+            "16777216T",
+            "4k",
+            "4 K",
+            "-1",
+            "1.5G",
+            "4KiB",
+            "4BB",
+        ] {
+            let error = parse_size(text).unwrap_err();
+            assert_eq!(error.to_string(), format!("invalid size '{text}'"));
+        }
+    }
+
+    // Test: Derive capabilities from hyphenated and plain device names.
+    // Expected: Hyphens become underscores so the name is a valid identifier,
+    //       while other characters and the VFIO flag accessors are preserved.
+    #[test]
+    fn capabilities_replace_hyphens_in_device_names() {
+        let device = DeviceConfig::Edu(EduDeviceConfig {
+            name: "edu-p2p-initiator".into(),
+            dma_mask: None,
+            vfio: true,
+        });
+        assert_eq!(device.capability(), "edu_p2p_initiator");
+        assert_eq!(device.name(), "edu-p2p-initiator");
+        assert!(device.vfio());
+        let plain = DeviceConfig::IvshmemPlain(IvshmemPlainDeviceConfig {
+            name: "target".into(),
+            size: "4M".into(),
+            vfio: false,
+        });
+        assert_eq!(
+            (plain.capability().as_str(), plain.vfio()),
+            ("target", false)
+        );
+    }
+
     const OPENVMM: &str = include_str!("../profiles/x86_64-openvmm.toml");
     const MSHV: &str = include_str!("../profiles/x86_64-mshv.toml");
     const QEMU: &str = include_str!("../profiles/aarch64-tcg-pcie.toml");
