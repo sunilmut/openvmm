@@ -436,3 +436,62 @@ mod tests {
         assert!(format!("{error:#}").contains("at least 30 GiB is required"));
     }
 }
+
+#[cfg(test)]
+mod capacity_boundary_tests {
+    use super::HostCapacity;
+    use super::MIB;
+    use super::validate_requested_capacity;
+    use std::collections::BTreeMap;
+    use test_with_tracing::test;
+
+    fn check(params: &[(&str, &str)]) -> anyhow::Result<()> {
+        validate_requested_capacity(
+            &params
+                .iter()
+                .map(|(k, v)| ((*k).into(), (*v).into()))
+                .collect::<BTreeMap<_, _>>(),
+            HostCapacity {
+                logical_processors: 4,
+                available_memory_bytes: 2048 * MIB,
+            },
+        )
+    }
+
+    // Test: Request no capacity, exactly the host capacity, and one unit above
+    //       it for CPUs and memory, plus zero, non-numeric and overflowing values.
+    // Expected: Absent and exact requests pass; every out-of-range or malformed
+    //       request fails with a message naming the specific parameter problem.
+    #[test]
+    fn capacity_requests_enforce_inclusive_limits_and_input_errors() {
+        check(&[]).unwrap();
+        check(&[("CpuCount", "4"), ("MemoryMB", "2048")]).unwrap();
+        for (params, expected) in [
+            (&[("CpuCount", "5")][..], "requested 5 CPUs"),
+            (&[("MemoryMB", "2049")][..], "requested 2049 MB"),
+            (
+                &[("CpuCount", "0")][..],
+                "CpuCount must be greater than zero",
+            ),
+            (
+                &[("MemoryMB", "0")][..],
+                "MemoryMB must be greater than zero",
+            ),
+            (
+                &[("CpuCount", "-1")][..],
+                "CpuCount must be a positive integer",
+            ),
+            (
+                &[("MemoryMB", "1.5")][..],
+                "MemoryMB must be a positive integer",
+            ),
+            (
+                &[("MemoryMB", "18446744073709551615")][..],
+                "MemoryMB is too large",
+            ),
+        ] {
+            let error = format!("{:#}", check(params).unwrap_err());
+            assert!(error.contains(expected), "{params:?}: {error}");
+        }
+    }
+}

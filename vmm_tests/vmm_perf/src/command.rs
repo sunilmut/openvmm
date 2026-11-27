@@ -372,3 +372,85 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(all(test, unix))]
+mod process_tests {
+    use super::run_command;
+    use crate::test_support;
+    use std::process::Command;
+    use std::process::Stdio;
+    use test_with_tracing::test;
+
+    fn shell(script: &str) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    // Test: Run an owned shell command that writes CRLF, LF, unterminated and
+    //       invalid UTF-8 lines to both streams, then exits with status 3.
+    // Expected: The exit status is returned unchanged, and the console log keeps
+    //       every line per stream in order with its tag and line endings removed.
+    #[test]
+    fn console_log_tags_each_stream_line_and_preserves_status() -> anyhow::Result<()> {
+        let dir = test_support::tempdir("console")?;
+        let log = dir.path().join("console.log");
+        let status = run_command(
+            &mut shell(r"printf 'one\r\ntwo\n\377x\nlast'; printf 'err1\nerr2\r\n' >&2; exit 3"),
+            &log,
+            "cfg",
+        )?;
+        assert_eq!(status.code(), Some(3));
+        let text = fs_err::read_to_string(&log)?;
+        let lines: Vec<_> = text.lines().collect();
+        let stdout: Vec<_> = lines
+            .iter()
+            .filter(|l| l.starts_with("[stdout] "))
+            .copied()
+            .collect();
+        let stderr: Vec<_> = lines
+            .iter()
+            .filter(|l| l.starts_with("[stderr] "))
+            .copied()
+            .collect();
+        assert_eq!(
+            stdout,
+            [
+                "[stdout] one",
+                "[stdout] two",
+                "[stdout] \u{fffd}x",
+                "[stdout] last"
+            ]
+        );
+        assert_eq!(stderr, ["[stderr] err1", "[stderr] err2"]);
+        assert_eq!(lines.len(), 6);
+        Ok(())
+    }
+
+    // Test: Run a missing program, and a command whose console log directory
+    //       does not exist.
+    // Expected: Launch failure and log creation failure are reported distinctly
+    //       rather than as a successful empty run.
+    #[test]
+    fn launch_and_log_failures_are_reported_distinctly() -> anyhow::Result<()> {
+        let dir = test_support::tempdir("failures")?;
+        let mut missing = Command::new(dir.path().join("no-such-program"));
+        missing.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let error = run_command(&mut missing, &dir.path().join("log"), "cfg").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("failed to launch VMM.Perf VirtualClient"),
+            "{error:#}"
+        );
+
+        let error =
+            run_command(&mut shell("true"), &dir.path().join("no/dir/log"), "cfg").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("failed to create VMM.Perf console log"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+}

@@ -282,3 +282,66 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod layout_tests {
+    use super::ensure_runtime_executables;
+    use super::find_runtime_dir;
+    use super::virtual_client_name;
+    use crate::test_support;
+    use test_with_tracing::test;
+
+    // Test: Search for the VirtualClient binary exactly four levels deep, five
+    //       levels deep, in a missing root, and where the name is a directory.
+    // Expected: Four levels is found; deeper or directory-named entries are not
+    //       accepted, and a missing root reports its own error.
+    #[test]
+    fn runtime_search_is_bounded_to_four_levels_and_regular_files() -> anyhow::Result<()> {
+        let root = test_support::tempdir("depth")?;
+        let four = root.path().join("a/b/c/d");
+        fs_err::create_dir_all(&four)?;
+        fs_err::write(four.join(virtual_client_name()), b"")?;
+        assert_eq!(find_runtime_dir(root.path())?, four);
+
+        let deep = test_support::tempdir("deep")?;
+        let five = deep.path().join("a/b/c/d/e");
+        fs_err::create_dir_all(&five)?;
+        fs_err::write(five.join(virtual_client_name()), b"")?;
+        assert!(
+            format!("{:#}", find_runtime_dir(deep.path()).unwrap_err())
+                .contains("within four directory levels")
+        );
+
+        let dir_named = test_support::tempdir("dirnamed")?;
+        fs_err::create_dir_all(dir_named.path().join(virtual_client_name()))?;
+        assert!(find_runtime_dir(dir_named.path()).is_err());
+
+        let missing = root.path().join("missing");
+        assert_eq!(
+            format!("{:#}", find_runtime_dir(&missing).unwrap_err()),
+            "runtime extraction directory is missing"
+        );
+        Ok(())
+    }
+
+    // Test: Mark runtime executables in a directory where only one of the two
+    //       known executables exists and starts without execute permission.
+    // Expected: The present file gains execute bits while keeping its other
+    //       permissions, and the absent helper is skipped without error.
+    #[cfg(unix)]
+    #[test]
+    fn present_runtime_executables_gain_execute_bits() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let root = test_support::tempdir("exec")?;
+        let client = root.path().join(virtual_client_name());
+        fs_err::write(&client, b"")?;
+        fs_err::set_permissions(&client, std::fs::Permissions::from_mode(0o640))?;
+        ensure_runtime_executables(root.path())?;
+        assert_eq!(
+            fs_err::metadata(&client)?.permissions().mode() & 0o777,
+            0o751
+        );
+        assert!(!root.path().join("cidata-inject").exists());
+        Ok(())
+    }
+}

@@ -458,3 +458,37 @@ mod tests {
         assert_eq!(parameters["CpuCount"], "4");
     }
 }
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::ConfigOutcome;
+    use test_with_tracing::test;
+
+    // Test: Summarize successful, explicitly failed and error-less failed
+    //       configuration outcomes.
+    // Expected: Success has no summary; failures report the configuration name
+    //       with the full error chain or an explicit unknown-failure marker.
+    #[test]
+    fn failure_summaries_name_configuration_and_first_error() {
+        let ok = ConfigOutcome {
+            name: "a".into(),
+            success: true,
+            errors: vec!["ignored".into()],
+        };
+        assert_eq!(ok.failure_summary(), None);
+        let failed = ConfigOutcome::failed(
+            "cfg".into(),
+            anyhow::anyhow!("root cause").context("while staging"),
+        );
+        assert_eq!(
+            failed.failure_summary().unwrap(),
+            "cfg: while staging: root cause"
+        );
+        let unknown = ConfigOutcome {
+            name: "b".into(),
+            success: false,
+            errors: vec![],
+        };
+        assert_eq!(unknown.failure_summary().unwrap(), "b: unknown failure");
+    }
+}
