@@ -304,4 +304,93 @@ mod tests {
         let disk = Disk::new(DiskWithReservations::new(inner)).unwrap();
         storage_tests::sector_range::test_disk_sector_range_conformance(&disk).await;
     }
+
+    // Test: Register, reserve, replace the key, release and unregister through the API.
+    // Expected: Reports preserve the reservation across rekeying, update generations
+    //       only for registrations, and drop the reservation on unregistration.
+    #[async_test]
+    async fn reservation_lifecycle_survives_rekeying() {
+        use disk_backend::pr::PersistentReservation;
+        use disk_backend::pr::ReservationType;
+
+        let disk = DiskWithReservations::new(disklayer_ram::ram_disk(4096, false).unwrap());
+        disk.register(Some(0), 0x1234, Some(true)).await.unwrap();
+        disk.reserve(0x1234, ReservationType::ExclusiveAccess)
+            .await
+            .unwrap();
+        disk.register(Some(0x1234), 0x5678, None).await.unwrap();
+        let report = disk.report().await.unwrap();
+        assert_eq!(report.generation, 2);
+        assert!(report.persist_through_power_loss);
+        assert_eq!(
+            report.reservation_type,
+            Some(ReservationType::ExclusiveAccess)
+        );
+        assert_eq!(report.controllers.len(), 1);
+        assert_eq!(report.controllers[0].key, 0x5678);
+        assert!(report.controllers[0].holds_reservation);
+
+        disk.release(0x5678, ReservationType::ExclusiveAccess)
+            .await
+            .unwrap();
+        let report = disk.report().await.unwrap();
+        assert_eq!(report.generation, 2);
+        assert_eq!(report.reservation_type, None);
+        assert_eq!(report.controllers[0].key, 0x5678);
+        assert!(!report.controllers[0].holds_reservation);
+
+        disk.reserve(0x5678, ReservationType::WriteExclusive)
+            .await
+            .unwrap();
+        disk.register(Some(0x5678), 0, Some(false)).await.unwrap();
+        let report = disk.report().await.unwrap();
+        assert_eq!(report.generation, 3);
+        assert_eq!(report.reservation_type, None);
+        assert!(report.controllers.is_empty());
+        assert!(!report.persist_through_power_loss);
+    }
+
+    // Test: Submit incorrect keys to registration, reservation, release and clear.
+    // Expected: All conflict errors leave the existing registration and reservation intact.
+    #[async_test]
+    async fn conflicting_keys_do_not_mutate_reservations() {
+        use disk_backend::DiskError;
+        use disk_backend::pr::PersistentReservation;
+        use disk_backend::pr::ReservationType;
+
+        let disk = DiskWithReservations::new(disklayer_ram::ram_disk(4096, false).unwrap());
+        disk.register(None, 0x1234, Some(true)).await.unwrap();
+        disk.reserve(0x1234, ReservationType::WriteExclusive)
+            .await
+            .unwrap();
+        let results = [
+            disk.register(Some(0x9999), 0, Some(false)).await,
+            disk.reserve(0x9999, ReservationType::ExclusiveAccess).await,
+            disk.release(0x9999, ReservationType::WriteExclusive).await,
+            disk.clear(0x9999).await,
+            disk.preempt(0x9999, 0x1234, ReservationType::WriteExclusive, false)
+                .await,
+        ];
+        for result in results {
+            assert!(
+                matches!(result, Err(DiskError::ReservationConflict)),
+                "{result:?}"
+            );
+        }
+        let report = disk.report().await.unwrap();
+        assert_eq!(report.generation, 1);
+        assert!(report.persist_through_power_loss);
+        assert_eq!(
+            report.reservation_type,
+            Some(ReservationType::WriteExclusive)
+        );
+        assert_eq!(report.controllers.len(), 1);
+        assert_eq!(report.controllers[0].key, 0x1234);
+        assert!(report.controllers[0].holds_reservation);
+        disk.clear(0x1234).await.unwrap();
+        let cleared = disk.report().await.unwrap();
+        assert_eq!(cleared.generation, 2);
+        assert_eq!(cleared.reservation_type, None);
+        assert!(cleared.controllers.is_empty());
+    }
 }
