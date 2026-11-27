@@ -3376,4 +3376,6 @@ mod tests {
             [(StoreKind::Nvram, _), (StoreKind::Ppi, _)]
         ));
     }
+
+    mod protocol;
 }
