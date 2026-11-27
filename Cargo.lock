@@ -11515,6 +11515,7 @@ dependencies = [
  "pal_async",
  "pal_event",
  "serde_json",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracing",
  "widestring",

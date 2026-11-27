@@ -107,6 +107,38 @@ fn parse_network_ids(json: &str) -> Result<Vec<Guid>, Error> {
 mod tests {
     use super::parse_network_ids;
     use guid::Guid;
+    use test_with_tracing::test;
+
+    #[test]
+    fn parse_preserves_duplicates_order_and_json_escapes() {
+        let ids = parse_network_ids(
+            r#" [
+                "b807c2d2-0db8-401a-994a-840d4c0769b1",
+                "\u00652af8db9-d4e4-42ff-a695-85a71b928dd0",
+                "b807c2d2-0db8-401a-994a-840d4c0769b1"
+            ] "#,
+        )
+        .unwrap();
+        let first: Guid = "b807c2d2-0db8-401a-994a-840d4c0769b1".parse().unwrap();
+        let second: Guid = "e2af8db9-d4e4-42ff-a695-85a71b928dd0".parse().unwrap();
+        assert_eq!(ids, [first, second, first]);
+    }
+
+    #[test]
+    fn invalid_network_entries_fail_the_entire_parse() {
+        for json in [
+            r#"["e2af8db9-d4e4-42ff-a695-85a71b928dd0","not-a-guid"]"#,
+            r#"["e2af8db9-d4e4-42ff-a695-85a71b928dd0",null]"#,
+            r#"[""]"#,
+            r#"[123]"#,
+            r#"{"Networks":[]}"#,
+            "null",
+        ] {
+            let error = parse_network_ids(json).unwrap_err();
+            assert_eq!(error.to_string(), "HCN parse failed");
+            assert_eq!(error.err.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
 
     #[test]
     fn parse_plain_array() {

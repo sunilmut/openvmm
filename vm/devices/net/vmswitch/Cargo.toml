@@ -27,5 +27,8 @@ windows-sys = { workspace = true, features = [
 ] }
 zerocopy.workspace = true
 
+[target.'cfg(windows)'.dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
