@@ -205,3 +205,94 @@ pub struct MetricComparison {
     /// Relative delta as percentage.
     pub delta_pct: f64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    fn stats(name: &str, mean: f64) -> MetricStats {
+        MetricStats {
+            name: name.into(),
+            unit: "ms".into(),
+            iterations: 2,
+            mean,
+            std_dev: 0.5,
+            min: mean - 1.0,
+            max: mean + 1.0,
+        }
+    }
+
+    fn report(revision: &str, results: Vec<MetricStats>) -> PerfReport {
+        PerfReport {
+            git_revision: revision.into(),
+            git_branch: "branch".into(),
+            git_commit_date: String::new(),
+            date: "2026-01-01T00:00:00Z".into(),
+            results,
+        }
+    }
+
+    // Test: Compare reports with shared, baseline-only, candidate-only and
+    //       zero-baseline metrics listed in different orders.
+    // Expected: Only shared metrics are compared, in candidate order, with exact
+    //       signed deltas; a zero baseline yields 0% rather than infinity or NaN.
+    #[test]
+    fn comparison_matches_by_name_and_handles_zero_baseline() {
+        let baseline = report(
+            "base",
+            vec![stats("zero", 0.0), stats("boot", 200.0), stats("gone", 5.0)],
+        );
+        let candidate = report(
+            "cand",
+            vec![stats("boot", 150.0), stats("new", 1.0), stats("zero", 4.0)],
+        );
+        let cmp = compare_reports(&baseline, &candidate);
+        assert_eq!(
+            (
+                cmp.baseline_revision.as_str(),
+                cmp.candidate_revision.as_str()
+            ),
+            ("base", "cand")
+        );
+        let rows: Vec<_> = cmp
+            .comparisons
+            .iter()
+            .map(|c| {
+                (
+                    c.name.as_str(),
+                    c.baseline_mean,
+                    c.candidate_mean,
+                    c.delta,
+                    c.delta_pct,
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("boot", 200.0, 150.0, -50.0, -25.0),
+                ("zero", 0.0, 4.0, 4.0, 0.0)
+            ]
+        );
+    }
+
+    // Test: Round-trip a report through JSON, and load a legacy report that
+    //       omits the newer branch and commit-date fields.
+    // Expected: Every field survives the round trip; legacy optional fields
+    //       default to empty strings, while a missing required field is an error.
+    #[test]
+    fn report_json_round_trips_and_accepts_legacy_optional_fields() {
+        let original = report("abc", vec![stats("boot", 12.25)]);
+        let decoded = PerfReport::from_json(&original.to_json().unwrap()).unwrap();
+        assert_eq!(decoded.to_json().unwrap(), original.to_json().unwrap());
+
+        let legacy =
+            PerfReport::from_json(r#"{"git_revision":"old","date":"d","results":[]}"#).unwrap();
+        assert_eq!(
+            (legacy.git_branch.as_str(), legacy.git_commit_date.as_str()),
+            ("", "")
+        );
+        assert!(PerfReport::from_json(r#"{"git_revision":"old","results":[]}"#).is_err());
+    }
+}

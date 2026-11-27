@@ -295,3 +295,72 @@ async fn boot_one_vm(
 
     Ok((vm, agent, boot_ms))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Expand default powers-of-two sweeps and filter explicit VM counts
+    //       that include zero, duplicates and values above the maximum.
+    // Expected: Defaults are 1,2,4,... up to and including the maximum; explicit
+    //       lists keep order and duplicates but drop zero and out-of-range values.
+    #[test]
+    fn sweep_values_respect_bounds_and_explicit_order() {
+        assert_eq!(sweep_values(&None, 0), Vec::<u32>::new());
+        assert_eq!(sweep_values(&None, 1), [1]);
+        assert_eq!(sweep_values(&None, 8), [1, 2, 4, 8]);
+        assert_eq!(sweep_values(&None, 9), [1, 2, 4, 8]);
+        assert_eq!(sweep_values(&Some(vec![8, 0, 3, 3, 9, 1]), 8), [8, 3, 3, 1]);
+        assert!(sweep_values(&Some(vec![]), 8).is_empty());
+    }
+
+    // IGNORED: entry322-bug2; a maximum above 2^31 overflows the doubling
+    //       counter (debug panic; release wraps to zero and never terminates).
+    //       Keep the reproducer until a separately authorized fix.
+    //
+    // Test: Expand the default sweep for the largest accepted maximum VM count.
+    // Expected: The sweep ends at 2^31 without overflowing the counter.
+    #[test]
+    #[ignore = "entry322-bug2: default sweep doubling overflows near u32::MAX"]
+    fn default_sweep_handles_largest_maximum() {
+        let values = sweep_values(&None, u32::MAX);
+        assert_eq!(values.len(), 32);
+        assert_eq!(values.last(), Some(&(1 << 31)));
+    }
+
+    // Test: Select nearest-rank percentiles at boundaries and between ranks,
+    //       including empty and single-sample inputs.
+    // Expected: 0% and 100% return the extremes, interior percentiles round to
+    //       the nearest rank, and empty input yields zero instead of panicking.
+    #[test]
+    fn percentiles_use_rounded_rank_with_safe_edges() {
+        let sorted = [1.0, 2.0, 3.0, 4.0, 5.0];
+        for (p, expected) in [
+            (0.0, 1.0),
+            (49.0, 3.0),
+            (50.0, 3.0),
+            (62.0, 3.0),
+            (63.0, 4.0),
+            (100.0, 5.0),
+        ] {
+            assert_eq!(percentile(&sorted, p), expected, "p{p}");
+        }
+        assert_eq!(percentile(&[], 50.0), 0.0);
+        assert_eq!(percentile(&[7.0], 99.0), 7.0);
+        assert_eq!(percentile(&sorted, 150.0), 5.0);
+    }
+
+    // Test: Build a single-shot statistic for a prefixed metric.
+    // Expected: Name is prefixed, iteration count is one, deviation is zero
+    //       and mean/min/max all equal the single observed value.
+    #[test]
+    fn single_shot_stats_are_prefixed_and_degenerate() {
+        let s = stat("scale_4", "boot_p99", "ms", 12.5);
+        assert_eq!(
+            (s.name.as_str(), s.unit.as_str(), s.iterations),
+            ("scale_4_boot_p99", "ms", 1)
+        );
+        assert_eq!((s.mean, s.std_dev, s.min, s.max), (12.5, 0.0, 12.5, 12.5));
+    }
+}

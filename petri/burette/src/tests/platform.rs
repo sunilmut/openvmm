@@ -317,6 +317,39 @@ mod linux {
             guest_ram_private_kib,
         })
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use test_with_tracing::test;
+
+        // Test: Parse smaps kB values with padding and malformed suffixes.
+        // Expected: Padded kB values parse exactly; missing units, other units
+        //       or non-numeric values return None instead of a guessed size.
+        #[test]
+        fn kb_values_require_numeric_kb_suffix() {
+            assert_eq!(parse_kb_value("   12345 kB"), Some(12345));
+            assert_eq!(parse_kb_value("0 kB\n"), Some(0));
+            for bad in ["12345", "12 MB", "x kB", "-1 kB", ""] {
+                assert_eq!(parse_kb_value(bad), None, "{bad:?}");
+            }
+        }
+
+        // Test: Parse hexadecimal smaps address ranges, including malformed text.
+        // Expected: Valid ranges decode exactly; malformed halves become zero and
+        //       a missing separator yields an empty range rather than panicking.
+        #[test]
+        fn address_ranges_parse_hex_and_degrade_safely() {
+            assert_eq!(
+                parse_addr_range("7f1234000000-7f1234100000"),
+                0x7f1234000000..0x7f1234100000
+            );
+            let reversed = parse_addr_range("ffffffffffffffff-0");
+            assert_eq!((reversed.start, reversed.end), (u64::MAX, 0));
+            assert_eq!(parse_addr_range("zz-10"), 0..0x10);
+            assert_eq!(parse_addr_range("1000"), 0..0);
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]

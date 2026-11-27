@@ -369,3 +369,53 @@ fn parse_fio_iops(json: &str, metric_name: &str, field: &str) -> anyhow::Result<
         value: iops,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Parse bandwidth and IOPS from the first fio job for read and write.
+    // Expected: Bandwidth converts bytes/s to MiB/s exactly, IOPS keeps its
+    //       value, and each field is read from the requested direction only.
+    #[test]
+    fn fio_metrics_convert_units_for_requested_direction() {
+        let json = r#"{"jobs":[{"read":{"bw_bytes":3145728,"iops":42.5},"write":{"bw_bytes":1048576,"iops":7}},{"read":{"bw_bytes":1,"iops":1}}]}"#;
+        let read_bw = parse_fio_bw(json, "fs_read_bw", "read").unwrap();
+        assert_eq!(
+            (read_bw.name.as_str(), read_bw.unit.as_str(), read_bw.value),
+            ("fs_read_bw", "MiB/s", 3.0)
+        );
+        assert_eq!(parse_fio_bw(json, "w", "write").unwrap().value, 1.0);
+        let iops = parse_fio_iops(json, "fs_iops", "read").unwrap();
+        assert_eq!((iops.unit.as_str(), iops.value), ("IOPS", 42.5));
+        assert_eq!(parse_fio_iops(json, "w", "write").unwrap().value, 7.0);
+    }
+
+    // Test: Parse invalid JSON, absent jobs and a missing direction field.
+    // Expected: Errors name the missing field and metric instead of yielding zero.
+    #[test]
+    fn fio_metrics_reject_missing_fields_with_context() {
+        assert!(parse_fio_bw("nope", "m", "read").is_err());
+        for json in [
+            r#"{}"#,
+            r#"{"jobs":[]}"#,
+            r#"{"jobs":[{"write":{"bw_bytes":1,"iops":1}}]}"#,
+        ] {
+            let bw = parse_fio_bw(json, "metric_bw", "read")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                bw.contains("read.bw_bytes") && bw.contains("metric_bw"),
+                "{bw}"
+            );
+            let iops = parse_fio_iops(json, "metric_iops", "read")
+                .unwrap_err()
+                .to_string();
+            assert!(
+                iops.contains("read.iops") && iops.contains("metric_iops"),
+                "{iops}"
+            );
+        }
+    }
+}

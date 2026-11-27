@@ -670,3 +670,71 @@ fn parse_udp_pps(json: &str, metric_name: &str) -> anyhow::Result<MetricResult> 
         value: pps,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Parse TCP iperf3 summaries for transmit and receive direction,
+    //       including a zero preferred sum that must fall back to the other side.
+    // Expected: Each direction reads its preferred summary in Gbps; a zero or
+    //       missing preferred value uses the opposite summary.
+    #[test]
+    fn tcp_throughput_prefers_direction_and_falls_back_on_zero() {
+        let json = r#"{"end":{"sum_sent":{"bits_per_second":4e9},"sum_received":{"bits_per_second":3e9}}}"#;
+        let tx = parse_result(json, "tcp_tx", &IperfMode::TcpTx).unwrap();
+        assert_eq!(
+            (tx.name.as_str(), tx.unit.as_str(), tx.value),
+            ("tcp_tx", "Gbps", 3.0)
+        );
+        assert_eq!(
+            parse_result(json, "rx", &IperfMode::TcpRx).unwrap().value,
+            4.0
+        );
+        let zero =
+            r#"{"end":{"sum_sent":{"bits_per_second":2e9},"sum_received":{"bits_per_second":0}}}"#;
+        assert_eq!(
+            parse_result(zero, "tx", &IperfMode::TcpTx).unwrap().value,
+            2.0
+        );
+        let only_sent = r#"{"end":{"sum_sent":{"bits_per_second":1e9}}}"#;
+        assert_eq!(
+            parse_result(only_sent, "tx", &IperfMode::TcpTx)
+                .unwrap()
+                .value,
+            1.0
+        );
+    }
+
+    // Test: Parse UDP iperf3 summaries with packets/seconds, a zero duration
+    //       and only a bit rate.
+    // Expected: Packets divided by seconds is used when the duration is positive;
+    //       otherwise the bit rate is converted using 1460-byte datagrams.
+    #[test]
+    fn udp_pps_uses_packet_rate_or_bit_rate_fallback() {
+        let json = r#"{"end":{"sum":{"packets":5000,"seconds":2.5,"bits_per_second":1}}}"#;
+        let pps = parse_result(json, "udp", &IperfMode::UdpTx).unwrap();
+        assert_eq!((pps.unit.as_str(), pps.value), ("pps", 2000.0));
+        let zero = r#"{"end":{"sum":{"packets":5000,"seconds":0,"bits_per_second":11680000}}}"#;
+        assert_eq!(parse_udp_pps(zero, "udp").unwrap().value, 1000.0);
+    }
+
+    // Test: Parse invalid JSON and summaries lacking every usable rate field.
+    // Expected: Each mode reports a metric-named error instead of a zero sample.
+    #[test]
+    fn iperf_parsing_rejects_missing_rates_with_metric_context() {
+        for mode in [IperfMode::TcpTx, IperfMode::TcpRx, IperfMode::UdpTx] {
+            assert!(
+                parse_result("not json", "m", &mode)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("failed to parse iperf3 JSON")
+            );
+            let error = parse_result(r#"{"end":{}}"#, "metric_x", &mode)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("metric_x"), "{error}");
+        }
+    }
+}
