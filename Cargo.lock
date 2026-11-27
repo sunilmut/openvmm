@@ -2408,6 +2408,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
+ "test_with_tracing",
  "xshell",
 ]
 

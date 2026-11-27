@@ -369,6 +369,7 @@ impl CommandWrapperKind {
 #[expect(clippy::disallowed_macros, reason = "test module")]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
 
     fn env_test_wrapper() -> CommandWrapperKind {
         if cfg!(windows) {
@@ -403,6 +404,27 @@ mod tests {
         let cmd = sh.wrap(xshell::cmd!(sh.xshell(), "echo hello"));
         let output = cmd.read().unwrap();
         assert_eq!(output, "hello");
+    }
+
+    // Test: Capture a Windows command's separate output streams and failing status with and without wrapping.
+    // Expected: Ignore-status preserves exit code seven and exact stdout/stderr bytes through either path.
+    #[cfg(windows)]
+    #[test]
+    fn windows_wrapped_output_preserves_streams_and_failure_status() {
+        for wrapper in [None, Some(CommandWrapperKind::CmdExe)] {
+            let mut sh = FloweyShell::new().unwrap();
+            sh.set_wrapper(wrapper);
+            let command = || {
+                sh.xshell()
+                    .cmd("cmd")
+                    .args(["/C", "(echo out)&(echo err>&2)&exit /b 7"])
+            };
+            assert!(sh.wrap(command()).output().is_err());
+            let output = sh.wrap(command()).ignore_status().output().unwrap();
+            assert_eq!(output.status.code(), Some(7));
+            assert_eq!(output.stdout, b"out\r\n");
+            assert_eq!(output.stderr, b"err\r\n");
+        }
     }
 
     #[test]
