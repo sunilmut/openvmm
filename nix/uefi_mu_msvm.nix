@@ -2,19 +2,19 @@
 
 let
   # Allow explicit override of architecture, otherwise derive from host system
-  # Both architectures use the legacy C core with CLANGPDB
+  # Both architectures use the Patina core with CLANGPDB
   archToolchain = if targetArch == "x86_64" then "X64-CLANGPDB"
          else if targetArch == "aarch64" then "AARCH64-CLANGPDB"
          else if system == "aarch64-linux" then "AARCH64-CLANGPDB"
          else "X64-CLANGPDB";
   hash = {
-    "AARCH64-CLANGPDB" = "sha256-zIdsaLRfkNJZl9Pj4GIjkHfxW3c3F3j+6cjFUlVt3U8=";
-    "X64-CLANGPDB" = "sha256-8H2nN8Lehsbr8DsL6zAGkcxm+ECEwQFKtmgXVtjaXx8=";
+    "AARCH64-CLANGPDB" = "sha256-SOuUMedQbeX5EV84u8R/37kNlrvsDNb/4p0Rb/vzcdw=";
+    "X64-CLANGPDB" = "sha256-EWNuqQxh83LiAV3yFwN/9BGvptgLv1UV2jD6ckwOarE=";
   }.${archToolchain};
 
 in stdenv.mkDerivation rec {
   pname = "uefi-mu-msvm-${archToolchain}";
-  version = "26.0.50";
+  version = "26.0.56";
 
   src = fetchzip {
     url =
