@@ -147,3 +147,81 @@ vm_resource::register_static_resolvers! {
     #[cfg(all(target_os = "macos", guest_arch = "aarch64", guest_is_native, feature = "virt_hvf"))]
     hypervisor_resolvers::hvf::HvfResolver,
 }
+
+#[cfg(test)]
+mod tests {
+    use futures::{AsyncReadExt, AsyncWriteExt};
+    use serial_core::resources::{
+        DisconnectedSerialBackendHandle, NullSerialBackendHandle, ResolveSerialBackendParams,
+    };
+    use test_with_tracing::test;
+    use vm_resource::{IntoResource, ResourceResolver};
+    use vmcore::non_volatile_store::resources::EphemeralNonVolatileStoreHandle;
+
+    // Test: Use the linked OpenVMM catalog to provision independent stores.
+    // Expected: Resolution requires no dynamic registration; persisting one
+    //       store does not initialize or overwrite another store.
+    #[test]
+    fn linked_catalog_resolves_independent_stores() {
+        futures::executor::block_on(async {
+            let resolver = ResourceResolver::new();
+            let mut first = resolver
+                .resolve(EphemeralNonVolatileStoreHandle.into_resource(), &())
+                .await
+                .unwrap()
+                .0;
+            let mut second = resolver
+                .resolve(EphemeralNonVolatileStoreHandle.into_resource(), &())
+                .await
+                .unwrap()
+                .0;
+            first.persist(vec![0, 255, 42]).await.unwrap();
+            assert_eq!(second.restore().await.unwrap(), None);
+            second.persist(vec![]).await.unwrap();
+            assert_eq!(second.restore().await.unwrap(), Some(vec![]));
+            assert_eq!(first.restore().await.unwrap(), Some(vec![0, 255, 42]));
+        });
+    }
+
+    // Test: Resolve the null and disconnected serial handles via the catalog.
+    // Expected: Null accepts output, while disconnected returns EOF and
+    //       BrokenPipe; resource roundtripping preserves those distinct roles.
+    #[test]
+    fn linked_serial_backends_have_distinct_io_behavior() {
+        futures::executor::block_on(async {
+            let resolver = ResourceResolver::new();
+            let pool = pal_async::DefaultPool::new();
+            let params = || ResolveSerialBackendParams {
+                driver: Box::new(pool.driver()),
+                _async_trait_workaround: &(),
+            };
+            let null = resolver
+                .resolve(NullSerialBackendHandle.into_resource(), params())
+                .await
+                .unwrap()
+                .0;
+            let null = resolver
+                .resolve(null.into_resource(), params())
+                .await
+                .unwrap()
+                .0;
+            let mut null = null.into_io();
+            null.write_all(b"discarded output").await.unwrap();
+            assert!(null.is_connected());
+            let mut disconnected = resolver
+                .resolve(DisconnectedSerialBackendHandle.into_resource(), params())
+                .await
+                .unwrap()
+                .0
+                .into_io();
+            assert!(!disconnected.is_connected());
+            let mut bytes = [0xa5; 4];
+            assert_eq!(disconnected.read(&mut bytes).await.unwrap(), 0);
+            assert_eq!(bytes, [0xa5; 4]);
+            assert_eq!(
+                disconnected.write(b"output").await.unwrap_err().kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+        });
+    }
+}

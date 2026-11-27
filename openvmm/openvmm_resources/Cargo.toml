@@ -134,6 +134,11 @@ disk_vhdmp.workspace = true
 [build-dependencies]
 build_rs_guest_arch.workspace = true
 
+[dev-dependencies]
+futures.workspace = true
+pal_async.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
 
