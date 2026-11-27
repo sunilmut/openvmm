@@ -189,3 +189,81 @@ fn deserialize_syzkaller_pointers() {
     assert_eq!(result, 0);
     assert_eq!(recorded_calls(), vec![(String::from("chkmagic"), vec![]),]);
 }
+
+fn mapped_deserializer(names: &[&str]) -> SyzlangDeserializer {
+    let mut deserializer = SyzlangDeserializer::new();
+    install_function_registry(&mut deserializer);
+    let names: Vec<String> = names.iter().map(|&n| String::from(n)).collect();
+    deserializer
+        .set_mappings(postcard::to_allocvec(&names).unwrap())
+        .unwrap();
+    deserializer
+}
+
+fn failure_message(result: Result<u64, ExecutorError>) -> String {
+    match result {
+        Err(ExecutorError::SyzlangDeserializerFailed(message)) => message,
+        other => panic!("expected a deserializer failure, got {other:?}"),
+    }
+}
+
+// Test: Run a program whose call number is beyond the mapping table, then a
+//       program that calls a mapped name with no registered function, then a
+//       valid program on the same deserializer.
+// Expected: Each bad call fails with its call number or handler name, the
+//       collected errors are cleared after reporting, and the valid program
+//       then succeeds without stale errors.
+#[test]
+fn bad_calls_report_and_clear_errors() {
+    let _guard = SYZLANG_EXEC_TEST_LOCK.lock();
+    clear_recorded_calls();
+    let mut deserializer = mapped_deserializer(&["func0", "nosuch"]);
+
+    let message = failure_message(
+        deserializer.deserialize_and_execute(&mut build_testcase(&[Insn::Call(5, &[])])),
+    );
+    assert_eq!(message, "invalid call number 5 received from syzlang");
+    let message = failure_message(
+        deserializer.deserialize_and_execute(&mut build_testcase(&[Insn::Call(1, &[7])])),
+    );
+    assert_eq!(message, "nosuch: Invalid function name: nosuch");
+
+    let result = deserializer.deserialize_and_execute(&mut build_testcase(&[Insn::Call(0, &[3])]));
+    assert!(matches!(result, Ok(0)), "{result:?}");
+    assert_eq!(recorded_calls(), vec![(String::from("func0"), vec![3])]);
+}
+
+// Test: Supply undecodable mappings, a testcase larger than the input buffer,
+//       and a testcase with a corrupted program header.
+// Expected: Mappings fail with the mapping error; the oversized and corrupted
+//       testcases fail with size and decoder details instead of executing.
+#[test]
+fn invalid_mappings_and_testcases_are_rejected() {
+    let _guard = SYZLANG_EXEC_TEST_LOCK.lock();
+    clear_recorded_calls();
+    let mut deserializer = SyzlangDeserializer::new();
+    assert!(matches!(
+        deserializer.set_mappings(vec![0xff, 0xff, 0xff]),
+        Err(ExecutorError::DecoderMappingsDeserializeFailed)
+    ));
+
+    let mut deserializer = mapped_deserializer(&["func0"]);
+    let mut oversized = OpenTMKFuzzTest {
+        testcase_vcpu0: vec![0; opentmk_decoder::SUPPORTED_INPUT_SIZE + 1],
+    };
+    let message = failure_message(deserializer.deserialize_and_execute(&mut oversized));
+    assert_eq!(
+        message,
+        format!(
+            "Testcase input is too large: {} > {}",
+            opentmk_decoder::SUPPORTED_INPUT_SIZE + 1,
+            opentmk_decoder::SUPPORTED_INPUT_SIZE
+        )
+    );
+
+    let mut corrupt = build_testcase(&[Insn::Call(0, &[1])]);
+    corrupt.testcase_vcpu0[0] ^= 1;
+    let message = failure_message(deserializer.deserialize_and_execute(&mut corrupt));
+    assert!(message.starts_with("BadMagic("), "{message}");
+    assert!(recorded_calls().is_empty());
+}

@@ -222,3 +222,42 @@ fn framed_fuzz_packet_writes_framed_error() {
         }))
     );
 }
+
+// Test: Register the built-in fuzz functions and call each one with a port
+//       outside the allow-list (and too few arguments for the hypercall).
+// Expected: Every built-in name resolves to a registered function, and the
+//       port functions do nothing for a disallowed port.
+#[test]
+fn builtin_fuzz_functions_are_registered() {
+    use crate::functions::FuzzFunctionVariable as V;
+    let mut executor = Executor::new_with_comms(SerialCommsServer::new_with_transport(
+        MockSerialIo::default(),
+    ));
+    executor.register_fuzz_functions();
+    let registry = executor.fn_registry.lock();
+    let mut backing = [0u8; 8];
+    #[cfg(target_arch = "x86_64")]
+    for name in [
+        "port_write8",
+        "port_write16",
+        "port_write32",
+        "port_read8",
+        "port_read16",
+        "port_read32",
+    ] {
+        let result = registry.exec(
+            opentmk_decoder::SingleMap::from_slice(&mut backing, 0x1000),
+            name,
+            vec![V::Int(0x3f8), V::Int(0x1000)],
+        );
+        assert!(matches!(result, V::Void), "{name}: {result:?}");
+    }
+    match registry.exec(
+        opentmk_decoder::SingleMap::from_slice(&mut backing, 0x1000),
+        "hvcall",
+        vec![],
+    ) {
+        V::Error(message) => assert!(!message.starts_with("Invalid function name"), "{message}"),
+        other => panic!("unexpected {other:?}"),
+    }
+}
