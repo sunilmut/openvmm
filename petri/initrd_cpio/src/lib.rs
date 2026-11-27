@@ -216,4 +216,112 @@ mod tests {
         let trailer_pos = s.find("TRAILER!!!").unwrap();
         assert!(pipette_pos < trailer_pos);
     }
+
+    fn read_entries(data: &[u8]) -> Vec<(String, u32, Vec<u8>)> {
+        let mut entries = Vec::new();
+        let mut offset = 0;
+        while offset < data.len() {
+            let header = &data[offset..offset + 110];
+            assert_eq!(&header[..6], b"070701");
+            let field = |range| {
+                u32::from_str_radix(std::str::from_utf8(&header[range]).unwrap(), 16).unwrap()
+            };
+            let mode = field(14..22);
+            let size = field(54..62) as usize;
+            let namesize = field(94..102) as usize;
+            let name = &data[offset + 110..offset + 110 + namesize];
+            assert_eq!(name.last(), Some(&0));
+            let name = std::str::from_utf8(&name[..name.len() - 1])
+                .unwrap()
+                .to_owned();
+            let payload = (offset + 110 + namesize).next_multiple_of(4);
+            entries.push((name, mode, data[payload..payload + size].to_vec()));
+            offset = (payload + size).next_multiple_of(4);
+        }
+        entries
+    }
+
+    // Test: Inject a duplicate executable name when a file contains a fake trailer.
+    // Expected: The original payload is intact and the replacement's exact bytes
+    //       and permissions appear last, before the real archive trailer.
+    #[test]
+    fn injection_preserves_payload_and_appends_replacement() {
+        let mut fake_trailer = Vec::new();
+        write_cpio_entry(&mut fake_trailer, "TRAILER!!!", &[], 0);
+        let mut original = Vec::new();
+        write_cpio_entry(&mut original, "nested/archive", &fake_trailer, 0o100644);
+        write_cpio_entry(&mut original, "pipette", &[0xff, 0, 0x71], 0o100600);
+        write_cpio_entry(&mut original, "TRAILER!!!", &[], 0);
+        let merged = inject_into_initrd(
+            &compress_gz(&original).unwrap(),
+            "pipette",
+            &[0x83, 0, 0xff, 0x19, 0x27],
+            0o100755,
+        )
+        .unwrap();
+        assert_eq!(
+            read_entries(&decompress_gz(&merged).unwrap()),
+            vec![
+                ("nested/archive".into(), 0o100644, fake_trailer),
+                ("pipette".into(), 0o100600, vec![0xff, 0, 0x71]),
+                ("pipette".into(), 0o100755, vec![0x83, 0, 0xff, 0x19, 0x27]),
+                ("TRAILER!!!".into(), 0, vec![]),
+            ]
+        );
+    }
+
+    // Test: Append independent gzip layers to an existing initrd.
+    // Expected: The existing compressed bytes stay unchanged and each added member
+    //       decodes to its own complete archive, with exact binary content and mode.
+    #[test]
+    fn appended_layers_preserve_existing_compressed_bytes() {
+        use flate2::read::MultiGzDecoder;
+        use std::io::Read;
+
+        let mut original = Vec::new();
+        write_cpio_entry(&mut original, "init", b"original", 0o100755);
+        write_cpio_entry(&mut original, "TRAILER!!!", &[], 0);
+        let prefix = compress_gz(&original).unwrap();
+        let mut initrd = prefix.clone();
+        append_to_initrd(&mut initrd, "bin/a", &[0, 0x91, 0xff], 0o100700).unwrap();
+        let first_end = initrd.len();
+        append_to_initrd(&mut initrd, "empty", &[], 0o100644).unwrap();
+        assert_eq!(&initrd[..prefix.len()], prefix);
+        assert_eq!(
+            read_entries(&decompress_gz(&initrd[prefix.len()..first_end]).unwrap()),
+            vec![
+                ("bin/a".into(), 0o100700, vec![0, 0x91, 0xff]),
+                ("TRAILER!!!".into(), 0, vec![]),
+            ]
+        );
+        assert_eq!(
+            read_entries(&decompress_gz(&initrd[first_end..]).unwrap()),
+            vec![
+                ("empty".into(), 0o100644, vec![]),
+                ("TRAILER!!!".into(), 0, vec![]),
+            ]
+        );
+        let mut all = Vec::new();
+        MultiGzDecoder::new(initrd.as_slice())
+            .read_to_end(&mut all)
+            .unwrap();
+        let entries = read_entries(&all);
+        assert_eq!(entries.len(), 6);
+        assert_eq!(entries[0], ("init".into(), 0o100755, b"original".to_vec()));
+        assert_eq!(entries[2], ("bin/a".into(), 0o100700, vec![0, 0x91, 0xff]));
+        assert_eq!(entries[4], ("empty".into(), 0o100644, vec![]));
+    }
+
+    // Test: Attempt injection into invalid gzip or a valid archive without a trailer.
+    // Expected: Both unsupported inputs return errors, not a fabricated initrd.
+    #[test]
+    fn injection_rejects_invalid_gzip_and_missing_trailer() {
+        assert!(inject_into_initrd(b"not gzip", "init", b"data", 0o100755).is_err());
+        let mut original = Vec::new();
+        write_cpio_entry(&mut original, "init", b"data", 0o100755);
+        assert!(
+            inject_into_initrd(&compress_gz(&original).unwrap(), "other", b"data", 0o100644)
+                .is_err()
+        );
+    }
 }
