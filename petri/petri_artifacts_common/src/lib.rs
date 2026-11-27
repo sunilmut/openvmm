@@ -182,3 +182,102 @@ pub mod tags {
     /// Artifact is a VmgsTool binary
     pub trait IsVmgsTool: ArtifactId {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::capabilities::*;
+    use super::tags::*;
+    use std::collections::BTreeSet;
+    use test_with_tracing::test;
+
+    // Test: Inspect every known capability name and look up known, unknown,
+    //       differently cased and padded names.
+    // Expected: Names are unique lowercase identifiers usable in
+    //       `requires(...)`; only exact matches are known, and a lookup of an
+    //       owned copy returns the registered name.
+    #[test]
+    fn capability_registry_has_unique_identifiers_and_exact_lookup() {
+        let names: BTreeSet<_> = KNOWN_CAPABILITIES.iter().collect();
+        assert_eq!(names.len(), KNOWN_CAPABILITIES.len());
+        for &name in KNOWN_CAPABILITIES {
+            assert!(
+                !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()),
+                "{name}"
+            );
+            assert!(
+                name.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{name}"
+            );
+            let owned: String = name.chars().collect();
+            let found = known(&owned).unwrap();
+            assert_eq!(found, name);
+            assert!(is_known_name(name));
+        }
+        for unknown in ["", "VPCI", " vpci", "vpci ", "nested", "test-disk"] {
+            assert_eq!(known(unknown), None, "{unknown:?}");
+            assert!(!is_known_name(unknown));
+        }
+    }
+
+    petri_artifacts_core::declare_artifacts! {
+        /// Fixture image that declares no boot quirks.
+        PLAIN_IMAGE("plain.img", ANY),
+    }
+
+    impl IsTestVhd for PLAIN_IMAGE {
+        const OS_FLAVOR: OsFlavor = OsFlavor::Linux;
+        const ARCH: MachineArch = MachineArch::X86_64;
+    }
+
+    impl IsTestIso for PLAIN_IMAGE {
+        const OS_FLAVOR: OsFlavor = OsFlavor::FreeBsd;
+        const ARCH: MachineArch = MachineArch::Aarch64;
+    }
+
+    // Test: Query boot quirks for VHD and ISO images that declare none.
+    // Expected: Both backends get no shutdown delay and no initial reboot,
+    //       so undeclared images are booted without workarounds.
+    #[test]
+    fn images_without_declared_quirks_get_none() {
+        for quirks in [
+            <PLAIN_IMAGE as IsTestVhd>::quirks(),
+            <PLAIN_IMAGE as IsTestIso>::quirks(),
+        ] {
+            for inner in [quirks.openvmm, quirks.hyperv] {
+                assert!(inner.hyperv_shutdown_ic_sleep.is_none());
+                assert!(inner.initial_reboot.is_none());
+            }
+        }
+    }
+
+    // Test: Expand backend-independent quirks, and query the host architecture.
+    // Expected: OpenVMM and Hyper-V receive identical quirks, the default has
+    //       none, and the host architecture matches this test binary's target.
+    #[test]
+    fn quirks_apply_to_all_backends_and_host_arch_matches_target() {
+        let quirks = GuestQuirks::for_all_backends(GuestQuirksInner {
+            hyperv_shutdown_ic_sleep: Some(std::time::Duration::from_millis(1500)),
+            initial_reboot: Some(InitialRebootCondition::WithTpm),
+        });
+        assert_eq!(
+            format!("{:?}", quirks.openvmm),
+            format!("{:?}", quirks.hyperv)
+        );
+        assert_eq!(
+            quirks.openvmm.hyperv_shutdown_ic_sleep,
+            Some(std::time::Duration::from_millis(1500))
+        );
+        let default = GuestQuirks::default();
+        assert!(
+            default.openvmm.initial_reboot.is_none()
+                && default.hyperv.hyperv_shutdown_ic_sleep.is_none()
+        );
+        let expected = if cfg!(target_arch = "x86_64") {
+            MachineArch::X86_64
+        } else {
+            MachineArch::Aarch64
+        };
+        assert_eq!(MachineArch::host(), expected);
+    }
+}

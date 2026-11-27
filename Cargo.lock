@@ -6997,6 +6997,7 @@ name = "petri_artifacts_common"
 version = "0.0.0"
 dependencies = [
  "petri_artifacts_core",
+ "test_with_tracing",
 ]
 
 [[package]]
