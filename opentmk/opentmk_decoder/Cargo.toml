@@ -10,5 +10,8 @@ rust-version.workspace = true
 bitfield-struct.workspace = true
 zerocopy.workspace = true
 
+[dev-dependencies]
+parking_lot.workspace = true
+
 [lints]
 workspace = true
