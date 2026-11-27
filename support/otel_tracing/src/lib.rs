@@ -136,6 +136,7 @@ mod tests {
     use super::part_c_resource_keys;
     use opentelemetry::KeyValue;
     use opentelemetry_sdk::Resource;
+    use test_with_tracing::test;
 
     #[test]
     fn part_c_keys_include_non_part_a_resource_attributes() {
@@ -152,5 +153,26 @@ mod tests {
         keys.sort();
 
         assert_eq!(keys, ["run.id", "service.version"]);
+    }
+
+    // Test: Initialize a native ETW provider, then drop its guard while a tracer and layer remain alive.
+    // Expected: Spans record before shutdown and no longer record after guard cleanup.
+    #[cfg(windows)]
+    #[test]
+    fn native_provider_guard_shuts_down_live_tracers() {
+        use opentelemetry::trace::Span as _;
+        use opentelemetry::trace::Tracer as _;
+        use opentelemetry::trace::TracerProvider as _;
+
+        let (layer, guard) =
+            super::init_native_layer::<tracing_subscriber::Registry>("OpenVMMUnitTestGuard", "1.0")
+                .unwrap();
+        let tracer = guard.provider.tracer("guard-lifetime-test");
+        let mut span = tracer.start("before-shutdown");
+        assert!(span.is_recording());
+        span.end();
+        drop(guard);
+        assert!(!tracer.start("after-shutdown").is_recording());
+        drop(layer);
     }
 }
