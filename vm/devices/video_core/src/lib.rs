@@ -81,3 +81,6 @@ pub trait FramebufferControl: Send {
     /// Updates the framebuffer format.
     async fn set_format(&mut self, format: FramebufferFormat);
 }
+
+#[cfg(test)]
+mod tests;

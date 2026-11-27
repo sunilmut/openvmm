@@ -10138,6 +10138,8 @@ dependencies = [
  "async-trait",
  "inspect",
  "mesh",
+ "pal_async",
+ "test_with_tracing",
  "vm_resource",
 ]
 
