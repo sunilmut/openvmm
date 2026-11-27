@@ -8172,6 +8172,7 @@ dependencies = [
  "minimal_rt_build",
  "sidecar_defs",
  "spin",
+ "test_with_tracing",
  "uart_16550",
  "x86defs",
  "zerocopy",

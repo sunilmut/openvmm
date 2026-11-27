@@ -592,3 +592,52 @@ fn park_until<F: FnMut() -> Option<R>, R>(mut f: F) -> R {
         }
     }
 }
+
+#[cfg(all(test, not(minimal_rt)))]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Reject get/set register counts one beyond payload capacity and at
+    //       the maximum count, using owned command pages without hardware access.
+    // Expected: Each handler replaces stale diagnostics with the precise error
+    //       while preserving request bytes and CPU context.
+    #[test]
+    fn register_handlers_reject_counts_exceeding_the_request_payload() {
+        let handlers: [(fn(&mut CommandPage), &str); 2] = [
+            (get_vp_registers, "invalid register name count"),
+            (set_vp_registers, "invalid register count"),
+        ];
+        for (handle, message) in handlers {
+            let mut page = CommandPage::new_zeroed();
+            let capacity = (page.request_data.as_bytes().len()
+                - size_of::<GetSetVpRegisterRequest>())
+                / size_of::<HvRegisterAssoc>();
+            for count in [u16::try_from(capacity + 1).unwrap(), u16::MAX] {
+                page.has_error = 0;
+                page.error.len = 8;
+                page.error.buf[..8].copy_from_slice(b"previous");
+                page.cpu_context.gps[CpuContextX64::RAX] = 0xfeed_1234;
+                page.request_data.as_mut_bytes().fill(0x7b);
+                GetSetVpRegisterRequest {
+                    count,
+                    target_vtl: HvInputVtl::CURRENT_VTL,
+                    ..FromZeros::new_zeroed()
+                }
+                .write_to_prefix(page.request_data.as_mut_bytes())
+                .unwrap();
+                let request = page.request_data.as_bytes().to_vec();
+                let context = page.cpu_context.as_bytes().to_vec();
+                handle(&mut page);
+                let expected = format!("{message}: {count}");
+                assert_eq!(page.has_error, 1);
+                assert_eq!(
+                    &page.error.buf[..usize::from(page.error.len)],
+                    expected.as_bytes()
+                );
+                assert_eq!(page.request_data.as_bytes(), request);
+                assert_eq!(page.cpu_context.as_bytes(), context);
+            }
+        }
+    }
+}

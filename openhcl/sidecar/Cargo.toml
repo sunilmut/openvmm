@@ -8,7 +8,6 @@ rust-version.workspace = true
 
 [[bin]]
 name = "sidecar"
-test = false
 
 [features]
 # Disable build scripts that do not pass in the CI environment.
@@ -28,6 +27,9 @@ zerocopy.workspace = true
 
 [build-dependencies]
 minimal_rt_build.workspace = true
+
+[dev-dependencies]
+test_with_tracing.workspace = true
 
 [lints]
 workspace = true

@@ -490,3 +490,6 @@ core::arch::global_asm!(
     .popsection
     "#,
 );
+
+#[cfg(all(test, not(minimal_rt)))]
+mod tests;
