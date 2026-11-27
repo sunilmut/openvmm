@@ -5685,6 +5685,7 @@ dependencies = [
  "pal",
  "pal_async",
  "socket2",
+ "tempfile",
  "term",
  "thiserror 2.0.16",
  "tracing-subscriber",

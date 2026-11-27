@@ -1189,3 +1189,132 @@ mod tests {
         assert!(matches!(id, VmId::HybridVsock(_)));
     }
 }
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    fn parse(args: &[&str]) -> Result<Options, clap::Error> {
+        Options::try_parse_from(std::iter::once("ohcldiag-dev").chain(args.iter().copied()))
+    }
+
+    // Test: Validate the whole clap command definition.
+    // Expected: clap's debug assertions find no conflicting, duplicate or
+    //       dangling argument definitions in any subcommand.
+    #[test]
+    fn command_definition_is_consistent() {
+        Options::command().debug_assert();
+    }
+
+    // Test: Parse inspect, shell and run invocations, and inspect flags whose
+    //       required companions are missing or which conflict.
+    // Expected: Defaults and trailing arguments are preserved; options that
+    //       need -r/-p or conflict with --update are rejected by the parser.
+    #[test]
+    fn cli_enforces_option_dependencies_and_defaults() {
+        let options = parse(&["vsock:/vm.sock", "inspect", "-r", "-l", "2", "vm/a"]).unwrap();
+        assert!(matches!(options.vm.id, VmId::HybridVsock(ref p) if p == Path::new("/vm.sock")));
+        match options.command {
+            Command::Inspect {
+                recursive,
+                limit,
+                path,
+                timeout,
+                period,
+                ..
+            } => {
+                assert!(recursive);
+                assert_eq!(
+                    (limit, path.as_deref(), timeout, period),
+                    (Some(2), Some("vm/a"), 1, 1.0)
+                );
+            }
+            _ => panic!("expected inspect"),
+        }
+        match parse(&["vsock:/v", "shell"]).unwrap().command {
+            Command::Shell { shell, args } => {
+                assert_eq!((shell.as_str(), args.len()), ("/bin/sh", 0))
+            }
+            _ => panic!("expected shell"),
+        }
+        match parse(&["vsock:/v", "run", "ls", "--", "-l", "/"])
+            .unwrap()
+            .command
+        {
+            Command::Run { command, args } => assert_eq!(
+                (command.as_str(), args),
+                ("ls", vec!["-l".to_owned(), "/".to_owned()])
+            ),
+            _ => panic!("expected run"),
+        }
+        for bad in [
+            &["vsock:/v", "inspect", "-l", "2"][..],
+            &["vsock:/v", "inspect", "--count", "3"],
+            &["vsock:/v", "inspect", "-r", "-u", "x", "p"],
+            &["vsock:/v", "inspect", "-u", "x", "-t", "5", "p"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    // Test: Parse VM IDs with and without the vsock prefix, and environment
+    //       assignments with empty values, extra '=' and no '='.
+    // Expected: On this platform every VM ID is a hybrid vsock path with the
+    //       prefix removed; env values split on the first '=' only, and a
+    //       missing '=' is rejected.
+    #[cfg(not(windows))]
+    #[test]
+    fn vm_ids_and_env_strings_parse_exactly() {
+        for (text, path) in [
+            ("vsock:/a/b.sock", "/a/b.sock"),
+            ("/a/b.sock", "/a/b.sock"),
+            ("vsock:", ""),
+        ] {
+            let id: VmId = text.parse().unwrap();
+            assert!(
+                matches!(id, VmId::HybridVsock(ref p) if p == Path::new(path)),
+                "{text}"
+            );
+        }
+        for (text, name, value) in [
+            ("A=1", "A", "1"),
+            ("A=", "A", ""),
+            ("A=b=c", "A", "b=c"),
+            ("=v", "", "v"),
+        ] {
+            let env: EnvString = text.parse().unwrap();
+            assert_eq!((env.name.as_str(), env.value.as_str()), (name, value));
+        }
+        assert!("NOEQUALS".parse::<EnvString>().is_err());
+    }
+
+    // Test: Map EFI diagnostics options to inspect values, and open output
+    //       files for a writable path and a path in a missing directory.
+    // Expected: Each option maps to its documented inspect string; output
+    //       creation succeeds for a valid path and fails for a missing directory,
+    //       and an explicit path never counts as writing to the terminal.
+    #[test]
+    fn efi_values_and_output_files() {
+        assert_eq!(
+            [
+                EfiDiagnosticsLogLevel::Default,
+                EfiDiagnosticsLogLevel::Info,
+                EfiDiagnosticsLogLevel::Full
+            ]
+            .map(|l| l.as_inspect_value()),
+            ["default", "info", "full"]
+        );
+        assert_eq!(
+            [EfiDiagnosticsOutput::Stdout, EfiDiagnosticsOutput::Tracing]
+                .map(|o| o.as_inspect_value()),
+            ["stdout", "tracing"]
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = Some(dir.path().join("out.bin"));
+        ensure_not_terminal(&path).unwrap();
+        create_or_stderr(&path).unwrap();
+        assert!(path.as_ref().unwrap().exists());
+        assert!(create_or_stderr(&Some(dir.path().join("missing/out.bin"))).is_err());
+    }
+}
