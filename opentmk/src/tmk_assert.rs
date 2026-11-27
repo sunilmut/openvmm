@@ -91,3 +91,38 @@ macro_rules! tmk_assert {
         }
     }};
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test: Format passing and failing assertion records whose expression text
+    //       needs JSON escaping, with string and structured test names, with
+    //       and without a trailing newline.
+    // Expected: Each record is one JSON object with the fixed type/level, the
+    //       exact message, location, result and test name; only the newline
+    //       flag changes framing.
+    #[test]
+    fn assertion_records_are_lossless_json_lines() {
+        let expr = "a == \"b\\c\"\n\u{1f642}";
+        for (terminate, result) in [(false, true), (true, false)] {
+            let out = format_assert_json_string(expr, terminate, "f.rs:9".into(), result, &"case");
+            assert_eq!(out.ends_with('\n'), terminate);
+            let value: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+            assert_eq!(
+                value,
+                serde_json::json!({
+                    "type": "assert",
+                    "level": "WARN",
+                    "message": expr,
+                    "line": "f.rs:9",
+                    "assertion_result": result,
+                    "testname": "case",
+                })
+            );
+        }
+        let structured = format_assert_json_string("x", false, "l".into(), true, &("suite", 3));
+        let value: serde_json::Value = serde_json::from_str(&structured).unwrap();
+        assert_eq!(value["testname"], serde_json::json!(["suite", 3]));
+    }
+}

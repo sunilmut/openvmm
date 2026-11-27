@@ -75,3 +75,108 @@ pub fn run_test(cfg: &OpenTmkConfig, dispatch: fn(&str, &str, &serde_json::Value
         panic!("unknown backend/test: '{}'/'{}'", cfg.backend, cfg.test);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::string::String;
+    use alloc::string::ToString;
+    use alloc::vec::Vec;
+    use opentmk_protocol::OPENTMK_CONFIG_JSON_SIZE;
+    use spin::Mutex;
+
+    static LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    mod suite {
+        use super::LOG;
+
+        pub struct Ctx(pub String);
+
+        pub mod alpha {
+            pub fn exec(ctx: &mut super::Ctx) {
+                super::LOG.lock().push(alloc::format!("alpha:{}", ctx.0));
+            }
+        }
+
+        pub mod gated {
+            pub fn exec(_: &mut super::Ctx) {
+                super::LOG.lock().push("gated".into());
+            }
+        }
+
+        crate::opentmk_tests! {
+            ctx: Ctx,
+            tests: { alpha, #[cfg(any())] gated },
+        }
+    }
+
+    crate::opentmk_backends! {
+        suite => |params: &serde_json::Value| suite::Ctx(params["tag"].to_string()),
+    }
+
+    fn config(json: &str) -> OpenTmkConfig {
+        let mut cfg = OpenTmkConfig::new();
+        cfg.json[..json.len()].copy_from_slice(json.as_bytes());
+        cfg.json_len = (json.len() as u32).into();
+        cfg
+    }
+
+    // Test: Dispatch a known test, a test whose registration is compiled out,
+    //       an unknown test and an unknown backend through the generated
+    //       registration macros.
+    // Expected: Only the registered test runs, receiving a context built from
+    //       the parameters; every other selection reports "not found".
+    #[test]
+    fn generated_dispatch_runs_only_registered_tests() {
+        LOG.lock().clear();
+        let params = serde_json::json!({ "tag": 7 });
+        assert!(dispatch("suite", "alpha", &params));
+        assert!(!dispatch("suite", "gated", &params));
+        assert!(!dispatch("suite", "missing", &params));
+        assert!(!dispatch("other", "alpha", &params));
+        assert_eq!(*LOG.lock(), ["alpha:7"]);
+        let _ = suite::gated::exec;
+    }
+
+    // Test: Run the config-selected test from a patched config region.
+    // Expected: The backend, test name and parameters from the JSON reach the
+    //       dispatcher exactly once.
+    #[test]
+    fn run_test_dispatches_the_configured_selection() {
+        static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        fn record(backend: &str, test: &str, params: &serde_json::Value) -> bool {
+            SEEN.lock()
+                .push(alloc::format!("{backend}/{test}/{params}"));
+            true
+        }
+        run_test(
+            &config(r#"{"backend":"hv","test":"t1","params":{"n":2}}"#),
+            record,
+        );
+        assert_eq!(*SEEN.lock(), [r#"hv/t1/{"n":2}"#]);
+    }
+
+    // Test: Run from an unpatched config region.
+    // Expected: The run stops with the "missing or invalid" message instead of
+    //       dispatching a default selection.
+    #[test]
+    #[should_panic(expected = "TMK config missing or invalid")]
+    fn run_test_rejects_an_unpatched_config() {
+        run_test(&OpenTmkConfig::new(), |_, _, _| true);
+    }
+
+    // Test: Run a well-formed config naming a selection the dispatcher rejects,
+    //       and a config whose length exceeds the payload buffer.
+    // Expected: An unknown selection is reported by name; an oversized length
+    //       is treated as invalid rather than reading past the buffer.
+    #[test]
+    #[should_panic(expected = "unknown backend/test: 'hv'/'nope'")]
+    fn run_test_reports_unknown_selections() {
+        let mut oversized = config(r#"{"backend":"a","test":"b"}"#);
+        oversized.json_len = ((OPENTMK_CONFIG_JSON_SIZE + 1) as u32).into();
+        assert!(oversized.parse().is_none());
+        run_test(&config(r#"{"backend":"hv","test":"nope"}"#), |_, _, _| {
+            false
+        });
+    }
+}
