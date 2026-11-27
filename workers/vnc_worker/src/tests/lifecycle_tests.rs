@@ -187,3 +187,42 @@ fn client_limit_policy_preserves_the_right_connection_and_keyboard_input() {
         join.join().unwrap().unwrap();
     }
 }
+
+// Test: Send an unsupported client message while another VNC client is active.
+// Expected: Only the malformed connection closes; the other client still gets
+// exact framebuffer data and forwards pointer input through the worker.
+#[test]
+fn malformed_client_message_does_not_disconnect_other_clients() {
+    let mut fixture = Fixture::new();
+    fixture
+        .mapping
+        .write_at(0, &pixel(0x12, 0x34, 0x56))
+        .unwrap();
+    let address = fixture.params.listener.local_addr().unwrap();
+    let worker = VncWorker::<TcpListener>::new(fixture.params).unwrap();
+    let (send, receive) = mesh::channel();
+    let join = thread::spawn(move || worker.run(receive));
+    let mut malformed = Client::connect(address);
+    let mut active = Client::connect(address);
+    malformed.stream.write_all(&[0x7f]).unwrap();
+    let mut byte = [0];
+    match malformed.stream.read(&mut byte) {
+        Ok(0) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("malformed client should close, got {other:?}"),
+    }
+    active.send_update_request(false);
+    let update = active.read_update();
+    assert_eq!(&update[0].payload[..4], &pixel(0x12, 0x34, 0x56));
+    active.send_pointer_event(1, 15, 15);
+    match wait_for_input(&mut fixture.input_recv) {
+        InputData::Mouse(MouseData {
+            button_mask: 1,
+            x: 0x7fff,
+            y: 0x7fff,
+        }) => {}
+        other => panic!("unexpected input after malformed client: {other:?}"),
+    }
+    send.send(WorkerRpc::Stop);
+    join.join().unwrap().unwrap();
+}
