@@ -13,5 +13,9 @@ petri_artifacts_core.workspace = true
 linkme.workspace = true
 serde = { workspace = true, features = ["std", "derive"] }
 
+[dev-dependencies]
+serde_json.workspace = true
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

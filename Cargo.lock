@@ -7019,6 +7019,8 @@ dependencies = [
  "petri_artifacts_common",
  "petri_artifacts_core",
  "serde",
+ "serde_json",
+ "test_with_tracing",
 ]
 
 [[package]]

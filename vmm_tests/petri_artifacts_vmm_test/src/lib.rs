@@ -1113,3 +1113,166 @@ pub mod vmm_test_images_macro_support {
     #[linkme::distributed_slice]
     pub static VMM_TEST_IMAGES: [ErasedVmmTestImage];
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use test_with_tracing::test;
+
+    // Test: Inspect every registered downloadable test image.
+    // Expected: IDs, filenames and download names are each unique and nonempty,
+    //       sizes are nonzero, and the registry is not empty, so lookups by any
+    //       key cannot silently select the wrong image.
+    #[test]
+    fn registered_images_have_unique_nonempty_keys() {
+        let images = vmm_test_images();
+        assert!(!images.is_empty());
+        for key in [
+            ErasedVmmTestImage::global_unique_id as fn(&ErasedVmmTestImage) -> &'static str,
+            ErasedVmmTestImage::filename,
+            ErasedVmmTestImage::name,
+        ] {
+            let values: Vec<_> = images.iter().map(key).collect();
+            assert!(values.iter().all(|v| !v.is_empty()));
+            assert_eq!(
+                values.iter().collect::<BTreeSet<_>>().len(),
+                values.len(),
+                "{values:?}"
+            );
+        }
+        // Download names and filenames are both accepted by the CLI parser, so
+        // one image's name must never equal another image's filename.
+        for a in images {
+            for b in images {
+                if a != b {
+                    assert_ne!(a.name(), b.filename(), "{a:?} vs {b:?}");
+                }
+            }
+            assert!(a.file_size() > 0, "{a:?}");
+        }
+    }
+
+    // Test: Parse and look up every image by download name, filename and ID,
+    //       and look up unknown or differently cased values.
+    // Expected: Each key resolves to the same image; unknown or case-changed
+    //       values are rejected rather than matching a different image.
+    #[test]
+    fn every_lookup_key_resolves_to_the_same_image() {
+        for image in vmm_test_images() {
+            assert_eq!(parse_vmm_test_image(image.name()).unwrap(), *image);
+            assert_eq!(parse_vmm_test_image(image.filename()).unwrap(), *image);
+            assert_eq!(
+                vmm_test_image_from_id(image.global_unique_id()).unwrap(),
+                *image
+            );
+            assert_eq!(
+                vmm_test_image_from_filename(image.filename()).unwrap(),
+                *image
+            );
+            let upper = image.filename().to_uppercase();
+            if upper != image.filename() {
+                assert!(parse_vmm_test_image(&upper).is_err());
+            }
+        }
+        assert_eq!(
+            parse_vmm_test_image("no-such-image").unwrap_err(),
+            "invalid image name"
+        );
+        assert!(vmm_test_image_from_id("").is_none());
+        assert!(vmm_test_image_from_filename("").is_none());
+    }
+
+    // Test: Serialize every image to JSON and back, and deserialize unknown IDs.
+    // Expected: Images serialize as their global ID and round-trip exactly; an
+    //       unknown ID fails with the offending value in the error.
+    #[test]
+    fn images_round_trip_through_serialized_ids() {
+        for image in vmm_test_images() {
+            let json = serde_json::to_string(image).unwrap();
+            assert_eq!(
+                json,
+                serde_json::to_string(image.global_unique_id()).unwrap()
+            );
+            assert_eq!(
+                serde_json::from_str::<ErasedVmmTestImage>(&json).unwrap(),
+                *image
+            );
+        }
+        let error = serde_json::from_str::<ErasedVmmTestImage>("\"bogus-id\"").unwrap_err();
+        assert!(
+            error.to_string().contains("invalid artifact id: bogus-id"),
+            "{error}"
+        );
+        assert!(serde_json::from_str::<ErasedVmmTestImage>("7").is_err());
+    }
+
+    // Test: Derive blob URLs for every image and compare typed handles with
+    //       their erased forms.
+    // Expected: Blob-capable URLs point at the configured container and end with
+    //       the image filename; erased and typed handles compare equal by ID.
+    #[test]
+    fn blob_urls_and_handle_equality_follow_registered_identity() {
+        let prefix = blob_storage_prefix();
+        for image in vmm_test_images() {
+            match image.url() {
+                Some(url) => {
+                    assert!(image.supports_blob_disk());
+                    assert_eq!(url, format!("{prefix}{}", image.filename()));
+                }
+                None => assert!(!image.supports_blob_disk()),
+            }
+        }
+        let handle = artifacts::test_vhd::GEN1_WINDOWS_DATA_CENTER_CORE2022_X64;
+        let erased = ErasedVmmTestImage::from(handle);
+        assert!(erased == handle);
+        assert!(erased == handle.erase());
+        assert_eq!(format!("{erased:?}"), erased.global_unique_id());
+        let mut sorted = vmm_test_images().to_vec();
+        sorted.sort();
+        assert!(
+            sorted
+                .windows(2)
+                .all(|w| w[0].global_unique_id() < w[1].global_unique_id())
+        );
+    }
+
+    // Test: Compare prepared images with their source images, and the FreeBSD
+    //       VHD with the FreeBSD installer ISO of the same release.
+    // Expected: Derived images report the same OS flavor, architecture and
+    //       per-backend boot quirks as their source, so preparation cannot drift.
+    #[test]
+    fn derived_images_inherit_source_identity_and_quirks() {
+        use artifacts::test_iso;
+        use artifacts::test_vhd::*;
+        use petri_artifacts_common::tags::IsTestIso;
+        use petri_artifacts_common::tags::IsTestVhd;
+
+        fn vhd<T: IsTestVhd>() -> String {
+            format!("{:?} {:?} {:?}", T::OS_FLAVOR, T::ARCH, T::quirks())
+        }
+        assert_eq!(
+            vhd::<GEN2_WINDOWS_DATA_CENTER_CORE2025_X64_PREPPED>(),
+            vhd::<GEN2_WINDOWS_DATA_CENTER_CORE2025_X64>()
+        );
+        assert_eq!(
+            vhd::<GEN2_WINDOWS_DATA_CENTER_CORE2022_X64_NO_VMBUS_PREPPED>(),
+            vhd::<GEN2_WINDOWS_DATA_CENTER_CORE2022_X64>()
+        );
+        assert_eq!(
+            vhd::<FREE_BSD_13_2_X64>(),
+            format!(
+                "{:?} {:?} {:?}",
+                test_iso::FREE_BSD_13_2_X64::OS_FLAVOR,
+                test_iso::FREE_BSD_13_2_X64::ARCH,
+                test_iso::FREE_BSD_13_2_X64::quirks()
+            )
+        );
+    }
+
+    fn blob_storage_prefix() -> String {
+        artifacts::blob_storage_url()
+            .trim_end_matches('*')
+            .to_owned()
+    }
+}
