@@ -1031,6 +1031,31 @@ mod failure_summary {
             assert_eq!(excerpt, vec!["[ERROR] [     petri] kept".to_owned()]);
         }
 
+        // Test: Read a valid warning, an invalid UTF-8 line, then a later error.
+        // Expected: The encoding failure stops the excerpt while preserving
+        //       earlier diagnostics; reading does not resume after the failure.
+        #[test_with_tracing::test]
+        fn excerpt_stops_at_encoding_error_and_preserves_prior_diagnostics() {
+            let mut jsonl = entry("WARN", "petri", "before").into_bytes();
+            jsonl.extend_from_slice(b"\n\xff\n");
+            jsonl.extend_from_slice(entry("ERROR", "petri", "after").as_bytes());
+            assert_eq!(
+                excerpt_from_petri_jsonl(jsonl.as_slice()),
+                ["[ WARN] [     petri] before"]
+            );
+        }
+
+        // Test: Collapse and truncate a diagnostic that crosses the character
+        //       limit with multibyte text rather than ASCII.
+        // Expected: All 300 retained characters stay intact, followed by one
+        //       ellipsis; byte length does not prematurely shorten the reason.
+        #[test_with_tracing::test]
+        fn failure_reason_limit_preserves_complete_multibyte_characters() {
+            let input = format!("  {}\n", "\u{00e9}".repeat(301));
+            let expected = format!("{}\u{2026}", "\u{00e9}".repeat(300));
+            assert_eq!(one_line(&input), expected);
+        }
+
         #[test]
         fn excerpt_is_truncated_to_the_tail() {
             let jsonl = (0..MAX_EXCERPT_LINES + 5)

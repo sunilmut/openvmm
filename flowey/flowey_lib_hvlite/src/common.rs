@@ -304,3 +304,38 @@ impl CommonTriple {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use test_with_tracing::test;
+
+    // IGNORED: Equality distinguishes the enum variants, but ordering compares
+    //       only the rendered triple. Unequal targets therefore collide in an
+    //       ordered collection. Keep the regression without a production fix.
+    //
+    // Test: Group common and custom representations of the same build target.
+    // Expected: Ordered grouping retains exactly the identities distinguished
+    //       by equality, rather than silently dropping an unequal target.
+    #[test]
+    #[ignore = "CommonTriple ordering and equality disagree for common/custom aliases"]
+    fn ordered_target_grouping_agrees_with_equality() {
+        for common in [
+            CommonTriple::X86_64_LINUX_GNU,
+            CommonTriple::AARCH64_WINDOWS_MSVC,
+        ] {
+            let custom = CommonTriple::Custom(common.as_triple());
+            let mut identities = Vec::new();
+            let mut ordered = BTreeSet::new();
+            for target in [common, custom] {
+                let distinct = !identities.contains(&target);
+                assert_eq!(ordered.insert(target.clone()), distinct);
+                if distinct {
+                    identities.push(target);
+                }
+            }
+            assert_eq!(ordered.len(), identities.len());
+        }
+    }
+}

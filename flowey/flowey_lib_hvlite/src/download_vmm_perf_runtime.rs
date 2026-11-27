@@ -207,4 +207,24 @@ mod tests {
         assert!(format!("{error:#}").contains("SHA-256 mismatch"));
         Ok(())
     }
+
+    // Test: Verify an archive that crosses the hash reader's 64 KiB buffer,
+    //       then modify the trailing byte beyond that first buffer.
+    // Expected: The independent full-file digest passes; trailing corruption
+    //       fails verification even though the entire first buffer is unchanged.
+    #[test_with_tracing::test]
+    fn runtime_digest_includes_bytes_after_the_first_read_buffer() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join("runtime");
+        let mut contents = vec![b'a'; 65_537];
+        contents[65_536] = b'b';
+        std::fs::write(&archive, &contents).unwrap();
+        let expected = "935bf57d7f52181f095c3a3484b68e542037e287f7cde4ffe8a32896d428a1b1";
+        verify_sha256(&archive, expected).unwrap();
+
+        contents[65_536] = b'c';
+        std::fs::write(&archive, &contents).unwrap();
+        let error = verify_sha256(&archive, expected).unwrap_err();
+        assert!(error.to_string().contains("SHA-256 mismatch"));
+    }
 }
