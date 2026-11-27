@@ -53,3 +53,46 @@ pub enum PowerRequest {
         vp: u32,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mesh::payload::decode;
+    use mesh::payload::encode;
+    use test_with_tracing::test;
+
+    // Test: Deliver serialized power requests through original and cloned clients.
+    // Expected: Every request arrives exactly once with its kind and fault VP
+    //       intact after the original is dropped; the final client releases
+    //       the delivery channel.
+    #[test]
+    fn cloned_clients_preserve_serialized_power_request_delivery() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let client = PowerRequestClient::from(move |request| sender.send(request).unwrap());
+        let survivor = client.clone();
+        let requests = [
+            PowerRequest::PowerOff,
+            PowerRequest::Reset,
+            PowerRequest::Hibernate,
+            PowerRequest::TripleFault { vp: 0 },
+            PowerRequest::TripleFault { vp: u32::MAX },
+        ];
+        for request in &requests[..3] {
+            client.power_request(decode(&encode(*request)).unwrap());
+        }
+        drop(client);
+        for request in &requests[3..] {
+            let delivered = decode(&encode(*request)).unwrap();
+            let peer = survivor.clone();
+            std::thread::spawn(move || peer.power_request(delivered))
+                .join()
+                .unwrap();
+        }
+        drop(survivor);
+        assert_eq!(receiver.try_iter().collect::<Vec<_>>(), requests);
+        assert_eq!(
+            receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        );
+    }
+}
