@@ -528,3 +528,47 @@ pub struct Gpadl<'a> {
     pub range_count: u32,
     pub range_buffer: &'a [u64],
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn gpadl_marshalling_preserves_ids_count_offset_and_payload() {
+        let payload = [0x8877665544332211u64, 0xffeeddccbbaa0099];
+        let mut buffer = Vec::new();
+        VmbusProxy::add_gpadl(
+            &mut buffer,
+            0x0102030405060708,
+            0x11223344,
+            1,
+            payload.as_bytes(),
+        );
+        assert_eq!(
+            buffer,
+            [
+                8, 7, 6, 5, 4, 3, 2, 1, 0x44, 0x33, 0x22, 0x11, 1, 0, 0, 0, 24, 0, 0, 0, 16, 0, 0,
+                0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ]
+        );
+    }
+
+    #[test]
+    fn appended_gpadls_keep_record_relative_offsets_and_existing_prefix() {
+        let prefix = [0xa5; size_of::<proxyioctl::VMBUS_PROXY_RESTORE_CHANNEL_INPUT>()];
+        let mut buffer = prefix.to_vec();
+        VmbusProxy::add_gpadl(&mut buffer, 0, 7, 0, &[]);
+        VmbusProxy::add_gpadl(&mut buffer, 0, 8, 1, &[0xff; 8]);
+        assert_eq!(&buffer[..prefix.len()], &prefix);
+        assert_eq!(
+            &buffer[prefix.len()..],
+            &[
+                0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 24, 0, 0, 0, 8, 0, 0, 0, 0xff, 0xff, 0xff,
+                0xff, 0xff, 0xff, 0xff, 0xff,
+            ]
+        );
+    }
+}

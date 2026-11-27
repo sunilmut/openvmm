@@ -10911,6 +10911,7 @@ dependencies = [
  "pal",
  "pal_async",
  "pal_event",
+ "test_with_tracing",
  "tracing",
  "vmbus_core",
  "widestring",
