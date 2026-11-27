@@ -216,6 +216,38 @@ pub(crate) fn unmap(
 mod tests {
     use super::*;
     use std::os::windows::io::AsHandle;
+    use test_with_tracing::test;
+
+    #[test]
+    fn unmap_preserves_advertised_granularity_and_large_limits() {
+        for (flags, behavior) in [
+            (0x80, UnmapBehavior::Unspecified),
+            (0xff, UnmapBehavior::Zeroes),
+        ] {
+            let provisioning = scsi::VpdLogicalBlockProvisioningPage {
+                flags,
+                ..FromZeros::new_zeroed()
+            };
+            let limits = scsi::VpdBlockLimitsDescriptor {
+                max_unmap_lba_count: u32::MAX.into(),
+                max_unmap_block_descriptor_count: 2.into(),
+                optimal_unmap_granularity: 128.into(),
+                ..FromZeros::new_zeroed()
+            };
+            let cap = UnmapCapabilities::from_vpd(&provisioning, &limits);
+            assert_eq!(cap.behavior, behavior);
+            assert_eq!(cap.max_sectors, u32::MAX);
+            assert_eq!(cap.optimal_sectors, 128);
+        }
+    }
+
+    #[test]
+    fn oversized_cdb_is_rejected_before_transport() {
+        let file = tempfile::tempfile().unwrap();
+        let error = command(file.as_handle(), &mut [0x12; 256], &mut [], true, 0).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), "SCSI CDB too long");
+    }
 
     #[test]
     fn unmap_requires_advertised_support_and_limits() {
