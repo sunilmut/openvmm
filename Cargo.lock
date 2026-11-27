@@ -3493,6 +3493,7 @@ dependencies = [
  "inspect",
  "page_pool_alloc",
  "sparse_mmap",
+ "test_with_tracing",
 ]
 
 [[package]]

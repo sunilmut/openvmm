@@ -61,3 +61,45 @@ impl PoolSource for HclMapper {
         self.fd.get().as_fd()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // IGNORED: Requires an OpenHCL Linux environment with read/write access to
+    //       /dev/mshv_vtl_low. Ordinary host Linux cannot construct the mapper.
+    //
+    // Test: Translate private-pool addresses through the real mapper.
+    // Expected: The guest bias is zero and file offsets preserve each address.
+    #[test]
+    #[ignore = "requires read/write access to /dev/mshv_vtl_low"]
+    fn private_pool_offsets_preserve_guest_addresses() -> anyhow::Result<()> {
+        let mapper = HclMapper::new_private()?;
+        assert_eq!(mapper.address_bias(), 0);
+        for address in [0, 0x2000, 0x0000_ffff_ffff_f000] {
+            assert_eq!(mapper.file_offset(address), address);
+        }
+        Ok(())
+    }
+
+    // IGNORED: Requires an OpenHCL Linux environment with read/write access to
+    //       /dev/mshv_vtl_low. Ordinary host Linux cannot construct the mapper.
+    //
+    // Test: Translate shared-pool offsets with a nonzero guest address bias.
+    // Expected: Offsets select shared memory without adding the guest bias.
+    #[test]
+    #[ignore = "requires read/write access to /dev/mshv_vtl_low"]
+    fn shared_pool_offsets_do_not_double_apply_guest_bias() -> anyhow::Result<()> {
+        let mapper = HclMapper::new_shared(0x4000_0000_0000)?;
+        assert_eq!(mapper.address_bias(), 0x4000_0000_0000);
+        for (address, offset) in [
+            (0, 0x8000_0000_0000_0000),
+            (0x2000, 0x8000_0000_0000_2000),
+            (0x0000_ffff_ffff_f000, 0x8000_ffff_ffff_f000),
+        ] {
+            assert_eq!(mapper.file_offset(address), offset);
+        }
+        Ok(())
+    }
+}
