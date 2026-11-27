@@ -2233,3 +2233,112 @@ mod tests {
         assert_eq!(buf, read_buf);
     }
 }
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+    use pal_async::async_test;
+
+    // Test: Parse every named file ID through its debug name, plus numeric IDs,
+    //       lower-case names and values that do not fit in 32 bits.
+    // Expected: Every named constant round-trips to the same ID, numbers map to
+    //       raw IDs, and unknown or oversized text is rejected instead of guessed.
+    #[test]
+    fn file_ids_round_trip_names_and_reject_unknown_text() {
+        let named = [
+            FileId::FILE_TABLE,
+            FileId::BIOS_NVRAM,
+            FileId::TPM_PPI,
+            FileId::TPM_NVRAM,
+            FileId::RTC_SKEW,
+            FileId::ATTEST,
+            FileId::KEY_PROTECTOR,
+            FileId::VM_UNIQUE_ID,
+            FileId::GUEST_FIRMWARE,
+            FileId::CUSTOM_UEFI,
+            FileId::GUEST_WATCHDOG,
+            FileId::HW_KEY_PROTECTOR,
+            FileId::GUEST_SECRET_KEY,
+            FileId::HIBERNATION_TOKEN,
+            FileId::PLATFORM_SEED,
+            FileId::PROVENANCE_DOC,
+            FileId::TPM_NVRAM_BACKUP,
+            FileId::EXTENDED_FILE_TABLE,
+            FileId::TPM_185_NVRAM,
+            FileId::LSTORACCEL_CREDENTIAL_STORE,
+        ];
+        for id in named {
+            assert_eq!(parse_file_id(&format!("{id:?}")).unwrap(), id, "{id:?}");
+        }
+        assert_eq!(parse_file_id("1").unwrap(), FileId::BIOS_NVRAM);
+        assert_eq!(parse_file_id("4294967295").unwrap(), FileId(u32::MAX));
+        for bad in ["bios_nvram", "4294967296", "-1", "", "0x1"] {
+            assert!(parse_file_id(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    // Test: Validate VMGS file sizes at zero, around the VHD footer size and
+    //       around the 4 GiB maximum; parse encryption algorithm names.
+    // Expected: Zero, sub-footer and over-maximum sizes fail with the offending
+    //       size; boundaries pass; only the exact AES_GCM name is accepted.
+    #[test]
+    fn size_bounds_and_algorithm_names_are_exact() {
+        let max = 4 * ONE_GIGA_BYTE;
+        assert!(matches!(validate_size(0), Err(Error::ZeroSize)));
+        let footer = VHD_DISK_FOOTER_PACKED_SIZE;
+        assert!(
+            matches!(validate_size(footer - 1), Err(Error::InvalidVmgsFileSize(n, _)) if n == footer - 1)
+        );
+        assert!(validate_size(footer).is_ok());
+        assert!(validate_size(max).is_ok());
+        assert!(
+            matches!(validate_size(max + 1), Err(Error::InvalidVmgsFileSize(n, _)) if n == max + 1)
+        );
+
+        assert!(matches!(
+            parse_encryption_algorithm("AES_GCM"),
+            Ok(EncryptionAlgorithm::AES_GCM)
+        ));
+        for bad in ["aes_gcm", "NONE", "AES_GCM ", ""] {
+            assert!(parse_encryption_algorithm(bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(extract_version(vmgs_format::VMGS_VERSION_3_0), "3.0");
+    }
+
+    // Test: Read encryption keys that are missing, one byte short, one byte
+    //       long and exactly sized from an owned temporary directory.
+    // Expected: Missing files report a key-file error, wrong sizes report the
+    //       expected and actual sizes, and an exact key is returned unchanged.
+    #[test]
+    fn key_files_require_exact_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("key.bin");
+        assert!(matches!(read_key_path(&path), Err(Error::KeyFile(_))));
+        for len in [VMGS_ENCRYPTION_KEY_SIZE - 1, VMGS_ENCRYPTION_KEY_SIZE + 1] {
+            std::fs::write(&path, vec![7; len]).unwrap();
+            assert!(matches!(
+                read_key_path(&path),
+                Err(Error::InvalidKeySize(e, a)) if e == VMGS_ENCRYPTION_KEY_SIZE as u64 && a == len as u64
+            ));
+        }
+        let key: Vec<u8> = (0..VMGS_ENCRYPTION_KEY_SIZE as u8).collect();
+        std::fs::write(&path, &key).unwrap();
+        assert_eq!(read_key_path(&path).unwrap().to_vec(), key);
+    }
+
+    // Test: Query encryption status of a freshly created unencrypted VMGS file.
+    // Expected: The documented stable result for an unencrypted file is the
+    //       NotEncrypted error rather than success or an unknown status.
+    #[async_test]
+    async fn query_encryption_reports_plain_file_as_not_encrypted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.vmgs");
+        tests::test_vmgs_create(&path, None, false, None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            vmgs_file_query_encryption(&path).await,
+            Err(Error::NotEncrypted)
+        ));
+    }
+}
