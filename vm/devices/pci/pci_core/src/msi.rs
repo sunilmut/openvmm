@@ -392,6 +392,7 @@ mod tests {
     use pal_event::Event;
     use parking_lot::Mutex;
     use std::collections::VecDeque;
+    use test_with_tracing::test;
 
     /// A [`SignalMsi`] mock that records `(devid, address, data)`.
     struct RecordingSignalMsi {
@@ -479,6 +480,8 @@ mod tests {
         )
     }
 
+    // Test: Signal an MSI without an explicit requester override.
+    // Expected: Secondary bus, function offset, address and data are delivered.
     #[test]
     fn signal_msi_resolves_default_rid() {
         let bus_range = AssignedBusRange::new();
@@ -497,6 +500,8 @@ mod tests {
         assert_eq!(data, 42);
     }
 
+    // Test: Signal an MSI with an explicit requester on an assigned bus.
+    // Expected: The supplied requester, address and data reach the controller.
     #[test]
     fn signal_msi_with_rid_accepts_bus_in_range() {
         let bus_range = AssignedBusRange::new();
@@ -517,6 +522,8 @@ mod tests {
         assert_eq!(data, 99);
     }
 
+    // Test: Signal MSIs from buses below and above the assigned range.
+    // Expected: Neither request reaches the interrupt controller.
     #[test]
     fn signal_msi_with_rid_drops_bus_outside_range() {
         let bus_range = AssignedBusRange::new();
@@ -540,6 +547,8 @@ mod tests {
         assert!(recorder.pop().is_none());
     }
 
+    // Test: Signal MSIs from both inclusive boundaries of the assigned range.
+    // Expected: Each exact requester/address/data tuple is delivered once.
     #[test]
     fn signal_msi_with_rid_accepts_boundary_buses() {
         let bus_range = AssignedBusRange::new();
@@ -552,15 +561,19 @@ mod tests {
         msi_conn
             .msi_target(bus_range.clone(), 0)
             .signal_msi_with_rid(5 << 8, 0x1000, 10);
-        assert!(recorder.pop().is_some());
+        assert_eq!(recorder.pop(), Some((Some(5 << 8), 0x1000, 10)));
+        assert!(recorder.pop().is_none());
 
         // Exactly at subordinate bus (10)
         msi_conn
             .msi_target(bus_range, 0)
             .signal_msi_with_rid(10 << 8, 0x2000, 20);
-        assert!(recorder.pop().is_some());
+        assert_eq!(recorder.pop(), Some((Some(10 << 8), 0x2000, 20)));
+        assert!(recorder.pop().is_none());
     }
 
+    // Test: Enable an irqfd route without an explicit requester override.
+    // Expected: Its sole enable record contains the resolved default RID.
     #[test]
     fn route_enable_resolves_default_rid() {
         let bus_range = AssignedBusRange::new();
@@ -588,6 +601,8 @@ mod tests {
         );
     }
 
+    // Test: Enable an irqfd route with an explicit in-range requester.
+    // Expected: The route receives exactly that RID, address and data.
     #[test]
     fn route_enable_with_rid_accepts_bus_in_range() {
         let bus_range = AssignedBusRange::new();
@@ -616,6 +631,8 @@ mod tests {
         );
     }
 
+    // Test: Enable an irqfd route using a requester outside its assigned buses.
+    // Expected: The backend route is disabled instead of enabled.
     #[test]
     fn route_enable_with_rid_disables_when_bus_outside_range() {
         let bus_range = AssignedBusRange::new();
@@ -638,6 +655,8 @@ mod tests {
         assert_eq!(log[0], RouteCall::Disable);
     }
 
+    // Test: Derive an MSI target with a new device/function number.
+    // Expected: Its delivered RID combines the original bus and new function.
     #[test]
     fn with_devfn_derives_target_with_new_devfn() {
         let bus_range = AssignedBusRange::new();
@@ -653,6 +672,8 @@ mod tests {
         assert_eq!(devid, Some((2 << 8) | 0x18));
     }
 
+    // Test: Derive an MSI target onto a child bus range and new function.
+    // Expected: Its default RID uses the child range and parent-only buses fail.
     #[test]
     fn with_bus_range_derives_target_with_new_range() {
         let parent_range = AssignedBusRange::new();
@@ -677,6 +698,8 @@ mod tests {
         assert!(recorder.pop().is_none()); // bus 16 > subordinate 15
     }
 
+    // Test: Signal through a target with a fixed in-range requester override.
+    // Expected: The override RID and supplied payload reach the controller.
     #[test]
     fn with_rid_signal_msi_accepts_bus_in_range() {
         let bus_range = AssignedBusRange::new();
@@ -696,6 +719,8 @@ mod tests {
         assert_eq!(data, 7);
     }
 
+    // Test: Signal through targets whose fixed requester buses are out of range.
+    // Expected: Neither override can deliver an MSI.
     #[test]
     fn with_rid_signal_msi_drops_bus_outside_range() {
         let bus_range = AssignedBusRange::new();
@@ -715,6 +740,8 @@ mod tests {
         assert!(recorder.pop().is_none());
     }
 
+    // Test: Enable a route from a target with an out-of-range fixed requester.
+    // Expected: The backend receives one disable operation and no enable.
     #[test]
     fn with_rid_route_enable_disables_when_bus_outside_range() {
         let bus_range = AssignedBusRange::new();

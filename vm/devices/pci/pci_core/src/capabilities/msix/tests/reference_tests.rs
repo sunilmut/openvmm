@@ -8,6 +8,9 @@ use super::read_cap_u32;
 use super::write_cap_u32;
 use test_with_tracing::test;
 
+// IGNORED: The known function-mask regression still delivers masked interrupts.
+//       Keep the failing requirement until a separately authorized fix lands.
+//
 // Test: Set the MSI-X function mask after proving that an unmasked vector delivers.
 // Expected: Function masking suppresses delivery and clearing it replays one pending MSI.
 #[test]

@@ -240,6 +240,7 @@ mod tests {
     use crate::msi::SignalMsi;
     use parking_lot::Mutex;
     use std::sync::Arc;
+    use test_with_tracing::test;
 
     /// Records the requester IDs signaled through an `MsiTarget`, so tests
     /// can observe the MSI identity derived by `with_rid_offset`.
@@ -288,14 +289,22 @@ mod tests {
         }
     }
 
+    // Test: Construct a DMA target with shared memory and no IOMMU backend.
+    // Expected: Passthrough is allowed and supplied memory remains shared.
     #[test]
     fn new_has_no_iommu() {
         let msi_conn = MsiConnection::new();
-        let target = DmaTarget::new(AssignedBusRange::new(), 0, GuestMemory::empty(), &msi_conn);
+        let memory = GuestMemory::allocate(0x1000);
+        let target = DmaTarget::new(AssignedBusRange::new(), 0, memory.clone(), &msi_conn);
         assert!(matches!(target.passthrough(), DmaPassthrough::Allowed));
-        assert!(target.iommu.is_none());
+        target.guest_memory().write_at(0, &[0x5a]).unwrap();
+        let mut byte = [0];
+        memory.read_at(0, &mut byte).unwrap();
+        assert_eq!(byte, [0x5a]);
     }
 
+    // Test: Derive a DMA target with a requester offset and no IOMMU backend.
+    // Expected: Memory is shared and the signaled MSI uses the derived RID.
     #[test]
     fn with_rid_offset_no_iommu_shares_memory_and_updates_msi() {
         let bus_range = AssignedBusRange::new();
@@ -322,6 +331,8 @@ mod tests {
         assert_eq!(recorder.pop().unwrap(), (5 << 8) | 0x18);
     }
 
+    // Test: Derive a DMA target through two successive requester offsets.
+    // Expected: The resulting MSI identity contains their accumulated offset.
     #[test]
     fn with_rid_offset_stacks() {
         let bus_range = AssignedBusRange::new();
@@ -338,6 +349,8 @@ mod tests {
         assert_eq!(recorder.pop().unwrap(), (5 << 8) | 0x18);
     }
 
+    // Test: Derive a software-IOMMU target with a new requester offset.
+    // Expected: The factory supplies usable memory and MSI uses the same RID.
     #[test]
     fn with_rid_offset_iommu_derives_memory_and_msi_together() {
         let bus_range = AssignedBusRange::new();
@@ -373,6 +386,8 @@ mod tests {
         assert_eq!(recorder.pop().unwrap(), (5 << 8) | 0x18);
     }
 
+    // Test: Derive an IOMMU target whose requester offset crosses bus numbers.
+    // Expected: Factory offset and delivered MSI identity agree on bus seven.
     #[test]
     fn with_rid_offset_iommu_cross_bus() {
         let bus_range = AssignedBusRange::new();
@@ -412,6 +427,8 @@ mod tests {
         id: u32,
     }
 
+    // Test: Derive a DMA target with an opaque hardware-nesting context.
+    // Expected: Both targets expose the same typed context through passthrough.
     #[test]
     fn with_nestable_iommu_exposes_downcastable_handle() {
         let bus_range = AssignedBusRange::new();

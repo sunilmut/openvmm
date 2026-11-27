@@ -5,6 +5,8 @@
 
 use crate::capabilities::PciCapability;
 use crate::capabilities::extended::PciExtendedCapability;
+use crate::cfg_space_emu::CommonHeaderResult;
+use crate::cfg_space_emu::ConfigSpaceCommonHeaderEmulator;
 use crate::cfg_space_emu::ConfigSpaceType0Emulator;
 use crate::cfg_space_emu::ConfigSpaceType1Emulator;
 use crate::msi::SignalMsi;
@@ -105,6 +107,32 @@ impl TestCfgAccess for ConfigSpaceType1Emulator {
             ByteEnabledDwordWrite::with_all_bytes_enabled(value),
         )
         .unwrap();
+    }
+}
+
+impl<const N: usize> TestCfgAccess for ConfigSpaceCommonHeaderEmulator<N> {
+    fn read_u32(&self, offset: u16) -> u32 {
+        assert!(offset.is_multiple_of(4));
+        let mut value = 0;
+        assert!(matches!(
+            self.read(
+                PciConfigAddress::new(0, 0, offset / 4).unwrap(),
+                ByteEnabledDwordRead::with_all_bytes_enabled(&mut value),
+            ),
+            CommonHeaderResult::Handled
+        ));
+        value
+    }
+
+    fn write_u32(&mut self, offset: u16, value: u32) {
+        assert!(offset.is_multiple_of(4));
+        assert!(matches!(
+            self.write(
+                PciConfigAddress::new(0, 0, offset / 4).unwrap(),
+                ByteEnabledDwordWrite::with_all_bytes_enabled(value),
+            ),
+            CommonHeaderResult::Handled
+        ));
     }
 }
 

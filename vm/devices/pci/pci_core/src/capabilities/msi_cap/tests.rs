@@ -9,10 +9,14 @@ use crate::test_helpers::read_cap_u32;
 use crate::test_helpers::write_cap_u32;
 use test_with_tracing::test;
 
+// Test: Program a 64-bit MSI capability, enable two messages, and reset it.
+// Expected: Capability bits remain fixed while address/data and enable reset.
 #[test]
 fn msi_check() {
     let msi_conn = MsiConnection::new();
-    let mut cap = MsiCapability::new(2, true, false, &msi_conn.target()); // 4 messages max, 64-bit, no masking
+    let addr_64bit = true;
+    let per_vector_masking = false;
+    let mut cap = MsiCapability::new(2, addr_64bit, per_vector_masking, &msi_conn.target());
     let msi_controller = TestPciInterruptController::new();
     msi_conn.connect(msi_controller.signal_msi());
 
@@ -46,10 +50,14 @@ fn msi_check() {
     assert_eq!(read_cap_u32(&cap, 12), 0);
 }
 
+// Test: Program the address and data of a 32-bit MSI capability.
+// Expected: The capability lacks the 64-bit flag and data uses offset eight.
 #[test]
 fn msi_32bit_check() {
     let msi_conn = MsiConnection::new();
-    let mut cap = MsiCapability::new(1, false, false, &msi_conn.target()); // 2 messages max, 32-bit, no masking
+    let addr_64bit = false;
+    let per_vector_masking = false;
+    let mut cap = MsiCapability::new(1, addr_64bit, per_vector_masking, &msi_conn.target());
     let msi_controller = TestPciInterruptController::new();
     msi_conn.connect(msi_controller.signal_msi());
 
@@ -64,12 +72,16 @@ fn msi_32bit_check() {
     assert_eq!(read_cap_u32(&cap, 8), 0x1234);
 }
 
+// Test: Save a configured 64-bit MSI capability, reset it, then restore.
+// Expected: Both address halves, data and enabled message count are recovered.
 #[test]
 fn test_msi_save_restore() {
     use vmcore::save_restore::SaveRestore;
 
     let msi_conn = MsiConnection::new();
-    let mut cap = MsiCapability::new(2, true, false, &msi_conn.target()); // 4 messages max, 64-bit, no masking
+    let addr_64bit = true;
+    let per_vector_masking = false;
+    let mut cap = MsiCapability::new(2, addr_64bit, per_vector_masking, &msi_conn.target());
     let msi_controller = TestPciInterruptController::new();
     msi_conn.connect(msi_controller.signal_msi());
 
@@ -105,19 +117,24 @@ fn test_msi_save_restore() {
     assert_eq!(read_cap_u32(&cap, 12), 0x5678);
 }
 
+// Test: Save and restore supported fields of a 32-bit masking-capable MSI.
+// Expected: Address, data, enable and message count survive later changes.
 #[test]
 fn test_msi_save_restore_32bit_with_masking() {
     use vmcore::save_restore::SaveRestore;
 
     let msi_conn = MsiConnection::new();
-    let mut cap = MsiCapability::new(3, false, true, &msi_conn.target()); // 8 messages max, 32-bit, with masking
+    let addr_64bit = false;
+    let per_vector_masking = true;
+    let mut cap = MsiCapability::new(3, addr_64bit, per_vector_masking, &msi_conn.target());
     let msi_controller = TestPciInterruptController::new();
     msi_conn.connect(msi_controller.signal_msi());
 
     // Configure MSI capability with specific values
     write_cap_u32(&mut cap, 4, 0x87654321); // Address (32-bit)
     write_cap_u32(&mut cap, 8, 0x1234); // Data
-    write_cap_u32(&mut cap, 12, 0xaaaabbbb); // Mask bits (for per-vector masking)
+    // This implementation does not expose the 32-bit mask offset.
+    write_cap_u32(&mut cap, 12, 0xaaaabbbb);
     write_cap_u32(&mut cap, 0, 0x00210001); // Enable MSI with MME=2 (4 messages)
 
     // Verify initial state
@@ -156,12 +173,16 @@ fn test_msi_save_restore_32bit_with_masking() {
     assert_eq!(read_cap_u32(&cap, 8), 0x1234);
 }
 
+// Test: Request more MSI messages than supported and checkpoint the result.
+// Expected: The clamped message count, route data and enable survive restore.
 #[test]
 fn test_msi_save_restore_mme_clamping() {
     use vmcore::save_restore::SaveRestore;
 
     let msi_conn = MsiConnection::new();
-    let mut cap = MsiCapability::new(1, true, false, &msi_conn.target()); // Only 2 messages max (MMC=1)
+    let addr_64bit = true;
+    let per_vector_masking = false;
+    let mut cap = MsiCapability::new(1, addr_64bit, per_vector_masking, &msi_conn.target());
     let msi_controller = TestPciInterruptController::new();
     msi_conn.connect(msi_controller.signal_msi());
 
@@ -203,12 +224,14 @@ fn test_msi_save_restore_mme_clamping() {
 #[test]
 fn live_reprogramming_and_restore_control_actual_msi_delivery() {
     use vmcore::save_restore::SaveRestore;
-    for wide in [false, true] {
+    for addr_64bit in [false, true] {
         let connection = MsiConnection::new();
         let controller = TestPciInterruptController::new();
         connection.connect(controller.signal_msi());
-        let mut capability = MsiCapability::new(0, wide, false, &connection.target());
-        let data_offset = if wide { 12 } else { 8 };
+        let per_vector_masking = false;
+        let mut capability =
+            MsiCapability::new(0, addr_64bit, per_vector_masking, &connection.target());
+        let data_offset = if addr_64bit { 12 } else { 8 };
         write_cap_u32(&mut capability, 4, 0xfee00000);
         write_cap_u32(&mut capability, data_offset, 0x41);
         write_cap_u32(&mut capability, 0, 0x00010000);
@@ -216,11 +239,11 @@ fn live_reprogramming_and_restore_control_actual_msi_delivery() {
         interrupt.deliver();
         assert_eq!(controller.get_next_interrupt(), Some((0xfee00000, 0x41)));
         write_cap_u32(&mut capability, 4, 0xfee01000);
-        if wide {
+        if addr_64bit {
             write_cap_u32(&mut capability, 8, 1);
         }
         write_cap_u32(&mut capability, data_offset, 0x51);
-        let address = if wide { 0x1fee01000 } else { 0xfee01000 };
+        let address = if addr_64bit { 0x1fee01000 } else { 0xfee01000 };
         interrupt.deliver();
         assert_eq!(controller.get_next_interrupt(), Some((address, 0x51)));
         let enabled = capability.save().unwrap();
@@ -247,7 +270,10 @@ fn invalid_checkpoint_preserves_existing_msi_route() {
     let connection = MsiConnection::new();
     let controller = TestPciInterruptController::new();
     connection.connect(controller.signal_msi());
-    let mut capability = MsiCapability::new(0, true, false, &connection.target());
+    let addr_64bit = true;
+    let per_vector_masking = false;
+    let mut capability =
+        MsiCapability::new(0, addr_64bit, per_vector_masking, &connection.target());
     write_cap_u32(&mut capability, 4, 0xfee02000);
     write_cap_u32(&mut capability, 12, 0x61);
     write_cap_u32(&mut capability, 0, 0x00010000);
@@ -262,16 +288,26 @@ fn invalid_checkpoint_preserves_existing_msi_route() {
     assert_eq!(controller.get_next_interrupt(), None);
 }
 
-// Test: Read and write the mask registers of a 64-bit per-vector-mask capability.
-// Expected: Masks round-trip, pending bits stay read-only, and capability size is 24 bytes.
+// Test: Write and checkpoint a 64-bit MSI mask while attempting pending-bit writes.
+// Expected: Mask bits survive restoration and pending bits remain read-only.
 #[test]
 fn mask_registers_preserve_writes_and_pending_bits_are_read_only() {
+    use vmcore::save_restore::SaveRestore;
     let connection = MsiConnection::new();
-    let mut capability = MsiCapability::new(2, true, true, &connection.target());
+    let addr_64bit = true;
+    let per_vector_masking = true;
+    let mut capability =
+        MsiCapability::new(2, addr_64bit, per_vector_masking, &connection.target());
     assert_eq!(capability.len(), 24);
     assert_eq!(read_cap_u32(&capability, 16), u32::MAX);
     write_cap_u32(&mut capability, 16, 0xa5a55a5a);
     assert_eq!(read_cap_u32(&capability, 16), 0xa5a55a5a);
     write_cap_u32(&mut capability, 20, u32::MAX);
+    assert_eq!(read_cap_u32(&capability, 20), 0);
+    let saved = capability.save().unwrap();
+    write_cap_u32(&mut capability, 16, 0);
+    assert_eq!(read_cap_u32(&capability, 16), 0);
+    capability.restore(saved).unwrap();
+    assert_eq!(read_cap_u32(&capability, 16), 0xa5a55a5a);
     assert_eq!(read_cap_u32(&capability, 20), 0);
 }

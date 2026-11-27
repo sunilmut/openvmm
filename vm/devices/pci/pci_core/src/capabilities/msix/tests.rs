@@ -69,6 +69,8 @@ fn table_and_pending_array_locations_are_read_only() {
     assert_eq!(read_cap_u32(&capability, 0), 0x003f0011);
 }
 
+// Test: Program the first and last MSI-X entries and update pending bits.
+// Expected: Capability locations, vector fields and both PBA words stay distinct.
 #[test]
 fn msix_check() {
     let msi_conn = MsiConnection::new();
@@ -192,6 +194,8 @@ fn mock_irqfd(
     )
 }
 
+// Test: Program a masked MSI-X vector and then unmask it.
+// Expected: Its exact route is enabled once without modifying the other vector.
 #[test]
 fn route_set_msi_on_unmask() {
     let (irqfd, calls) = mock_irqfd(2);
@@ -224,16 +228,22 @@ fn route_set_msi_on_unmask() {
 
     // Unmask vector 0 (write control = 0).
     calls[0].lock().clear();
+    calls[1].lock().clear();
     msix.write_u32(12, 0);
 
     // Should have called set_msi to re-establish the route.
-    let log = calls[0].lock().clone();
-    assert!(log.contains(&RouteCall::SetMsi {
-        address: 0xFEE00000,
-        data: 0x42
-    }));
+    assert_eq!(
+        *calls[0].lock(),
+        [RouteCall::SetMsi {
+            address: 0xFEE00000,
+            data: 0x42
+        }]
+    );
+    assert!(calls[1].lock().is_empty());
 }
 
+// Test: Mask an enabled MSI-X vector after clearing earlier route records.
+// Expected: Its route is disabled once and the other vector is untouched.
 #[test]
 fn route_mask_on_vector_mask() {
     let (irqfd, calls) = mock_irqfd(2);
@@ -255,14 +265,17 @@ fn route_mask_on_vector_mask() {
     msix.write_u32(12, 0); // unmask
 
     calls[0].lock().clear();
+    calls[1].lock().clear();
 
     // Mask vector 0 (write control = 1).
     msix.write_u32(12, 1);
 
-    let log = calls[0].lock().clone();
-    assert!(log.contains(&RouteCall::ClearMsi));
+    assert_eq!(*calls[0].lock(), [RouteCall::ClearMsi]);
+    assert!(calls[1].lock().is_empty());
 }
 
+// Test: Disable MSI-X globally with two programmed unmasked vectors.
+// Expected: Each vector's route receives exactly one disable operation.
 #[test]
 fn route_global_disable_masks_all() {
     let (irqfd, calls) = mock_irqfd(2);
@@ -291,10 +304,12 @@ fn route_global_disable_masks_all() {
     write_cap_u32(&mut cap, 0, 0);
 
     // Both vectors should have been disabled.
-    assert!(calls[0].lock().contains(&RouteCall::ClearMsi));
-    assert!(calls[1].lock().contains(&RouteCall::ClearMsi));
+    assert_eq!(*calls[0].lock(), [RouteCall::ClearMsi]);
+    assert_eq!(*calls[1].lock(), [RouteCall::ClearMsi]);
 }
 
+// Test: Signal one masked irqfd vector and read its pending-bit array twice.
+// Expected: Only that vector's pending bit remains set across both reads.
 #[test]
 fn route_consume_pending_on_pba_read() {
     let (irqfd, _calls) = mock_irqfd(2);
@@ -319,9 +334,12 @@ fn route_consume_pending_on_pba_read() {
     let pba = msix.read_u32(32);
 
     // consume_pending drains the event; PBA bit 0 should be set.
-    assert_eq!(pba & 1, 1);
+    assert_eq!(pba, 1);
+    assert_eq!(msix.read_u32(32), 1);
 }
 
+// Test: Change the data of an already unmasked MSI-X vector.
+// Expected: Exactly one route update carries its unchanged address and new data.
 #[test]
 fn route_set_msi_on_addr_data_change_while_unmasked() {
     let (irqfd, calls) = mock_irqfd(1);
@@ -344,11 +362,13 @@ fn route_set_msi_on_addr_data_change_while_unmasked() {
     // Change data while still unmasked.
     msix.write_u32(8, 0x99);
 
-    let log = calls[0].lock().clone();
-    assert!(log.contains(&RouteCall::SetMsi {
-        address: 0xFEE00000,
-        data: 0x99
-    }));
+    assert_eq!(
+        *calls[0].lock(),
+        [RouteCall::SetMsi {
+            address: 0xFEE00000,
+            data: 0x99
+        }]
+    );
 }
 
 // Test: Trigger a masked vector repeatedly, unmask it, then disable and re-enable.

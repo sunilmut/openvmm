@@ -106,6 +106,8 @@ fn poll_write_token(token: &mut DeferredToken) -> Poll<Result<(), IoError>> {
     token.poll_write(&mut cx)
 }
 
+// Test: Read only the high word from a successful configuration callback.
+// Expected: The address is forwarded once and disabled bytes keep their sentinel.
 #[test]
 fn immediate_read_applies_byte_enable() {
     let mut handler = PciBusCfgAccessHandler::new();
@@ -122,6 +124,8 @@ fn immediate_read_applies_byte_enable() {
     assert_eq!(buffer, 0x1122_ffff);
 }
 
+// Test: Return InvalidRegister from an immediate configuration read.
+// Expected: The same error reaches the caller after one callback.
 #[test]
 fn immediate_read_error_is_returned() {
     let mut handler = PciBusCfgAccessHandler::new();
@@ -138,6 +142,8 @@ fn immediate_read_error_is_returned() {
     assert_eq!(callbacks.reads, vec![addr]);
 }
 
+// Test: Complete a deferred configuration read with only the high word enabled.
+// Expected: The outer token returns the two selected bytes in wire order.
 #[test]
 fn deferred_read_applies_byte_enable() {
     let mut handler = PciBusCfgAccessHandler::new();
@@ -162,6 +168,8 @@ fn deferred_read_applies_byte_enable() {
     assert_eq!(read_data, [0x22, 0x11]);
 }
 
+// Test: Complete a deferred configuration read with NoResponse.
+// Expected: The outer token completes with that error rather than data.
 #[test]
 fn deferred_read_error_completes_outer_read_with_error() {
     let mut handler = PciBusCfgAccessHandler::new();
@@ -184,6 +192,8 @@ fn deferred_read_error_completes_outer_read_with_error() {
     ));
 }
 
+// Test: Write a single enabled byte through the configuration handler.
+// Expected: The masked value is forwarded once without a read-modify-write.
 #[test]
 fn partial_writes_do_not_read_for_write() {
     let mut handler = PciBusCfgAccessHandler::new();
@@ -199,6 +209,8 @@ fn partial_writes_do_not_read_for_write() {
     assert_eq!(callbacks.writes, vec![(addr, 0x0000_aa00)]);
 }
 
+// Test: Reject a byte-enabled write in the immediate callback.
+// Expected: The masked write reaches the callback and InvalidRegister survives.
 #[test]
 fn immediate_write_error_is_returned() {
     let mut handler = PciBusCfgAccessHandler::new();
@@ -216,6 +228,8 @@ fn immediate_write_error_is_returned() {
     assert_eq!(callbacks.writes, vec![(addr, 0x0000_aa00)]);
 }
 
+// Test: Complete a deferred configuration write successfully.
+// Expected: Polling the outer token reports success after completion.
 #[test]
 fn deferred_writes_complete_outer_write() {
     let mut handler = PciBusCfgAccessHandler::new();
@@ -236,6 +250,8 @@ fn deferred_writes_complete_outer_write() {
     ));
 }
 
+// Test: Complete a deferred configuration write with NoResponse.
+// Expected: Polling the outer token reports the same failure.
 #[test]
 fn deferred_write_error_completes_outer_write_with_error() {
     let mut handler = PciBusCfgAccessHandler::new();

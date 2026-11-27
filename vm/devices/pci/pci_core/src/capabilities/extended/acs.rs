@@ -149,8 +149,11 @@ mod tests {
     use crate::capabilities::extended::assert_extended_header_contract;
     use crate::test_helpers::read_extended_cap_u32;
     use crate::test_helpers::write_extended_cap_u32;
+    use test_with_tracing::test;
     use vmcore::save_restore::SaveRestore;
 
+    // Test: Read a newly constructed ACS capability and its extended header.
+    // Expected: Identity, size, supported features and disabled controls agree.
     #[test]
     fn test_acs_defaults() {
         let cap = AcsExtendedCapability::new();
@@ -166,6 +169,8 @@ mod tests {
         assert_eq!((caps_ctl >> 16) as u16, 0);
     }
 
+    // Test: Write every ACS control bit, including unsupported features.
+    // Expected: Only advertised capability bits become enabled controls.
     #[test]
     fn test_acs_control_write_masks_unsupported_bits() {
         let mut cap = AcsExtendedCapability::new();
@@ -180,6 +185,8 @@ mod tests {
         assert_eq!((caps_ctl >> 16) as u16, DEFAULT_ACS_CAP_MASK);
     }
 
+    // Test: Enable supported ACS controls and reset the capability.
+    // Expected: All control bits return to zero.
     #[test]
     fn test_acs_reset_clears_control() {
         let mut cap = AcsExtendedCapability::new();
@@ -195,6 +202,8 @@ mod tests {
         assert_eq!((caps_ctl >> 16) as u16, 0);
     }
 
+    // Test: Save enabled ACS controls, reset, and restore the checkpoint.
+    // Expected: Reset clears controls and restoration recovers supported bits.
     #[test]
     fn test_acs_save_restore() {
         let mut cap = AcsExtendedCapability::new();

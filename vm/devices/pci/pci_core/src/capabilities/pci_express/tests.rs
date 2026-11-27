@@ -45,6 +45,8 @@ impl Inspect for TestFlrHandler {
     }
 }
 
+// Test: Read ARI support on downstream ports, an upstream port and an endpoint.
+// Expected: Only downstream-facing ports advertise ARI forwarding.
 #[test]
 fn test_ari_forwarding_supported_by_port_type() {
     // ARI Forwarding Supported (Device Capabilities 2, bit 5 / 0x20) must be
@@ -63,6 +65,8 @@ fn test_ari_forwarding_supported_by_port_type() {
     }
 }
 
+// Test: Set and clear a root port's ARI forwarding control.
+// Expected: Both the public accessor and register follow the guest writes.
 #[test]
 fn test_ari_forwarding_enable_is_guest_writable() {
     let mut cap = PciExpressCapability::new(DevicePortType::RootPort, None);
@@ -80,6 +84,8 @@ fn test_ari_forwarding_enable_is_guest_writable() {
     assert!(!cap.ari_forwarding_enable());
 }
 
+// Test: Advertise each supported maximum number of end-to-end TLP prefixes.
+// Expected: Support bits and the prefix-count encoding match the configuration.
 #[test]
 fn test_tlp_prefixing_supported_max_prefixes() {
     for max_prefixes in [
@@ -102,6 +108,8 @@ fn test_tlp_prefixing_supported_max_prefixes() {
     }
 }
 
+// Test: Read an endpoint capability with function-level reset support.
+// Expected: Header identity, FLR support, control defaults and link agree.
 #[test]
 fn test_pci_express_capability_read_endpoint() {
     let flr_handler = TestFlrHandler::new();
@@ -131,6 +139,8 @@ fn test_pci_express_capability_read_endpoint() {
     assert_eq!(link_ctl_sts_val, (expected_link_status as u32) << 16); // Link status is in upper 16 bits
 }
 
+// Test: Read the header of a root-port PCIe capability.
+// Expected: Its wire identity, version and port type identify a root port.
 #[test]
 fn test_pci_express_capability_read_root_port() {
     let cap = PciExpressCapability::new(DevicePortType::RootPort, None);
@@ -142,6 +152,8 @@ fn test_pci_express_capability_read_root_port() {
     assert_eq!((caps_val >> 16) & 0xFFFF, 0x0042); // PCIe Caps: Version 2, Device/Port Type 4
 }
 
+// Test: Encode reserved PCIe speeds, widths and an unknown device port type.
+// Expected: Unknown wire values round-trip without coercion or panic.
 #[test]
 fn test_pcie_open_enums_preserve_reserved_values() {
     assert_eq!(LinkSpeed::from_bits(0).into_bits(), 0);
@@ -157,6 +169,8 @@ fn test_pcie_open_enums_preserve_reserved_values() {
     assert_eq!(capabilities.device_port_type(), unknown_port_type);
 }
 
+// Test: Read an endpoint configured without a function-level reset handler.
+// Expected: The device capability does not advertise FLR.
 #[test]
 fn test_pci_express_capability_read_no_flr() {
     let cap = PciExpressCapability::new(DevicePortType::Endpoint, None);
@@ -166,6 +180,8 @@ fn test_pci_express_capability_read_no_flr() {
     assert_eq!(device_caps_val & PCI_EXPRESS_DEVICE_CAPS_FLR_BIT_MASK, 0);
 }
 
+// Test: Supply an FLR handler to a root port and write the reset bit.
+// Expected: FLR remains unadvertised and the handler is not invoked.
 #[test]
 fn test_flr_is_only_advertised_by_endpoints() {
     let flr_handler = TestFlrHandler::new();
@@ -243,6 +259,8 @@ fn non_hotplug_ports_ignore_hotplug_notifications() {
     assert!(!capability.hot_plug_interrupt_enabled());
 }
 
+// Test: Write endpoint controls and repeatedly request function-level reset.
+// Expected: Ordinary controls persist, each FLR invokes its handler and clears.
 #[test]
 fn test_pci_express_capability_write_device_control() {
     let flr_handler = TestFlrHandler::new();
@@ -276,6 +294,8 @@ fn test_pci_express_capability_write_device_control() {
     assert!(flr_handler.was_flr_initiated()); // Should trigger because FLR transitioned from 0 to 1
 }
 
+// Test: Write all ones to unimplemented PCIe status registers.
+// Expected: Every unimplemented status field continues to read zero.
 #[test]
 fn test_unimplemented_status_registers_ignore_writes() {
     let mut cap = PciExpressCapability::new(DevicePortType::Endpoint, None);
@@ -293,6 +313,8 @@ fn test_unimplemented_status_registers_ignore_writes() {
     assert_eq!(read_cap_u32(&cap, 0x38), 0);
 }
 
+// Test: Write all control bits on a root port and endpoint.
+// Expected: Only each device type's supported control fields remain set.
 #[test]
 fn test_unsupported_control_fields_ignore_all_ones_write() {
     let mut root_port = PciExpressCapability::new(DevicePortType::RootPort, None);
@@ -318,6 +340,8 @@ fn test_unsupported_control_fields_ignore_all_ones_write() {
     assert_eq!(read_cap_u32(&endpoint, 0x28), 0);
 }
 
+// Test: Write one enabled byte of endpoint device control.
+// Expected: Disabled control bytes survive and status remains read-only.
 #[test]
 fn test_pci_express_capability_byte_write_control() {
     let mut cap = PciExpressCapability::new(DevicePortType::Endpoint, None);
@@ -346,6 +370,8 @@ fn test_pci_express_capability_byte_write_control() {
     assert_eq!(status_after, 0);
 }
 
+// Test: Write the link register while observing device control.
+// Expected: The write does not corrupt the neighboring control register.
 #[test]
 fn test_pci_express_capability_write_unhandled_offset() {
     let mut cap = PciExpressCapability::new(DevicePortType::Endpoint, None);
@@ -356,6 +382,8 @@ fn test_pci_express_capability_write_unhandled_offset() {
     assert_eq!(read_cap_u32(&cap, 0x08), 0x2810);
 }
 
+// Test: Reset a modified root port that still has a physically present device.
+// Expected: Guest controls reset without removing physical presence or link.
 #[test]
 fn test_pci_express_capability_reset() {
     let mut cap = PciExpressCapability::new(DevicePortType::RootPort, None).with_hotplug_support(1);
@@ -366,7 +394,7 @@ fn test_pci_express_capability_reset() {
 
     // Verify state is set
     let device_ctl_sts = read_cap_u32(&cap, 0x08);
-    assert_ne!(device_ctl_sts, 0);
+    assert_eq!(device_ctl_sts, 0x0001);
     let slot_status = pci_express::SlotStatus::from_bits((read_cap_u32(&cap, 0x18) >> 16) as u16);
     let link_status = pci_express::LinkStatus::from_bits((read_cap_u32(&cap, 0x10) >> 16) as u16);
     assert_eq!(slot_status.presence_detect_state(), 1);
@@ -385,6 +413,8 @@ fn test_pci_express_capability_reset() {
     assert!(link_status.data_link_layer_link_active());
 }
 
+// Test: Read every extended PCIe register on a default endpoint.
+// Expected: Link advertisements, target speed and unsupported fields agree.
 #[test]
 fn test_pci_express_capability_extended_registers() {
     let cap = PciExpressCapability::new(DevicePortType::Endpoint, None);
@@ -417,18 +447,24 @@ fn test_pci_express_capability_extended_registers() {
     assert_eq!(read_cap_u32(&cap, 0x38), 0); // Slot Control/Status 2
 }
 
+// Test: Query the space occupied by a PCIe capability.
+// Expected: The layout occupies sixty bytes for capability-chain placement.
 #[test]
 fn test_pci_express_capability_length() {
     let cap = PciExpressCapability::new(DevicePortType::Endpoint, None);
     assert_eq!(cap.len(), 0x3C); // Should be 60 bytes (0x3C)
 }
 
+// Test: Query the PCIe capability's checkpoint identity label.
+// Expected: Its stable label is pci-express.
 #[test]
 fn test_pci_express_capability_label() {
     let cap = PciExpressCapability::new(DevicePortType::Endpoint, None);
     assert_eq!(cap.label(), "pci-express");
 }
 
+// Test: Enable hotplug on both supported downstream-facing port types.
+// Expected: Guest-visible slot flags and numbers change only with hotplug.
 #[test]
 fn test_pci_express_capability_with_hotplug_support() {
     // Test with RootPort (should work)
@@ -440,13 +476,16 @@ fn test_pci_express_capability_with_hotplug_support() {
     assert_eq!(cap_with_hotplug.len(), 0x3C);
 
     // Verify hotplug capabilities are set
-    assert!(cap_with_hotplug.slot_capabilities.hot_plug_surprise());
-    assert!(cap_with_hotplug.slot_capabilities.hot_plug_capable());
-    assert_eq!(cap_with_hotplug.slot_capabilities.physical_slot_number(), 1);
+    assert!(cap_with_hotplug.slot_capabilities().hot_plug_surprise());
+    assert!(cap_with_hotplug.slot_capabilities().hot_plug_capable());
+    assert_eq!(
+        cap_with_hotplug.slot_capabilities().physical_slot_number(),
+        1
+    );
 
     // Verify that slot_implemented is set in PCIe capabilities
     assert!(
-        cap_with_hotplug.pcie_capabilities.slot_implemented(),
+        read_cap_u32(&cap_with_hotplug, 0) & (1 << 24) != 0,
         "slot_implemented should be true when hotplug is enabled"
     );
 
@@ -454,27 +493,29 @@ fn test_pci_express_capability_with_hotplug_support() {
     let cap2 = PciExpressCapability::new(DevicePortType::DownstreamSwitchPort, None);
     let cap2_with_hotplug = cap2.with_hotplug_support(2);
 
-    assert!(cap2_with_hotplug.slot_capabilities.hot_plug_surprise());
-    assert!(cap2_with_hotplug.slot_capabilities.hot_plug_capable());
+    assert!(cap2_with_hotplug.slot_capabilities().hot_plug_surprise());
+    assert!(cap2_with_hotplug.slot_capabilities().hot_plug_capable());
     assert_eq!(
-        cap2_with_hotplug.slot_capabilities.physical_slot_number(),
+        cap2_with_hotplug.slot_capabilities().physical_slot_number(),
         2
     );
 
     // Verify that slot_implemented is set for downstream switch port too
     assert!(
-        cap2_with_hotplug.pcie_capabilities.slot_implemented(),
+        read_cap_u32(&cap2_with_hotplug, 0) & (1 << 24) != 0,
         "slot_implemented should be true when hotplug is enabled"
     );
 
     // Test that non-hotplug capability doesn't have slot_implemented set
     let cap_no_hotplug = PciExpressCapability::new(DevicePortType::RootPort, None);
     assert!(
-        !cap_no_hotplug.pcie_capabilities.slot_implemented(),
+        read_cap_u32(&cap_no_hotplug, 0) & (1 << 24) == 0,
         "slot_implemented should be false when hotplug is not enabled"
     );
 }
 
+// Test: Request hotplug configuration on an endpoint.
+// Expected: The internal configuration invariant rejects that unsupported mode.
 #[test]
 #[should_panic(expected = "Hotplug support is not valid for device port type Endpoint")]
 fn test_pci_express_capability_with_hotplug_support_endpoint_panics() {
@@ -482,6 +523,8 @@ fn test_pci_express_capability_with_hotplug_support_endpoint_panics() {
     cap.with_hotplug_support(1);
 }
 
+// Test: Request hotplug configuration on an upstream-facing switch port.
+// Expected: The internal configuration invariant rejects that unsupported mode.
 #[test]
 #[should_panic(expected = "Hotplug support is not valid for device port type UpstreamSwitchPort")]
 fn test_pci_express_capability_with_hotplug_support_upstream_panics() {
@@ -489,21 +532,13 @@ fn test_pci_express_capability_with_hotplug_support_upstream_panics() {
     cap.with_hotplug_support(1);
 }
 
+// Test: Set all slot controls on a normally configured hotplug root port.
+// Expected: Advertised event controls work and unsupported hardware controls do not.
 #[test]
 fn test_slot_control_write_protection() {
     // Create a root port capability with hotplug support but limited slot capabilities
     let mut cap = PciExpressCapability::new(DevicePortType::RootPort, None);
     cap = cap.with_hotplug_support(1);
-
-    // Modify slot capabilities to disable some features for testing
-    cap.slot_capabilities.set_attention_button_present(false);
-    cap.slot_capabilities.set_power_controller_present(false);
-    cap.slot_capabilities.set_mrl_sensor_present(false);
-    cap.slot_capabilities.set_attention_indicator_present(false);
-    cap.slot_capabilities.set_power_indicator_present(false);
-    cap.slot_capabilities
-        .set_electromechanical_interlock_present(false);
-    cap.slot_capabilities.set_no_command_completed_support(true);
 
     // Try to write to slot control register with all bits set
     let slot_ctl_sts_offset = 0x18; // SLOT_CTL_STS offset
@@ -563,6 +598,8 @@ fn test_slot_control_write_protection() {
     assert!(slot_control.data_link_layer_state_changed_enable());
 }
 
+// Test: Request link retraining and then write a supported ASPM control.
+// Expected: Retraining reads clear while the ordinary control remains writable.
 #[test]
 fn test_link_control_retrain_link_behavior() {
     // Test that retrain_link always reads as 0 regardless of what is written
@@ -601,6 +638,8 @@ fn test_link_control_retrain_link_behavior() {
     );
 }
 
+// Test: Write Link Disable while a downstream device remains physically present.
+// Expected: The intentionally read-only control cannot disable the active link.
 #[test]
 fn test_link_disable_is_read_only() {
     let mut cap = PciExpressCapability::new(DevicePortType::RootPort, None);
@@ -616,6 +655,8 @@ fn test_link_disable_is_read_only() {
     );
 }
 
+// Test: Compare link advertisements with and without hotplug support.
+// Expected: Hotplug adds link-active reporting without changing speed or width.
 #[test]
 fn test_hotplug_link_capabilities() {
     // Test that Data Link Layer Link Active Reporting is enabled with hotplug
@@ -656,6 +697,8 @@ fn test_hotplug_link_capabilities() {
     );
 }
 
+// Test: Write every link-status bit alongside a valid link-control change.
+// Expected: Physical status survives while the writable control changes.
 #[test]
 fn test_link_status_read_only() {
     // Test that Link Status register is read-only and cannot be modified by writes
@@ -720,6 +763,8 @@ fn test_link_status_read_only() {
     );
 }
 
+// Test: Acknowledge hotplug event latches independently through RW1C writes.
+// Expected: Only selected events clear and physical presence remains unchanged.
 #[test]
 fn test_slot_status_rw1c_behavior() {
     // Create a root port capability with hotplug support
@@ -765,6 +810,8 @@ fn test_slot_status_rw1c_behavior() {
     assert!(!status.data_link_layer_state_changed());
 }
 
+// Test: Write supported and unsupported target link-speed encodings.
+// Expected: Target values persist without changing negotiated speed or width.
 #[test]
 fn test_link_control_2_target_speed_validation() {
     // Target Link Speed is guest control state. Current Link Speed reports
@@ -857,6 +904,8 @@ fn test_link_control_2_target_speed_validation() {
     );
 }
 
+// Test: Configure hotplug slots numbered zero, five and 255 on supported ports.
+// Expected: Each public slot capability reports its configured slot number.
 #[test]
 fn test_with_hotplug_support_slot_number() {
     // Test that slot numbers are properly set when enabling hotplug support
@@ -865,9 +914,9 @@ fn test_with_hotplug_support_slot_number() {
     let cap1 = PciExpressCapability::new(DevicePortType::RootPort, None);
     let cap1_with_hotplug = cap1.with_hotplug_support(5);
 
-    assert!(cap1_with_hotplug.slot_capabilities.hot_plug_capable());
+    assert!(cap1_with_hotplug.slot_capabilities().hot_plug_capable());
     assert_eq!(
-        cap1_with_hotplug.slot_capabilities.physical_slot_number(),
+        cap1_with_hotplug.slot_capabilities().physical_slot_number(),
         5
     );
 
@@ -875,9 +924,9 @@ fn test_with_hotplug_support_slot_number() {
     let cap2 = PciExpressCapability::new(DevicePortType::DownstreamSwitchPort, None);
     let cap2_with_hotplug = cap2.with_hotplug_support(0);
 
-    assert!(cap2_with_hotplug.slot_capabilities.hot_plug_capable());
+    assert!(cap2_with_hotplug.slot_capabilities().hot_plug_capable());
     assert_eq!(
-        cap2_with_hotplug.slot_capabilities.physical_slot_number(),
+        cap2_with_hotplug.slot_capabilities().physical_slot_number(),
         0
     );
 
@@ -885,13 +934,15 @@ fn test_with_hotplug_support_slot_number() {
     let cap3 = PciExpressCapability::new(DevicePortType::RootPort, None);
     let cap3_with_hotplug = cap3.with_hotplug_support(255);
 
-    assert!(cap3_with_hotplug.slot_capabilities.hot_plug_capable());
+    assert!(cap3_with_hotplug.slot_capabilities().hot_plug_capable());
     assert_eq!(
-        cap3_with_hotplug.slot_capabilities.physical_slot_number(),
+        cap3_with_hotplug.slot_capabilities().physical_slot_number(),
         255
     );
 }
 
+// Test: Read the Slot Implemented wire bit before and after enabling hotplug.
+// Expected: Only the hotplug-capable configuration advertises an implemented slot.
 #[test]
 fn test_slot_implemented_flag_in_pcie_capabilities_register() {
     // Test that slot_implemented bit is correctly set in the PCIe Capabilities register
@@ -918,6 +969,8 @@ fn test_slot_implemented_flag_in_pcie_capabilities_register() {
     );
 }
 
+// Test: Mark a hotplug slot present and then absent through the public setter.
+// Expected: Guest-visible physical presence follows both transitions.
 #[test]
 fn test_set_presence_detect_state() {
     // Test setting presence detect state on a hotplug-capable port
@@ -950,6 +1003,8 @@ fn test_set_presence_detect_state() {
     );
 }
 
+// Test: Change physical link state on a port without an implemented slot.
+// Expected: Link activity follows presence while the slot-presence convention stays.
 #[test]
 fn test_set_presence_detect_state_without_slot_implemented() {
     let cap = PciExpressCapability::new(DevicePortType::RootPort, None);
@@ -975,6 +1030,8 @@ fn test_set_presence_detect_state_without_slot_implemented() {
     );
 }
 
+// Test: Save a newly created endpoint capability.
+// Expected: The public checkpoint contains the defined control and event defaults.
 #[test]
 fn test_save_restore_default_state() {
     use vmcore::save_restore::SaveRestore;
@@ -997,6 +1054,8 @@ fn test_save_restore_default_state() {
     assert_eq!(saved.link_control_2, expected_link_control_2);
 }
 
+// Test: Save a root port after modifying supported control registers.
+// Expected: The public checkpoint records each programmed control value.
 #[test]
 fn test_save_restore_modified_state() {
     use vmcore::save_restore::SaveRestore;
@@ -1022,6 +1081,8 @@ fn test_save_restore_modified_state() {
     assert_eq!(saved.device_control_2, 0x0020);
 }
 
+// Test: Restore programmed root-port controls into a fresh capability.
+// Expected: Device, link and second-generation controls round-trip through reads.
 #[test]
 fn test_save_restore_roundtrip() {
     use vmcore::save_restore::SaveRestore;
@@ -1071,6 +1132,8 @@ fn test_save_restore_roundtrip() {
     );
 }
 
+// Test: Checkpoint a real hotplug event and restore onto an empty destination.
+// Expected: Event latches survive without importing source physical presence.
 #[test]
 fn test_save_restore_with_status_bits() {
     use vmcore::save_restore::SaveRestore;
@@ -1078,16 +1141,7 @@ fn test_save_restore_with_status_bits() {
     let mut cap = PciExpressCapability::new(DevicePortType::RootPort, None);
     cap = cap.with_hotplug_support(1);
 
-    cap.set_presence_detect_state(true);
-
-    // Set a real hardware-produced slot event latch.
-    {
-        let mut state = cap.state.lock();
-        state
-            .registers
-            .slot_status_events
-            .set_presence_detect_changed(true);
-    }
+    cap.set_hotplug_state(true);
 
     // Save the state
     let saved = cap.save().expect("save should succeed");
@@ -1117,6 +1171,8 @@ fn test_save_restore_with_status_bits() {
     );
 }
 
+// Test: Restore a checkpoint with every supported and unsupported field set.
+// Expected: A subsequent checkpoint contains only the supported register masks.
 #[test]
 fn test_restore_masks_unsupported_fields() {
     use vmcore::save_restore::SaveRestore;
@@ -1144,6 +1200,8 @@ fn test_restore_masks_unsupported_fields() {
     assert_eq!(saved2.link_control_2, 0xffbf);
 }
 
+// Test: Reset modified endpoint controls and then save a checkpoint.
+// Expected: Serialized controls and event latches return to their defaults.
 #[test]
 fn test_save_after_reset() {
     use vmcore::save_restore::SaveRestore;

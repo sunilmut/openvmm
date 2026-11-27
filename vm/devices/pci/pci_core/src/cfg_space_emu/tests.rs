@@ -19,10 +19,12 @@ use std::sync::atomic::Ordering;
 use test_with_tracing::test;
 use vmcore::save_restore::SaveRestore;
 
+/// Creates an endpoint with fixed hardware IDs and standard capabilities.
 fn create_type0_emulator(caps: Vec<Box<dyn PciCapability>>) -> ConfigSpaceType0Emulator {
     create_type0_with_extended(caps, vec![])
 }
 
+/// Creates an endpoint with standard and extended capability lists.
 fn create_type0_with_extended(
     caps: Vec<Box<dyn PciCapability>>,
     extended: Vec<Box<dyn PciExtendedCapability>>,
@@ -44,10 +46,12 @@ fn create_type0_with_extended(
     )
 }
 
+/// Creates a bridge with fixed hardware IDs and standard capabilities.
 fn create_type1_emulator(caps: Vec<Box<dyn PciCapability>>) -> ConfigSpaceType1Emulator {
     create_type1_with_extended(caps, vec![])
 }
 
+/// Creates a bridge with standard and extended capability lists.
 fn create_type1_with_extended(
     caps: Vec<Box<dyn PciCapability>>,
     extended: Vec<Box<dyn PciExtendedCapability>>,
@@ -68,6 +72,8 @@ fn create_type1_with_extended(
     )
 }
 
+// Test: Enumerate a bridge with and without a standard capability.
+// Expected: Hardware IDs remain fixed and the capability-list status follows it.
 #[test]
 fn test_type1_probe() {
     let emu = create_type1_emulator(vec![]);
@@ -79,6 +85,8 @@ fn test_type1_probe() {
     assert_eq!(emu.read_u32(4) & 0x10_0000, 0x10_0000); // Capabilities pointer
 }
 
+// Test: Program bridge bus numbers incrementally, together and in reverse order.
+// Expected: Only valid inclusive secondary/subordinate ranges become assigned.
 #[test]
 fn test_type1_bus_number_assignment() {
     let mut emu = create_type1_emulator(vec![]);
@@ -118,6 +126,8 @@ fn test_type1_bus_number_assignment() {
     assert_eq!(emu.assigned_bus_range(), 0..=0);
 }
 
+// Test: Program bridge bus numbers through individual enabled bytes.
+// Expected: Selected bytes change while the reserved fourth byte stays zero.
 #[test]
 fn test_type1_bus_number_byte_writes() {
     let mut emu = create_type1_emulator(vec![]);
@@ -167,6 +177,8 @@ fn test_type1_bus_number_byte_writes() {
     assert_eq!(emu.assigned_bus_range(), 0x22..=0x33);
 }
 
+// Test: Program bridge memory windows while toggling memory decoding.
+// Expected: Valid inclusive windows appear only while decoding is enabled.
 #[test]
 fn test_type1_memory_assignment() {
     const MMIO_ENABLED: u32 = 0x0000_0002;
@@ -207,6 +219,8 @@ fn test_type1_memory_assignment() {
     assert!(emu.assigned_memory_range().is_none());
 }
 
+// Test: Program reserved bits in a bridge memory-window register.
+// Expected: Reserved bits read clear and the decoded window has proper alignment.
 #[test]
 fn test_type1_memory_range_register_masks_reserved_bits() {
     const MMIO_ENABLED: u32 = 0x0000_0002;
@@ -220,6 +234,8 @@ fn test_type1_memory_range_register_masks_reserved_bits() {
     assert_eq!(emu.assigned_memory_range(), Some(0x1230_0000..=0x567f_ffff));
 }
 
+// Test: Program 64-bit bridge prefetch windows with equal and differing upper words.
+// Expected: Complete addresses determine validity and decoding gates the window.
 #[test]
 fn test_type1_prefetch_assignment() {
     const MMIO_ENABLED: u32 = 0x0000_0002;
@@ -274,6 +290,8 @@ fn test_type1_prefetch_assignment() {
     assert!(emu.assigned_prefetch_range().is_none());
 }
 
+// Test: Set reserved bits in the bridge prefetch base/limit register.
+// Expected: Reads advertise 64-bit windows while masking reserved address bits.
 #[test]
 fn test_type1_prefetch_range_register_masks_reserved_bits_and_reports_64_bit() {
     const MMIO_ENABLED: u32 = 0x0000_0002;
@@ -290,18 +308,19 @@ fn test_type1_prefetch_range_register_masks_reserved_bits_and_reports_64_bit() {
     );
 }
 
+// Test: Restore bridge-window checkpoints containing reserved address bits.
+// Expected: Restored registers and assigned ranges expose normalized values.
 #[test]
 fn test_type1_restore_masks_bridge_memory_range_reserved_bits() {
     const MMIO_ENABLED: u32 = 0x0000_0002;
 
     let mut source = create_type1_emulator(vec![]);
     source.write_u32(0x4, MMIO_ENABLED);
-    source.state.memory_base = 0x123f;
-    source.state.memory_limit = 0x567f;
-    source.state.prefetch_base = 0x234e;
-    source.state.prefetch_limit = 0x678e;
-
-    let saved_state = source.save().expect("save should succeed");
+    let mut saved_state = source.save().expect("save should succeed");
+    saved_state.memory_base = 0x123f;
+    saved_state.memory_limit = 0x567f;
+    saved_state.prefetch_base = 0x234e;
+    saved_state.prefetch_limit = 0x678e;
 
     let mut emu = create_type1_emulator(vec![]);
     emu.restore(saved_state).expect("restore should succeed");
@@ -315,6 +334,8 @@ fn test_type1_restore_masks_bridge_memory_range_reserved_bits() {
     );
 }
 
+// Test: Construct bridges with absent, sole and mixed PCIe capabilities.
+// Expected: PCIe identity depends on the capability list rather than its position.
 #[test]
 fn test_type1_is_pcie_device() {
     // Test Type 1 device without PCIe capability
@@ -337,6 +358,8 @@ fn test_type1_is_pcie_device() {
     assert!(emu.is_pcie_device());
 }
 
+// Test: Construct endpoints with absent, sole and mixed PCIe capabilities.
+// Expected: PCIe identity follows the list, including the empty-list case.
 #[test]
 fn test_type0_is_pcie_device() {
     // Test Type 0 device without PCIe capability
@@ -419,6 +442,8 @@ fn test_type0_is_pcie_device() {
     assert!(!emu.is_pcie_device());
 }
 
+// Test: Query the identities used to enumerate PCIe and vendor capabilities.
+// Expected: Each capability returns its protocol-defined identifier.
 #[test]
 fn test_capability_ids() {
     // Test that capabilities return the correct capability IDs
@@ -429,6 +454,8 @@ fn test_capability_ids() {
     assert_eq!(read_only_cap.capability_id(), CapabilityId::VENDOR_SPECIFIC);
 }
 
+// Test: Construct a Type 0 common header with one implemented BAR.
+// Expected: Hardware identity and flags agree and BAR probing returns its size.
 #[test]
 fn test_common_header_emulator_type0() {
     // Test the common header emulator with Type 0 configuration (6 BARs)
@@ -445,16 +472,19 @@ fn test_common_header_emulator_type0() {
 
     let bars = DeviceBars::new().bar0(4096, BarMemoryKind::Dummy);
 
-    let common_emu: ConfigSpaceCommonHeaderEmulatorType0 =
+    let mut common_emu: ConfigSpaceCommonHeaderEmulatorType0 =
         ConfigSpaceCommonHeaderEmulator::new(hardware_ids, vec![], vec![], bars);
 
     assert_eq!(common_emu.hardware_ids().vendor_id, 0x1111);
     assert_eq!(common_emu.hardware_ids().device_id, 0x2222);
     assert!(!common_emu.multi_function_bit());
     assert!(!common_emu.is_pcie_device());
-    assert_ne!(common_emu.bar_masks()[0], 0); // Should have a mask for BAR0
+    common_emu.write_u32(0x10, u32::MAX);
+    assert_eq!(common_emu.read_u32(0x10), 0xffff_f00c);
 }
 
+// Test: Construct a multifunction Type 1 common header with PCIe and a BAR.
+// Expected: Identity persists through reset and its two BAR words probe correctly.
 #[test]
 fn test_common_header_emulator_type1() {
     // Test the common header emulator with Type 1 configuration (2 BARs)
@@ -487,14 +517,18 @@ fn test_common_header_emulator_type1() {
     assert_eq!(common_emu.hardware_ids().device_id, 0x4444);
     assert!(common_emu.multi_function_bit());
     assert!(common_emu.is_pcie_device());
-    assert_ne!(common_emu.bar_masks()[0], 0); // Should have a mask for BAR0
-    assert_eq!(common_emu.bar_masks().len(), 2);
+    common_emu.write_u32(0x10, u32::MAX);
+    common_emu.write_u32(0x14, u32::MAX);
+    assert_eq!(common_emu.read_u32(0x10), 0xffff_f00c);
+    assert_eq!(common_emu.read_u32(0x14), u32::MAX);
 
     // Test reset functionality
     common_emu.reset();
     assert_eq!(common_emu.capabilities().len(), 1); // capabilities should still be there
 }
 
+// Test: Probe every BAR register of an endpoint with no configured BARs.
+// Expected: Hardware IDs survive and every unimplemented BAR reads zero.
 #[test]
 fn test_common_header_emulator_no_bars() {
     // Test the common header emulator with no BARs configured
@@ -512,18 +546,20 @@ fn test_common_header_emulator_no_bars() {
     // Create bars with no BARs configured
     let bars = DeviceBars::new();
 
-    let common_emu: ConfigSpaceCommonHeaderEmulatorType0 =
+    let mut common_emu: ConfigSpaceCommonHeaderEmulatorType0 =
         ConfigSpaceCommonHeaderEmulator::new(hardware_ids, vec![], vec![], bars);
 
     assert_eq!(common_emu.hardware_ids().vendor_id, 0x5555);
     assert_eq!(common_emu.hardware_ids().device_id, 0x6666);
 
-    // All BAR masks should be 0 when no BARs are configured
-    for &mask in common_emu.bar_masks() {
-        assert_eq!(mask, 0);
+    for offset in (0x10..=0x24).step_by(4) {
+        common_emu.write_u32(offset, u32::MAX);
+        assert_eq!(common_emu.read_u32(offset), 0);
     }
 }
 
+// Test: Give a bridge BAR definitions beyond its two supported header words.
+// Expected: Only BAR0 and its upper word are exposed; bridge fields are forwarded.
 #[test]
 fn test_common_header_emulator_type1_ignores_extra_bars() {
     // Test that Type 1 emulator ignores BARs beyond index 1 (only supports 2 BARs)
@@ -544,21 +580,33 @@ fn test_common_header_emulator_type1_ignores_extra_bars() {
         .bar2(8192, BarMemoryKind::Dummy)
         .bar4(16384, BarMemoryKind::Dummy);
 
-    let common_emu: ConfigSpaceCommonHeaderEmulatorType1 =
+    let mut common_emu: ConfigSpaceCommonHeaderEmulatorType1 =
         ConfigSpaceCommonHeaderEmulator::new(hardware_ids, vec![], vec![], bars);
 
     assert_eq!(common_emu.hardware_ids().vendor_id, 0x7777);
     assert_eq!(common_emu.hardware_ids().device_id, 0x8888);
 
     // Should have a mask for BAR0, and BAR1 should be the upper 32 bits (64-bit BAR)
-    assert_ne!(common_emu.bar_masks()[0], 0); // BAR0 should be configured
-    assert_ne!(common_emu.bar_masks()[1], 0); // BAR1 should be upper 32 bits of BAR0
-    assert_eq!(common_emu.bar_masks().len(), 2); // Type 1 only has 2 BARs
+    common_emu.write_u32(0x10, u32::MAX);
+    common_emu.write_u32(0x14, u32::MAX);
+    assert_eq!(common_emu.read_u32(0x10), 0xffff_f00c);
+    assert_eq!(common_emu.read_u32(0x14), u32::MAX);
+    let mut value = 0x5a5a_5a5a;
+    assert!(matches!(
+        common_emu.read(
+            PciConfigAddress::new(0, 0, 0x18 / 4).unwrap(),
+            ByteEnabledDwordRead::with_all_bytes_enabled(&mut value),
+        ),
+        CommonHeaderResult::Unhandled
+    ));
+    assert_eq!(value, 0x5a5a_5a5a);
 
     // BAR2 and higher should be ignored (not accessible in Type 1 with N=2)
     // This demonstrates that extra BARs in DeviceBars are properly ignored
 }
 
+// Test: Access empty extended regions on present PCI and PCIe functions.
+// Expected: Valid accesses are handled as zero/ignored writes; bad offsets fail.
 #[test]
 fn test_common_header_extended_capabilities() {
     // Test common header emulator extended capabilities
@@ -661,6 +709,8 @@ fn test_common_header_extended_capabilities() {
     ));
 }
 
+// Test: Read and write a hole after an implemented standard capability.
+// Expected: The present function reports zero rather than stale or all-one data.
 #[test]
 fn test_unimplemented_capability_region_reads_zero() {
     // Unimplemented registers in the standard capability region of a
@@ -701,6 +751,8 @@ fn test_unimplemented_capability_region_reads_zero() {
     ));
 }
 
+// Test: Read and program an ACS capability through a bridge common header.
+// Expected: The extended header and masked controls appear at their wire offsets.
 #[test]
 fn test_type1_acs_extended_capability() {
     let mut common_emu_pcie = ConfigSpaceCommonHeaderEmulatorType1::new(
@@ -759,6 +811,8 @@ fn test_type1_acs_extended_capability() {
     assert_eq!((value >> 16) as u16, 0x005f);
 }
 
+// Test: Save modified endpoint command bits, reset, then restore.
+// Expected: Reset clears the command bits and restore recovers them.
 #[test]
 fn test_type0_emulator_save_restore() {
     // Test Type 0 emulator save/restore
@@ -789,6 +843,8 @@ fn test_type0_emulator_save_restore() {
     assert_eq!(emu.read_u32(0x04) & 0x0007, 0x0007); // Should be restored
 }
 
+// Test: Checkpoint bridge commands, bus/window assignments and bridge control.
+// Expected: Reset clears state and restoration recovers the programmed registers.
 #[test]
 fn test_type1_emulator_save_restore() {
     // Test Type 1 emulator save/restore
@@ -835,6 +891,8 @@ fn test_type1_emulator_save_restore() {
     assert_eq!(emu.read_u32(0x3C) >> 16, 0x0001); // bridge_control
 }
 
+// Test: Checkpoint a bridge with enabled ACS controls through reset.
+// Expected: Extended capability controls reset and are restored with the bridge.
 #[test]
 fn test_type1_emulator_save_restore_with_extended_capabilities() {
     let mut emu = ConfigSpaceType1Emulator::new(
@@ -869,6 +927,8 @@ fn test_type1_emulator_save_restore_with_extended_capabilities() {
     assert_eq!((emu.read_u32(0x104) >> 16) as u16, 0x005f);
 }
 
+// Test: Forward presence changes through a bridge's hotplug PCIe capability.
+// Expected: Guest-visible slot presence follows present and absent transitions.
 #[test]
 fn test_config_space_type1_set_presence_detect_state() {
     // Test that ConfigSpaceType1Emulator can set presence detect state
@@ -907,18 +967,32 @@ fn test_config_space_type1_set_presence_detect_state() {
     );
 }
 
+// Test: Send presence notifications to a bridge with no PCIe capability.
+// Expected: The notifications are harmless and its configuration stays unchanged.
 #[test]
 fn test_config_space_type1_set_presence_detect_state_without_pcie() {
     // Test that ConfigSpaceType1Emulator silently ignores set_presence_detect_state
     // when there is no PCIe Express capability
 
     let mut emulator = create_type1_emulator(vec![]); // No capabilities
+    let before: Vec<_> = (0..0x100)
+        .step_by(4)
+        .map(|offset| emulator.read_u32(offset))
+        .collect();
 
     // Should not panic and should be silently ignored
-    emulator.set_presence_detect_state(true);
-    emulator.set_presence_detect_state(false);
+    for present in [true, false] {
+        emulator.set_presence_detect_state(present);
+        let after: Vec<_> = (0..0x100)
+            .step_by(4)
+            .map(|offset| emulator.read_u32(offset))
+            .collect();
+        assert_eq!(after, before);
+    }
 }
 
+// Test: Configure interrupt pins A and D and write line/latency registers.
+// Expected: The configured pin is read-only while line and latency remain writable.
 #[test]
 fn test_interrupt_pin_register() {
     use vmcore::line_interrupt::LineInterrupt;
@@ -980,6 +1054,8 @@ fn test_interrupt_pin_register() {
     assert_eq!((emu_d.read_u32(0x3C) >> 8) & 0xFF, 4); // Interrupt pin should be 4 (INTD)
 }
 
+// Test: Compare header-type metadata and guest-visible endpoint/bridge headers.
+// Expected: BAR counts match their types and wire headers identify Type 0 and 1.
 #[test]
 fn test_header_type_functionality() {
     // Test HeaderType enum values
@@ -988,27 +1064,17 @@ fn test_header_type_functionality() {
     assert_eq!(usize::from(HeaderType::Type0), 6);
     assert_eq!(usize::from(HeaderType::Type1), 2);
 
-    // Test constant values
-    assert_eq!(header_type_consts::TYPE0_BAR_COUNT, 6);
-    assert_eq!(header_type_consts::TYPE1_BAR_COUNT, 2);
-
     // Test Type 0 emulator
     let emu_type0 = create_type0_emulator(vec![]);
-    assert_eq!(emu_type0.common.bar_count(), 6);
-    assert_eq!(emu_type0.common.header_type(), HeaderType::Type0);
-    assert!(emu_type0.common.validate_header_type(HeaderType::Type0));
-    assert!(!emu_type0.common.validate_header_type(HeaderType::Type1));
+    assert_eq!((emu_type0.read_u32(0x0c) >> 16) & 0xff, 0);
 
     // Test Type 1 emulator
     let emu_type1 = create_type1_emulator(vec![]);
-    assert_eq!(emu_type1.common.bar_count(), 2);
-    assert_eq!(emu_type1.common.header_type(), HeaderType::Type1);
-    assert!(emu_type1.common.validate_header_type(HeaderType::Type1));
-    assert!(!emu_type1.common.validate_header_type(HeaderType::Type0));
+    assert_eq!((emu_type1.read_u32(0x0c) >> 16) & 0xff, 1);
 }
 
-/// Ensure that `find_bar` correctly returns a full `u64` offset for BARs
-/// larger than 64KiB, guarding against truncation back to `u16`.
+// Test: Locate an address beyond 64 KiB inside a larger 64-bit BAR.
+// Expected: The BAR index and full-width offset survive without u16 truncation.
 #[test]
 fn find_bar_returns_full_u64_offset_for_large_bar() {
     use crate::bar_mapping::BarMappings;
@@ -1045,6 +1111,8 @@ fn find_bar_returns_full_u64_offset_for_large_bar() {
     assert_eq!(offset, expected_offset);
 }
 
+// Test: Program both words of an odd-indexed 64-bit BAR fixture.
+// Expected: Only the lower word preserves attributes; upper address bits survive.
 #[test]
 fn test_odd_index_64bit_bar_preserves_attrs_only_on_lower_dword() {
     let mut bars = DeviceBars::new();
@@ -1088,6 +1156,8 @@ fn test_odd_index_64bit_bar_preserves_attrs_only_on_lower_dword() {
     assert_eq!(common_emu.base_addresses()[2] & 0xF, 0x5);
 }
 
+// Test: Write an address to a 32-bit prefetchable BAR fixture.
+// Expected: The address survives together with the BAR's fixed attribute nibble.
 #[test]
 fn test_32bit_bar_preserves_attr_bits_without_clobbering_address_bits() {
     let mut common_emu = ConfigSpaceCommonHeaderEmulatorType0::new(
@@ -1188,12 +1258,8 @@ fn config_space_with_intercept_bar(
     )
 }
 
-// Regression test for a PCIe hot-add-after-remove failure: when a device's
-// config space is dropped (e.g. a hot-removed controller being torn down),
-// its BAR intercept registrations must be released. Otherwise the stale
-// range stays in the chipset's shared range map and a subsequent device
-// that reuses the same GPA fails to install its intercept, leaving its BAR
-// undispatched (guest reads all-1s -> stornvme FindAdapter reads CAP=~0).
+// Test: Drop configuration space after enabling an intercept-backed BAR.
+// Expected: Teardown unmaps the live intercept so its address can be reused.
 #[test]
 fn dropping_config_space_unmaps_bar_intercepts() {
     let mapped = Arc::new(AtomicBool::new(false));
@@ -1217,10 +1283,8 @@ fn dropping_config_space_unmaps_bar_intercepts() {
     );
 }
 
-// A device can be torn down before the guest ever enables memory space (so
-// the BAR was never mapped). Dropping its config space must not attempt to
-// unmap the never-mapped intercept -- which would panic for intercept impls
-// whose `unmap()` is not idempotent (as `TrackingBar::unmap` asserts here).
+// Test: Drop an intercept-backed device before enabling memory decoding.
+// Expected: Teardown leaves the never-mapped intercept alone without panicking.
 #[test]
 fn dropping_config_space_without_mmio_enabled_does_not_unmap() {
     let mapped = Arc::new(AtomicBool::new(false));
@@ -1232,6 +1296,8 @@ fn dropping_config_space_without_mmio_enabled_does_not_unmap() {
     assert!(!mapped.load(Ordering::SeqCst));
 }
 
+// Test: Read and write bridge BDFs, then reset and restore the captured identity.
+// Expected: Only writes capture BDF and the public checkpoint preserves it.
 #[test]
 fn test_type1_bdf_capturing() {
     // Test that the type1 config space emulator captures
@@ -1283,6 +1349,8 @@ fn test_type1_bdf_capturing() {
     assert_eq!(type1_emulator.captured_devfn(), 1);
 }
 
+// Test: Read and write endpoint BDFs, then reset and restore the captured identity.
+// Expected: Only writes capture BDF and the public checkpoint preserves it.
 #[test]
 fn test_type0_bdf_capturing() {
     // Test that the type0 config space emulator captures
@@ -1347,7 +1415,9 @@ fn assert_capability_checkpoint<T>(
     let connection = MsiConnection::new();
     let controller = TestPciInterruptController::new();
     connection.connect(controller.signal_msi());
-    let msi = MsiCapability::new(0, true, false, &connection.target());
+    let addr_64bit = true;
+    let per_vector_masking = false;
+    let msi = MsiCapability::new(0, addr_64bit, per_vector_masking, &connection.target());
     let interrupt = msi.interrupt().unwrap();
     let mut emulator = create(
         vec![
