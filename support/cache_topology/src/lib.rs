@@ -287,10 +287,26 @@ mod macos {
 
 #[cfg(test)]
 mod tests {
+    // Test: Query the real host topology consumed by guest firmware generation.
+    // Expected: Caches have usable geometry and ordered, nonempty CPU memberships,
+    //       with no duplicate cache descriptions.
     #[test]
     fn test_host_cache_topology() {
         let topology = super::CacheTopology::from_host().unwrap();
         assert!(!topology.caches.is_empty());
+        assert!(topology.caches.windows(2).all(|pair| pair[0] < pair[1]));
+        for cache in &topology.caches {
+            assert!(cache.level > 0, "{cache:?}");
+            assert!(cache.line_size > 0, "{cache:?}");
+            assert!(cache.size >= cache.line_size, "{cache:?}");
+            assert!(cache.size.is_multiple_of(cache.line_size), "{cache:?}");
+            assert!(!cache.cpus.is_empty(), "{cache:?}");
+            assert!(
+                cache.cpus.windows(2).all(|pair| pair[0] < pair[1]),
+                "{cache:?}"
+            );
+            assert!(cache.associativity.is_none_or(|ways| ways > 0), "{cache:?}");
+        }
         println!("{topology:?}");
     }
 }
