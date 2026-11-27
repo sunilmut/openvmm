@@ -234,6 +234,12 @@ fn uio_signal_uses_four_byte_notifications_and_consumes_one_at_a_time() {
             let mut outbound = [0; 4];
             peer.read_exact(&mut outbound).unwrap();
             assert_eq!(outbound, 1u32.to_ne_bytes());
+            peer.set_nonblocking(true).unwrap();
+            let error = peer
+                .read(&mut [0; 1])
+                .expect_err("notification has no trailing bytes");
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+            peer.set_nonblocking(false).unwrap();
             peer.write_all(&[3u32.to_ne_bytes(), 9u32.to_ne_bytes()].concat())
                 .unwrap();
             assert!(poll_fn(|cx| signal.poll_for_signal(cx)).await.is_ok());
