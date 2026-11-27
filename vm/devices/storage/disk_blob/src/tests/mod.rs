@@ -150,3 +150,59 @@ async fn misbehaving_server_never_reports_success() {
         }
     }
 }
+
+// Test: Shrink a file after opening a disk and read a sector it still advertises.
+// Expected: The failure is an IO error, not a bounds error or partial guest write.
+#[async_test]
+async fn shortened_backing_preserves_guest_buffer_on_error() {
+    let file = raw_file();
+    let disk = Disk::new(BlobDisk::new(
+        FileBlob::new(file.try_clone().unwrap()).unwrap(),
+    ))
+    .unwrap();
+    file.set_len(0).unwrap();
+    let mem = GuestMemory::allocate(SECTOR_SIZE);
+    mem.write_at(0, &[0x7b; SECTOR_SIZE]).unwrap();
+    let result = disk
+        .read_vectored(
+            &OwnedRequestBuffers::linear(0, SECTOR_SIZE, true).buffer(&mem),
+            1,
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DiskError::Io(ref error)) if error.kind() == std::io::ErrorKind::UnexpectedEof),
+        "{result:?}"
+    );
+    let mut bytes = [0; SECTOR_SIZE];
+    mem.read_at(0, &mut bytes).unwrap();
+    assert_eq!(bytes, [0x7b; SECTOR_SIZE]);
+}
+
+// Test: Read distinct adjacent sectors over HTTP into a page-crossing guest buffer.
+// Expected: Exact requested bytes are transferred; neighboring guest bytes stay intact.
+#[async_test]
+async fn positioned_read_crosses_guest_page_without_changing_neighbors() {
+    let content: Vec<_> = (0..DISK_SIZE as usize)
+        .map(|offset| ((offset / SECTOR_SIZE) * 37 + offset % SECTOR_SIZE) as u8)
+        .collect();
+    let server = TestHttpServer::new(content.clone(), Behavior::Correct);
+    let disk = Disk::new(BlobDisk::new(HttpBlob::new(&server.url()).await.unwrap())).unwrap();
+    let mem = GuestMemory::allocate(8192);
+    mem.write_at(0, &[0xd3; 8192]).unwrap();
+    let start = 4090;
+    let length = 2 * SECTOR_SIZE;
+    disk.read_vectored(
+        &OwnedRequestBuffers::new_unaligned(&[0, 1], start, length).buffer(&mem),
+        3,
+    )
+    .await
+    .unwrap();
+    let mut bytes = [0; 8192];
+    mem.read_at(0, &mut bytes).unwrap();
+    assert_eq!(&bytes[..start], &[0xd3; 4090]);
+    assert_eq!(
+        &bytes[start..start + length],
+        &content[3 * SECTOR_SIZE..5 * SECTOR_SIZE]
+    );
+    assert!(bytes[start + length..].iter().all(|&byte| byte == 0xd3));
+}
