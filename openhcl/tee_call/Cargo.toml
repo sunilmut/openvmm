@@ -22,5 +22,8 @@ static_assertions.workspace = true
 thiserror.workspace = true
 zerocopy.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true

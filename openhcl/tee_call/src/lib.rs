@@ -400,3 +400,77 @@ impl TeeCall for VbsCall {
         TeeType::Vbs
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    // Test: Give SNP a TDX SVN under both measurement policies.
+    // Expected: Key derivation rejects the mismatched TEE material before
+    //       opening a device or attempting hardware key derivation.
+    #[test]
+    fn snp_rejects_tdx_svn_for_either_measurement_policy() {
+        for mix_measurement in [false, true] {
+            let policy = KeyDerivationPolicy {
+                svn: KeyDerivationSvn::Tdx {
+                    tee_tcb_svn: [0x21; 16],
+                    cpu_svn: [0x72; 16],
+                },
+                mix_measurement,
+            };
+            assert!(matches!(
+                SnpCall.get_derived_key(policy),
+                Err(Error::KeyDerivationSvnMismatch)
+            ));
+        }
+    }
+
+    // Test: Give TDX an SNP SVN with either runtime capability and policy.
+    // Expected: SVN mismatch remains the precise error, rather than signer
+    //       rejection, a device-open error or a hardware-derived key.
+    #[test]
+    fn tdx_rejects_snp_svn_before_policy_or_device_handling() {
+        for hw_seal_keys_enabled in [false, true] {
+            let call = TdxCall::new(hw_seal_keys_enabled);
+            for mix_measurement in [false, true] {
+                assert!(matches!(
+                    call.get_derived_key(KeyDerivationPolicy {
+                        svn: KeyDerivationSvn::Snp {
+                            tcb_version: 0x1234_5678,
+                        },
+                        mix_measurement,
+                    }),
+                    Err(Error::KeyDerivationSvnMismatch)
+                ));
+            }
+        }
+    }
+
+    // Test: Discover TDX key capability before and after hardware enablement,
+    //       then request signer sealing through the enabled trait object.
+    // Expected: Disabled keys are unavailable; enabled keys still refuse the
+    //       measurement-independent signer policy without contacting hardware.
+    #[test]
+    fn tdx_hardware_key_capability_is_opt_in_and_refuses_signer_policy() {
+        let disabled = TdxCall::new(false);
+        let disabled_tee: &dyn TeeCall = &disabled;
+        assert!(disabled_tee.supports_get_derived_key().is_none());
+
+        let enabled = TdxCall::new(true);
+        let enabled_tee: &dyn TeeCall = &enabled;
+        let hardware = enabled_tee
+            .supports_get_derived_key()
+            .expect("enabled TDX exposes hardware key capability");
+        assert!(matches!(
+            hardware.get_derived_key(KeyDerivationPolicy {
+                svn: KeyDerivationSvn::Tdx {
+                    tee_tcb_svn: [0x21; 16],
+                    cpu_svn: [0x72; 16],
+                },
+                mix_measurement: false,
+            }),
+            Err(Error::TdxSignerPolicyUnsupported)
+        ));
+    }
+}

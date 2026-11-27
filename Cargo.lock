@@ -8745,6 +8745,7 @@ dependencies = [
  "sev_guest_device",
  "static_assertions",
  "tdx_guest_device",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "x86defs",
  "zerocopy",
