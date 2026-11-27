@@ -10,5 +10,8 @@ edition.workspace = true
 zerocopy.workspace = true
 bitfield-struct.workspace = true
 
+[dev-dependencies]
+test_with_tracing.workspace = true
+
 [lints]
 workspace = true
