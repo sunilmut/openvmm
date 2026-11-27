@@ -28,5 +28,10 @@ futures.workspace = true
 futures-concurrency.workspace = true
 tracing.workspace = true
 zerocopy.workspace = true
+
+[dev-dependencies]
+test_with_tracing.workspace = true
+user_driver_emulated_mock.workspace = true
+
 [lints]
 workspace = true

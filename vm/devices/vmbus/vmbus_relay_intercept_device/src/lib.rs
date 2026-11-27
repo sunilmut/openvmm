@@ -648,3 +648,6 @@ impl SignalVmbusChannel for MemoryBlockChannelSignal {
         self.event.poll_wait(cx).map(Ok)
     }
 }
+
+#[cfg(test)]
+mod tests;
