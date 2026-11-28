@@ -2357,6 +2357,8 @@ dependencies = [
  "inspect",
  "mesh",
  "open_enum",
+ "parking_lot",
+ "test_with_tracing",
  "tracelimit",
  "tracing",
  "vmcore",
