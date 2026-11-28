@@ -1689,3 +1689,81 @@ pub(crate) mod save_restore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::DeviceHeadReg;
+    use super::MediaGeometry;
+    use super::Registers;
+    use test_with_tracing::test;
+
+    // Test: Encode and decode the original low/high CHS, LBA28 and LBA48 samples.
+    // Expected: Each direction matches independent ATA register values, including
+    //       high address bits and the last sector of the supported CHS geometry.
+    #[test]
+    fn test_lba() {
+        let geometry = MediaGeometry::new(0x7ff_ffff, 512).unwrap();
+
+        // Each LBA48 FIFO holds the high byte followed by the low byte.
+        for (lba, low, mid, high) in [
+            (0, 0, 0, 0),
+            (0x10000, 0, 0, 1),
+            (0x12345678abcd, 0x56cd, 0x34ab, 0x1278),
+        ] {
+            let input = Registers {
+                device_head: DeviceHeadReg::new().with_lba(true),
+                lba_low: low,
+                lba_mid: mid,
+                lba_high: high,
+                ..Registers::at_reset()
+            };
+            assert_eq!(input.lba48().unwrap(), lba);
+
+            let mut output = Registers {
+                device_head: DeviceHeadReg::new().with_lba(true),
+                ..Registers::at_reset()
+            };
+            output.seek48(lba);
+            assert_eq!(
+                (output.lba_low, output.lba_mid, output.lba_high),
+                (low, mid, high)
+            );
+        }
+
+        // LBA28 uses three address bytes and the head nibble. CHS sectors are
+        // one-based; this disk has 16 heads, 63 sectors/track and 0x4000 cylinders.
+        for (use_lba, lba, low, mid, high, head) in [
+            (true, 0, 0, 0, 0, 0),
+            (true, 0x10000, 0, 0, 1, 0),
+            (true, 0x678abcd, 0xcd, 0xab, 0x78, 6),
+            (false, 0, 1, 0, 0, 0),
+            (false, 0x10000, 17, 0x41, 0, 0),
+            (false, 0xfbffff, 63, 0xff, 0x3f, 15),
+        ] {
+            let input = Registers {
+                device_head: DeviceHeadReg::new().with_lba(use_lba).with_head(head),
+                lba_low: low,
+                lba_mid: mid,
+                lba_high: high,
+                ..Registers::at_reset()
+            };
+            assert!(lba < input.capacity28(&geometry));
+            assert_eq!(input.lba28(&geometry).unwrap(), lba);
+
+            let mut output = Registers {
+                device_head: DeviceHeadReg::new().with_lba(use_lba),
+                ..Registers::at_reset()
+            };
+            output.seek28(&geometry, lba);
+            assert_eq!(
+                (
+                    output.lba_low,
+                    output.lba_mid,
+                    output.lba_high,
+                    output.device_head.head()
+                ),
+                (low, mid, high, head)
+            );
+        }
+    }
+}
