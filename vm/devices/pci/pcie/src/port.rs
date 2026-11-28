@@ -936,6 +936,7 @@ mod tests {
     use pci_core::spec::hwid::HardwareIds;
     use pci_core::test_helpers::TestCfgAccess;
     use std::sync::Arc;
+    use test_with_tracing::test;
 
     fn make_cxl_bar_port() -> PcieDownstreamPort {
         use pci_core::spec::hwid::{ClassCode, ProgrammingInterface, Subclass};
@@ -985,9 +986,9 @@ mod tests {
         direct_reads: usize,
         direct_writes: usize,
         type0_reads: Vec<PciConfigAddress>,
-        type0_writes: Vec<PciConfigAddress>,
+        type0_writes: Vec<(PciConfigAddress, ByteEnabledDwordWrite)>,
         type1_reads: Vec<PciConfigAddress>,
-        type1_writes: Vec<PciConfigAddress>,
+        type1_writes: Vec<(PciConfigAddress, ByteEnabledDwordWrite)>,
     }
 
     struct MultiFunctionMockDevice {
@@ -1032,17 +1033,19 @@ mod tests {
             &mut self,
             access_type: PciConfigAccessType,
             address: PciConfigAddress,
-            _value: ByteEnabledDwordWrite,
+            value: ByteEnabledDwordWrite,
         ) -> Option<IoResult> {
             let mut stats = self.stats.lock();
             match access_type {
-                PciConfigAccessType::Type0 => stats.type0_writes.push(address),
-                PciConfigAccessType::Type1 => stats.type1_writes.push(address),
+                PciConfigAccessType::Type0 => stats.type0_writes.push((address, value)),
+                PciConfigAccessType::Type1 => stats.type1_writes.push((address, value)),
             }
             Some(IoResult::Ok)
         }
     }
 
+    // Test: Attach and remove a device, then remove from the empty port.
+    // Expected: Guest presence tracks attachment and empty removal is rejected.
     #[test]
     fn test_add_remove_pcie_device_updates_presence_detect_state() {
         use pci_core::spec::hwid::{ClassCode, ProgrammingInterface, Subclass};
@@ -1095,7 +1098,6 @@ mod tests {
 
         port.remove_pcie_device()
             .expect("removing the connected device should succeed");
-        assert!(port.link.is_none());
         assert_eq!((port.cfg_space.read_u32(0x58) >> 22) & 0x1, 0);
 
         let error = port
@@ -1104,6 +1106,8 @@ mod tests {
         assert_eq!(error.to_string(), "port 'test-port' is empty");
     }
 
+    // Test: Attach an endpoint to a port without runtime hotplug support.
+    // Expected: Static attachment succeeds and config reads reach the endpoint.
     #[test]
     fn test_add_pcie_device_without_hotplug() {
         use pci_core::spec::hwid::{ClassCode, ProgrammingInterface, Subclass};
@@ -1134,14 +1138,31 @@ mod tests {
         );
 
         // Add a device to the port (should not panic even without hotplug support)
-        let mock_device = Box::new(TestPciDevice);
+        let mock_device = Box::new(crate::test_helpers::TestPcieEndpoint::new(
+            |offset, mut value| {
+                assert_eq!(offset, 0);
+                value.set(0x5678_1234);
+                Some(IoResult::Ok)
+            },
+            |_, _| Some(IoResult::Ok),
+        ));
         let result = port.add_pcie_device("test-port", "mock-device", mock_device);
         assert!(
             result.is_ok(),
             "Adding device should succeed even without hotplug support"
         );
+        port.cfg_space.write_u32(0x18, 0x0001_0100);
+        let mut value = 0;
+        port.forward_cfg_read_with_routing(
+            PciConfigAddress::new(1, 0, 0).unwrap(),
+            ByteEnabledDwordRead::with_all_bytes_enabled(&mut value),
+        )
+        .unwrap();
+        assert_eq!(value, 0x5678_1234);
     }
 
+    // Test: Read multiple functions on the secondary bus.
+    // Expected: The endpoint receives Type 0 addresses, not direct reads.
     #[test]
     fn test_direct_child_bus_reads_use_forward_for_multifunction_devices() {
         use pci_core::spec::hwid::{ClassCode, ProgrammingInterface, Subclass};
@@ -1191,6 +1212,7 @@ mod tests {
             ),
             IoResult::Ok
         ));
+        assert_eq!(value, 0x1234_5678);
         assert!(matches!(
             port.forward_cfg_read_with_routing(
                 PciConfigAddress::new(1, 3, 0x14 / 4).unwrap(),
@@ -1198,6 +1220,7 @@ mod tests {
             ),
             IoResult::Ok
         ));
+        assert_eq!(value, 0x1234_5678);
 
         let stats = stats.lock().clone();
         assert_eq!(stats.direct_reads, 0);
@@ -1210,6 +1233,8 @@ mod tests {
         );
     }
 
+    // Test: Write multiple functions on the secondary bus.
+    // Expected: The endpoint receives Type 0 addresses, not direct writes.
     #[test]
     fn test_direct_child_bus_writes_use_forward_for_multifunction_devices() {
         use pci_core::spec::hwid::{ClassCode, ProgrammingInterface, Subclass};
@@ -1271,8 +1296,14 @@ mod tests {
         assert_eq!(
             stats.type0_writes,
             vec![
-                PciConfigAddress::new(1, 0, 0x10 / 4).unwrap(),
-                PciConfigAddress::new(1, 2, 0x14 / 4).unwrap()
+                (
+                    PciConfigAddress::new(1, 0, 0x10 / 4).unwrap(),
+                    ByteEnabledDwordWrite::with_all_bytes_enabled(0xAAAA_0000)
+                ),
+                (
+                    PciConfigAddress::new(1, 2, 0x14 / 4).unwrap(),
+                    ByteEnabledDwordWrite::with_all_bytes_enabled(0xBBBB_0000)
+                )
             ]
         );
     }
@@ -1321,6 +1352,8 @@ mod tests {
         (port, stats)
     }
 
+    // Test: Access a nonzero device on the secondary bus without ARI.
+    // Expected: Reads return all ones and writes never reach the endpoint.
     #[test]
     fn test_secondary_bus_nonzero_device_without_ari_is_unsupported_request() {
         let (mut port, stats) = make_root_port_with_linked_device();
@@ -1368,6 +1401,9 @@ mod tests {
         assert!(stats.type1_writes.is_empty());
     }
 
+    // Test: Enable/disable ARI and access secondary/subordinate bus boundaries.
+    // Expected: Forwarding retains full devfn, offset and byte lanes; disabled ARI
+    //       rejects secondary-bus aliases and out-of-range buses reach no endpoint.
     #[test]
     fn test_secondary_bus_nonzero_device_with_ari_forwards_full_devfn() {
         let (mut port, stats) = make_root_port_with_linked_device();
@@ -1401,6 +1437,33 @@ mod tests {
             IoResult::Ok
         ));
 
+        port.cfg_space.write_u32(0x18, 0x0003_0100);
+        let last = PciConfigAddress::new(3, 0xff, 0x3ff).unwrap();
+        port.forward_cfg_read_with_routing(
+            last,
+            ByteEnabledDwordRead::with_all_bytes_enabled(&mut value),
+        )
+        .unwrap();
+        assert_eq!(value, 0x1234_5678);
+        let partial = ByteEnabledDwordWrite::new(
+            0x7e00_0000,
+            chipset_device::pci::PciConfigByteEnable::BYTE3,
+        );
+        port.forward_cfg_write_with_routing(last, partial).unwrap();
+        port.cfg_space.write_u32(0x68, 0);
+        for (bus, devfn) in [(1, 0xff), (0, 0), (4, 0)] {
+            let address = PciConfigAddress::new(bus, devfn, 0x3ff).unwrap();
+            value = 0;
+            port.forward_cfg_read_with_routing(
+                address,
+                ByteEnabledDwordRead::with_all_bytes_enabled(&mut value),
+            )
+            .unwrap();
+            assert_eq!(value, u32::MAX);
+            port.forward_cfg_write_with_routing(address, partial)
+                .unwrap();
+        }
+
         let stats = stats.lock().clone();
         assert_eq!(
             stats.type0_reads,
@@ -1408,12 +1471,23 @@ mod tests {
         );
         assert_eq!(
             stats.type0_writes,
-            vec![PciConfigAddress::new(1, 0x30, 0x14 / 4).unwrap()]
+            vec![(
+                PciConfigAddress::new(1, 0x30, 0x14 / 4).unwrap(),
+                ByteEnabledDwordWrite::with_all_bytes_enabled(0xCAFE_0000)
+            )]
         );
-        assert!(stats.type1_reads.is_empty());
-        assert!(stats.type1_writes.is_empty());
+        assert_eq!(
+            stats.type1_reads,
+            vec![PciConfigAddress::new(3, 0xff, 0x3ff).unwrap()]
+        );
+        assert_eq!(
+            stats.type1_writes,
+            vec![(PciConfigAddress::new(3, 0xff, 0x3ff).unwrap(), partial)]
+        );
     }
 
+    // Test: Save, clear and restore the bridge's programmed bus range.
+    // Expected: Restoration recovers secondary 0x10 and subordinate 0x12.
     #[test]
     fn test_port_cfg_space_save_restore() {
         use pci_core::spec::hwid::{ClassCode, ProgrammingInterface, Subclass};
@@ -1459,6 +1533,8 @@ mod tests {
         assert_eq!(port.cfg_space.assigned_bus_range(), 0x10..=0x12);
     }
 
+    // Test: Request all ACS bits on root, downstream, upstream and endpoint ports.
+    // Expected: Only implemented root/downstream ACS bits survive filtering.
     #[test]
     fn test_filter_acs_capabilities_for_bridge_type() {
         assert_eq!(
@@ -1479,6 +1555,8 @@ mod tests {
         );
     }
 
+    // Test: Construct root ports with and without requested ACS support.
+    // Expected: The guest sees an ACS capability only for the enabled port.
     #[test]
     fn test_root_port_adds_acs_only_when_non_zero() {
         use pci_core::spec::caps::ExtendedCapabilityId;
@@ -1528,6 +1606,8 @@ mod tests {
         assert_eq!(value, 0);
     }
 
+    // Test: Request CXL registers without an MMIO registration context.
+    // Expected: Configuration space advertises neither CXL DVSECs nor a BAR.
     #[test]
     fn test_invalid_cxl_component_register_locator_disables_cxl_exposure() {
         use cxl_spec::pci_registers::flex_bus_port_dvsec::CxlFlexBusPortDvsecCapability;
@@ -1576,12 +1656,11 @@ mod tests {
             value, 0,
             "CXL DVSECs should be absent when CXL component-register BAR backing is invalid"
         );
-        assert!(
-            port.cxl_component_registers.is_none(),
-            "component-register backing should not be allocated"
-        );
+        assert_eq!(port.cfg_space.read_u32(0x10), 0);
     }
 
+    // Test: Read CXL component registers using byte and word accesses.
+    // Expected: Both unsupported widths return InvalidAccessSize.
     #[test]
     fn test_cxl_component_register_bar_rejects_1_or_2_byte_reads() {
         let mut port = make_cxl_bar_port();
@@ -1599,6 +1678,8 @@ mod tests {
         ));
     }
 
+    // Test: Write CXL component registers using byte and word accesses.
+    // Expected: Both unsupported widths return InvalidAccessSize.
     #[test]
     fn test_cxl_component_register_bar_rejects_1_or_2_byte_writes() {
         let mut port = make_cxl_bar_port();

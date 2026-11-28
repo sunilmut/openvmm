@@ -17,6 +17,7 @@ use memory_range::MemoryRange;
 use pci_core::bus_range::AssignedBusRange;
 use pci_core::msi::{MsiConnection, SignalMsi};
 use std::sync::Arc;
+use test_with_tracing::test;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::save_restore::SaveRestore;
 
@@ -374,11 +375,9 @@ fn hotplug_changes_guest_presence_and_delivers_programmed_msi() {
     rc.hotplug_remove_device("port").unwrap();
     assert_eq!(read32(&mut rc, express + 0x18) & (0x40 << 16), 0);
     let signals = observer.0.lock();
-    assert_eq!(signals.len(), 2);
-    assert!(
-        signals
-            .iter()
-            .all(|(_, address, data)| (*address, *data) == (0xfee00000, 0x45))
+    assert_eq!(
+        &*signals,
+        &[(Some(0), 0xfee00000, 0x45), (Some(0), 0xfee00000, 0x45)]
     );
     drop(signals);
     assert!(
@@ -415,7 +414,14 @@ fn its_signal_wrapper_preserves_interrupt_payload() {
     let its = crate::its::ItsSignalMsi::new(observer.clone(), 0x1234);
     its.signal_msi(None, 1, 2);
     its.signal_msi(Some(0xdead5678), 0xfee00000, 0x45);
-    assert_eq!(&*observer.0.lock(), &[(Some(0x12345678), 0xfee00000, 0x45)]);
+    its.signal_msi(Some(0xffffffff), 0x12345678abcdef00, 0x89abcdef);
+    assert_eq!(
+        &*observer.0.lock(),
+        &[
+            (Some(0x12345678), 0xfee00000, 0x45),
+            (Some(0x1234ffff), 0x12345678abcdef00, 0x89abcdef)
+        ]
+    );
 }
 
 struct IrqObserver {
@@ -506,4 +512,295 @@ fn hotplug_status_acknowledgement_preserves_live_presence() {
     rc.hotplug_add_device("port", "replacement", Box::new(TestPciDevice))
         .unwrap();
     assert_eq!(status(&mut rc), presence | changed);
+}
+
+struct RoutedEndpoint {
+    bus: u8,
+    devfn: u8,
+    inner: Box<dyn pci_bus::GenericPciBusDevice>,
+}
+
+impl pci_bus::GenericPciBusDevice for RoutedEndpoint {
+    fn pci_cfg_read(&mut self, offset: u16, value: ByteEnabledDwordRead<'_>) -> Option<IoResult> {
+        self.inner.pci_cfg_read(offset, value)
+    }
+
+    fn pci_cfg_write(&mut self, offset: u16, value: ByteEnabledDwordWrite) -> Option<IoResult> {
+        self.inner.pci_cfg_write(offset, value)
+    }
+
+    fn pci_cfg_read_with_routing(
+        &mut self,
+        kind: PciConfigAccessType,
+        address: PciConfigAddress,
+        mut value: ByteEnabledDwordRead<'_>,
+    ) -> Option<IoResult> {
+        assert_eq!(kind, PciConfigAccessType::Type0);
+        assert_eq!(address.bus, self.bus);
+        if address.devfn == self.devfn {
+            self.pci_cfg_read(address.byte_offset(), value)
+        } else {
+            value.set(u32::MAX);
+            Some(IoResult::Ok)
+        }
+    }
+
+    fn pci_cfg_write_with_routing(
+        &mut self,
+        kind: PciConfigAccessType,
+        address: PciConfigAddress,
+        value: ByteEnabledDwordWrite,
+    ) -> Option<IoResult> {
+        assert_eq!(kind, PciConfigAccessType::Type0);
+        assert_eq!(address.bus, self.bus);
+        if address.devfn == self.devfn {
+            self.pci_cfg_write(address.byte_offset(), value)
+        } else {
+            Some(IoResult::Ok)
+        }
+    }
+}
+
+// Test: Access RCiEP config lanes on bus 255 at device 31 and its last dword.
+// Expected: Writes merge only enabled bytes; adjacent registers/functions remain
+//       intact, malformed lanes fail, and the ECAM aperture rejects outside access.
+#[test]
+fn ecam_byte_lanes_and_terminal_offsets_preserve_neighbors() {
+    let mut mmio = MmioRegistration;
+    let mut pio = TestPciePioRegistration;
+    let base = 0x80000000;
+    let mut rc = GenericPcieRootComplex::builder(
+        &mut mmio,
+        &mut pio,
+        255..=255,
+        MemoryRange::new(base..base + 0x100000),
+    )
+    .build()
+    .unwrap();
+    let registers = Arc::new(parking_lot::Mutex::new([
+        0x11223344, 0x55667788, 0x99aabbcc,
+    ]));
+    let reads = registers.clone();
+    let writes = registers.clone();
+    let index = |offset| match offset {
+        0x40 => 0,
+        0x44 => 1,
+        0xffc => 2,
+        _ => panic!("unexpected endpoint offset {offset:#x}"),
+    };
+    rc.add_rciep(
+        0xf8,
+        "last-device",
+        Box::new(RoutedEndpoint {
+            bus: 255,
+            devfn: 0xf8,
+            inner: Box::new(crate::test_helpers::TestPcieEndpoint::new(
+                move |offset, mut value| {
+                    value.set(reads.lock()[index(offset)]);
+                    Some(IoResult::Ok)
+                },
+                move |offset, value| {
+                    value.merge_into(&mut writes.lock()[index(offset)]);
+                    Some(IoResult::Ok)
+                },
+            )),
+        }),
+    )
+    .unwrap();
+    let function = base + 0xf8000;
+    rc.mmio_write(function + 0x41, &[0xa5]).unwrap();
+    assert_eq!(read32(&mut rc, function + 0x40), 0x1122a544);
+    rc.mmio_write(function + 0x42, &[0xc3, 0xd4]).unwrap();
+    assert_eq!(read32(&mut rc, function + 0x40), 0xd4c3a544);
+    let mut bytes = [0; 2];
+    rc.mmio_read(function + 0x42, &mut bytes).unwrap();
+    assert_eq!(bytes, [0xc3, 0xd4]);
+    for (lane, expected) in [0x44, 0xa5, 0xc3, 0xd4].into_iter().enumerate() {
+        let mut byte = [0];
+        rc.mmio_read(function + 0x40 + lane as u64, &mut byte)
+            .unwrap();
+        assert_eq!(byte, [expected]);
+    }
+    rc.mmio_write(function + 0xfff, &[0x7e]).unwrap();
+    assert_eq!(read32(&mut rc, function + 0xffc), 0x7eaabbcc);
+    assert_eq!(read32(&mut rc, function + 0x44), 0x55667788);
+    assert_eq!(read32(&mut rc, function + 0x1000), u32::MAX);
+    rc.mmio_write(function + 0x1000, &[0xff; 4]).unwrap();
+    assert_eq!(read32(&mut rc, base + 0xffffc), u32::MAX);
+    for (offset, len) in [(0x41, 2), (0x42, 4), (0xfff, 2)] {
+        assert!(matches!(
+            rc.mmio_read(function + offset, &mut vec![0; len]),
+            IoResult::Err(IoError::UnalignedAccess)
+        ));
+        assert!(matches!(
+            rc.mmio_write(function + offset, &vec![0xff; len]),
+            IoResult::Err(IoError::UnalignedAccess)
+        ));
+    }
+    for len in [0, 3, 8] {
+        assert!(matches!(
+            rc.mmio_read(function + 0x40, &mut vec![0; len]),
+            IoResult::Err(IoError::InvalidAccessSize)
+        ));
+        assert!(matches!(
+            rc.mmio_write(function + 0x40, &vec![0xff; len]),
+            IoResult::Err(IoError::InvalidAccessSize)
+        ));
+    }
+    for address in [base - 4, base + 0x100000] {
+        assert!(matches!(
+            rc.mmio_read(address, &mut [0; 4]),
+            IoResult::Err(IoError::InvalidRegister)
+        ));
+        assert!(matches!(
+            rc.mmio_write(address, &[0xff; 4]),
+            IoResult::Err(IoError::InvalidRegister)
+        ));
+    }
+    assert_eq!(*registers.lock(), [0xd4c3a544, 0x55667788, 0x7eaabbcc]);
+}
+
+// Test: Restore reversed sparse-port switch snapshots into a fresh topology.
+// Expected: Bus numbers and commands follow devfn identity, not vector order,
+//       and fresh endpoint links still answer on their independently restored buses.
+#[test]
+fn switch_fresh_restore_matches_sparse_devfns_not_snapshot_order() {
+    use PciConfigAccessType::{Type0, Type1};
+    let mut original = switch();
+    config_write(&mut original, Type0, 0, 0, 0x18, 0x00050100);
+    config_write(&mut original, Type0, 0, 0, 0x4, 6);
+    for (devfn, buses, command) in [(0, 0x00030201, 2), (8, 0x00050401, 4)] {
+        config_write(&mut original, Type1, 1, devfn, 0x18, buses);
+        config_write(&mut original, Type1, 1, devfn, 0x4, command);
+    }
+    let mut saved = original.save().unwrap();
+    saved.downstream_ports.reverse();
+    let mut restored = switch();
+    for (devfn, payload) in [(0, 0x1234abcd), (8, 0x8765dcba)] {
+        restored
+            .add_pcie_device(
+                devfn,
+                "fresh-endpoint",
+                Box::new(crate::test_helpers::TestPcieEndpoint::new(
+                    move |offset, mut value| {
+                        assert_eq!(offset, 0);
+                        value.set(payload);
+                        Some(IoResult::Ok)
+                    },
+                    |_, _| Some(IoResult::Ok),
+                )),
+            )
+            .unwrap();
+    }
+    assert_eq!(config_read(&mut restored, Type0, 0, 0, 0x18), 0);
+    restored.restore(saved).unwrap();
+    assert_eq!(config_read(&mut restored, Type0, 0, 0, 0x18), 0x00050100);
+    assert_eq!(config_read(&mut restored, Type0, 0, 0, 0x4) & 0xffff, 6);
+    for (devfn, buses, command) in [(0, 0x00030201, 2), (8, 0x00050401, 4)] {
+        assert_eq!(config_read(&mut restored, Type1, 1, devfn, 0x18), buses);
+        assert_eq!(
+            config_read(&mut restored, Type1, 1, devfn, 0x4) & 0xffff,
+            command
+        );
+    }
+    assert_eq!(config_read(&mut restored, Type1, 2, 0, 0), 0x1234abcd);
+    assert_eq!(config_read(&mut restored, Type1, 4, 0, 0), 0x8765dcba);
+    config_write(&mut restored, Type1, 1, 0, 0x18, 0x00030301);
+    assert_eq!(config_read(&mut restored, Type1, 2, 0, 0), u32::MAX);
+    assert_eq!(config_read(&mut restored, Type1, 3, 0, 0), 0x1234abcd);
+    assert_eq!(config_read(&mut restored, Type1, 4, 0, 0), 0x8765dcba);
+    assert_eq!(config_read(&mut restored, Type1, 1, 8, 0x18), 0x00050401);
+}
+
+struct OwnedEndpoint {
+    payload: u32,
+    drops: Arc<parking_lot::Mutex<Vec<u32>>>,
+}
+
+impl Drop for OwnedEndpoint {
+    fn drop(&mut self) {
+        self.drops.lock().push(self.payload);
+    }
+}
+
+impl pci_bus::GenericPciBusDevice for OwnedEndpoint {
+    fn pci_cfg_read(
+        &mut self,
+        offset: u16,
+        mut value: ByteEnabledDwordRead<'_>,
+    ) -> Option<IoResult> {
+        assert_eq!(offset, 0);
+        value.set(self.payload);
+        Some(IoResult::Ok)
+    }
+
+    fn pci_cfg_write(&mut self, _offset: u16, _value: ByteEnabledDwordWrite) -> Option<IoResult> {
+        Some(IoResult::Ok)
+    }
+}
+
+// Test: Reject hot-add to occupied/missing ports, then remove and replace one peer.
+// Expected: Rejected endpoints are released once, existing peers keep full payloads,
+//       and removing/replacing one port neither detaches nor aliases the other.
+#[test]
+fn hotplug_rejection_and_replacement_preserve_peer_ownership() {
+    let mut mmio = MmioRegistration;
+    let mut pio = TestPciePioRegistration;
+    let mut rc =
+        GenericPcieRootComplex::builder(&mut mmio, &mut pio, 0..=2, MemoryRange::new(0..0x300000))
+            .root_ports(
+                [("left", 0), ("right", 8)]
+                    .into_iter()
+                    .map(|(name, devfn)| GenericPciePortDefinition {
+                        name: name.into(),
+                        devfn: Some(devfn),
+                        hotplug: true,
+                        settings: Default::default(),
+                    })
+                    .collect(),
+                &pci_core::msi::MsiTarget::disconnected(),
+            )
+            .build()
+            .unwrap();
+    rc.mmio_write(0x18, &0x00010100_u32.to_le_bytes()).unwrap();
+    rc.mmio_write(0x8018, &0x00020200_u32.to_le_bytes())
+        .unwrap();
+    let drops = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let endpoint = |payload| {
+        Box::new(OwnedEndpoint {
+            payload,
+            drops: drops.clone(),
+        })
+    };
+    rc.hotplug_add_device("left", "first", endpoint(0x1234abcd))
+        .unwrap();
+    rc.hotplug_add_device("right", "peer", endpoint(0x8765dcba))
+        .unwrap();
+    assert!(
+        rc.hotplug_add_device("left", "duplicate", endpoint(0xaabbccdd))
+            .is_err()
+    );
+    assert!(
+        rc.hotplug_add_device("missing", "absent", endpoint(0xeeff0011))
+            .is_err()
+    );
+    assert_eq!(&*drops.lock(), &[0xaabbccdd, 0xeeff0011]);
+    assert_eq!(read32(&mut rc, 0x100000), 0x1234abcd);
+    assert_eq!(read32(&mut rc, 0x200000), 0x8765dcba);
+    rc.hotplug_remove_device("left").unwrap();
+    assert_eq!(read32(&mut rc, 0x100000), u32::MAX);
+    assert_eq!(read32(&mut rc, 0x200000), 0x8765dcba);
+    assert!(rc.hotplug_remove_device("left").is_err());
+    rc.hotplug_add_device("left", "replacement", endpoint(0x55667788))
+        .unwrap();
+    assert_eq!(read32(&mut rc, 0x100000), 0x55667788);
+    assert_eq!(read32(&mut rc, 0x200000), 0x8765dcba);
+    assert_eq!(&*drops.lock(), &[0xaabbccdd, 0xeeff0011, 0x1234abcd]);
+    drop(rc);
+    let mut released = drops.lock().clone();
+    released.sort_unstable();
+    assert_eq!(
+        released,
+        [0x1234abcd, 0x55667788, 0x8765dcba, 0xaabbccdd, 0xeeff0011]
+    );
 }

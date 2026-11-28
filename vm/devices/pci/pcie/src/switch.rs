@@ -720,6 +720,7 @@ mod tests {
     use crate::test_helpers::TestPciDevice;
     use pci_core::msi::MsiConnection;
     use pci_core::test_helpers::TestCfgAccess;
+    use test_with_tracing::test;
 
     /// Builds a switch definition with `downstream_port_count` uniform
     /// downstream ports named `{name}-downstream-{i}`, mirroring the naming
@@ -750,6 +751,30 @@ mod tests {
         GenericPcieSwitch::new(definition).unwrap()
     }
 
+    fn read_config(switch: &mut GenericPcieSwitch, bus: u8, devfn: u8, offset: u16) -> u32 {
+        let mut value = 0;
+        switch
+            .pci_cfg_read_with_routing(
+                PciConfigAccessType::Type1,
+                PciConfigAddress::new(bus, devfn, offset / 4).unwrap(),
+                ByteEnabledDwordRead::with_all_bytes_enabled(&mut value),
+            )
+            .unwrap();
+        value
+    }
+
+    fn write_config(switch: &mut GenericPcieSwitch, bus: u8, devfn: u8, offset: u16, value: u32) {
+        switch
+            .pci_cfg_write_with_routing(
+                PciConfigAccessType::Type1,
+                PciConfigAddress::new(bus, devfn, offset / 4).unwrap(),
+                ByteEnabledDwordWrite::with_all_bytes_enabled(value),
+            )
+            .unwrap();
+    }
+
+    // Test: Remove a downstream endpoint and attach a replacement.
+    // Expected: The detached port reports empty removal and remains reusable.
     #[test]
     fn test_remove_pcie_device_from_downstream_port() {
         let mut switch = build(switch_def(
@@ -767,9 +792,14 @@ mod tests {
             .remove_pcie_device(0)
             .expect("removing the connected device should succeed");
 
-        assert!(switch.downstream_ports[0].2.port.link.is_none());
+        assert!(switch.remove_pcie_device(0).is_err());
+        switch
+            .add_pcie_device(0, "replacement", Box::new(TestPciDevice))
+            .unwrap();
     }
 
+    // Test: Remove an endpoint at an unknown downstream devfn.
+    // Expected: The error identifies the missing port.
     #[test]
     fn test_remove_pcie_device_rejects_invalid_downstream_port() {
         let mut switch = build(switch_def(
@@ -793,6 +823,8 @@ mod tests {
         }
     }
 
+    // Test: Construct upstream ports with both TLP-prefix settings.
+    // Expected: Both retain the upstream-port hardware identity.
     #[test]
     fn test_upstream_switch_port_creation() {
         // Verify that we can read the vendor/device ID from config space
@@ -807,6 +839,8 @@ mod tests {
         assert_eq!(vendor_device_id, expected);
     }
 
+    // Test: Request TLP-prefix support on only one of two downstream ports.
+    // Expected: Construction rejects inconsistent switch-wide prefix support.
     #[test]
     fn test_switch_rejects_inconsistent_tlp_prefixing_support() {
         let mut definition = switch_def(
@@ -828,6 +862,8 @@ mod tests {
         ));
     }
 
+    // Test: Request one, two or three TLP prefixes on downstream ports.
+    // Expected: Construction rejects each unsupported maximum.
     #[test]
     fn test_switch_rejects_non_four_tlp_prefixing_support() {
         for max_prefixes in [
@@ -856,6 +892,8 @@ mod tests {
         }
     }
 
+    // Test: Request four-prefix support consistently across a switch.
+    // Expected: Upstream capability bits advertise extended format and four prefixes.
     #[test]
     fn test_switch_with_four_tlp_prefixes_reports_upstream_support() {
         let switch = build(switch_def(
@@ -877,16 +915,26 @@ mod tests {
         );
     }
 
+    // Test: Construct an unconnected downstream port.
+    // Expected: Config identity describes a bridge and forwarding sees no endpoint.
     #[test]
     fn test_downstream_switch_port_creation() {
-        let port = DownstreamSwitchPort::new(
+        let mut port = DownstreamSwitchPort::new(
             "test-downstream-port",
             None,
             None,
             &MsiTarget::disconnected(),
             PciePortSettings::default(),
         );
-        assert!(port.port.link.is_none());
+        port.cfg_space_mut().write_u32(0x18, 0x0001_0100);
+        let mut endpoint_value = 0;
+        port.port
+            .forward_cfg_read_with_routing(
+                PciConfigAddress::new(1, 0, 0).unwrap(),
+                ByteEnabledDwordRead::with_all_bytes_enabled(&mut endpoint_value),
+            )
+            .unwrap();
+        assert_eq!(endpoint_value, u32::MAX);
 
         // Verify that we can read the vendor/device ID from config space
         let vendor_device_id = port.port.cfg_space.read_u32(0x0);
@@ -894,6 +942,8 @@ mod tests {
         assert_eq!(vendor_device_id, expected);
     }
 
+    // Test: Construct downstream ports with default, false and true multifunction settings.
+    // Expected: Only the true setting advertises the multifunction header bit.
     #[test]
     fn test_downstream_switch_port_multi_function_options() {
         // Test with default multi_function (false)
@@ -945,6 +995,8 @@ mod tests {
         );
     }
 
+    // Test: Construct downstream ports with hotplug disabled and slot 42 enabled.
+    // Expected: IDs remain stable and slot capabilities reflect both settings.
     #[test]
     fn test_downstream_switch_port_hotplug_options() {
         // Test with hotplug disabled (None)
@@ -955,11 +1007,10 @@ mod tests {
             &MsiTarget::disconnected(),
             PciePortSettings::default(),
         );
-        // We can't easily verify hotplug is disabled without accessing internal state,
-        // but we can verify the port was created successfully
         let vendor_device_id = port_no_hotplug.cfg_space().read_u32(0x0);
         let expected = (DOWNSTREAM_SWITCH_PORT_DEVICE_ID as u32) << 16 | (VENDOR_ID as u32);
         assert_eq!(vendor_device_id, expected);
+        assert_eq!(port_no_hotplug.cfg_space().read_u32(0x54), 0);
 
         // Test with hotplug enabled (Some(slot_number))
         let port_with_hotplug = DownstreamSwitchPort::new(
@@ -971,10 +1022,13 @@ mod tests {
         );
         let vendor_device_id_hotplug = port_with_hotplug.cfg_space().read_u32(0x0);
         assert_eq!(vendor_device_id_hotplug, expected);
-        // The slot number and hotplug capability would be tested via PCIe capability registers
-        // but that requires more complex setup
+        let slot = port_with_hotplug.cfg_space().read_u32(0x54);
+        assert_ne!(slot & (1 << 6), 0);
+        assert_eq!(slot >> 19, 42);
     }
 
+    // Test: Build and enumerate a three-port switch.
+    // Expected: Enumeration retains all requested names and devfns.
     #[test]
     fn test_switch_creation() {
         let switch = build(switch_def(
@@ -1003,6 +1057,8 @@ mod tests {
         assert!(port_numbers.contains(&2));
     }
 
+    // Test: Attach an endpoint to a valid port and another to a missing port.
+    // Expected: Only valid attachment succeeds; the missing port is identified.
     #[test]
     fn test_switch_device_connections() {
         use crate::test_helpers::TestPcieEndpoint;
@@ -1044,12 +1100,11 @@ mod tests {
             |_, _| Some(IoResult::Err(IoError::InvalidRegister)),
         );
         let result = switch.add_pcie_device(99, "invalid-dev", Box::new(invalid_device)); // Use invalid port number
-        assert!(result.is_err());
-        // add_pcie_device returns an anyhow::Error on failure,
-        // so we just verify that the connection failed
-        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().to_string(), "port devfn 99 not found");
     }
 
+    // Test: Attach a device while probing the switch's upstream config identity.
+    // Expected: Attachment does not replace the upstream bridge identity.
     #[test]
     fn test_switch_routing_functionality() {
         let mut switch = build(switch_def(
@@ -1074,6 +1129,8 @@ mod tests {
         assert_eq!(value, expected);
     }
 
+    // Test: Access a switch through its chipset PCI interface.
+    // Expected: PCI/poll are supported, MMIO/PIO are not, and PCI reads/writes work.
     #[test]
     fn test_switch_chipset_device() {
         use chipset_device::ChipsetDevice;
@@ -1113,8 +1170,23 @@ mod tests {
             ByteEnabledDwordWrite::with_all_bytes_enabled(0x12345678),
         );
         assert!(matches!(result, IoResult::Ok));
+        PciConfigSpace::pci_cfg_write(
+            &mut switch,
+            0x4,
+            ByteEnabledDwordWrite::with_all_bytes_enabled(6),
+        )
+        .unwrap();
+        PciConfigSpace::pci_cfg_read(
+            &mut switch,
+            0x4,
+            ByteEnabledDwordRead::with_all_bytes_enabled(&mut value),
+        )
+        .unwrap();
+        assert_eq!(value & 0xffff, 6);
     }
 
+    // Test: Enumerate a four-port switch with a custom name.
+    // Expected: Public topology retains the name and all four ports.
     #[test]
     fn test_switch_default() {
         let switch = build(switch_def(
@@ -1128,6 +1200,8 @@ mod tests {
         assert_eq!(switch.downstream_ports().len(), 4);
     }
 
+    // Test: Enumerate a switch with sixteen downstream ports.
+    // Expected: No requested port is lost during multifunction packing.
     #[test]
     fn test_switch_large_downstream_port_count() {
         let switch = build(switch_def(
@@ -1140,6 +1214,8 @@ mod tests {
         assert_eq!(switch.downstream_ports().len(), 16);
     }
 
+    // Test: Read downstream bridge functions on the switch's internal bus.
+    // Expected: Present functions return downstream IDs; absent functions return all ones.
     #[test]
     fn test_switch_downstream_port_direct_access() {
         let mut switch = build(switch_def(
@@ -1198,6 +1274,8 @@ mod tests {
         assert_eq!(value3, !0);
     }
 
+    // Test: Route Type 1 reads through an unconfigured upstream bridge.
+    // Expected: Every requested bus returns all ones.
     #[test]
     fn test_switch_invalid_bus_range_handling() {
         let mut switch = build(switch_def(
@@ -1239,6 +1317,8 @@ mod tests {
         assert_eq!(value, !0);
     }
 
+    // Test: Route reads with configured upstream but unconfigured downstream ports.
+    // Expected: Endpoints remain absent while internal bridge config is accessible.
     #[test]
     fn test_switch_downstream_port_invalid_bus_range_skipping() {
         let mut switch = build(switch_def(
@@ -1289,13 +1369,15 @@ mod tests {
             ByteEnabledDwordRead::with_all_bytes_enabled(&mut value),
         );
         assert!(matches!(result3, IoResult::Ok));
-        assert!(value != !0);
+        assert_eq!(value, 0xC032_1414);
     }
 
+    // Test: Probe single and multifunction downstream bridge headers.
+    // Expected: Every bridge has Type 1 format and only packed siblings set bit seven.
     #[test]
     fn test_switch_multi_function_bit() {
         // Test that switches with multiple downstream ports set the multi-function bit
-        let multi_port_switch = build(switch_def(
+        let mut multi_port_switch = build(switch_def(
             "multi-port-switch",
             3,
             false,
@@ -1303,37 +1385,38 @@ mod tests {
             MsiTarget::disconnected(),
         ));
 
-        // Verify each downstream port has the multi-function bit set
+        multi_port_switch
+            .pci_cfg_write(
+                0x18,
+                ByteEnabledDwordWrite::with_all_bytes_enabled(0x0001_0100),
+            )
+            .unwrap();
         for p in multi_port_switch.downstream_ports() {
             let port_num = p.devfn;
-            if let Some((_, _, downstream_port)) =
-                multi_port_switch.downstream_ports.get(port_num as usize)
-            {
-                let header_type_value = downstream_port.cfg_space().read_u32(0x0C);
+            let header_type_value = read_config(&mut multi_port_switch, 1, port_num, 0x0C);
 
-                // Extract the header type field (bits 16-23, with multi-function bit at bit 23)
-                let header_type_field = (header_type_value >> 16) & 0xFF;
+            // Extract the header type field (bits 16-23, with multi-function bit at bit 23)
+            let header_type_field = (header_type_value >> 16) & 0xFF;
 
-                // Multi-function bit should be set (bit 7 of header type field = bit 23 of dword)
-                assert_eq!(
-                    header_type_field & 0x80,
-                    0x80,
-                    "Multi-function bit should be set for downstream port {} in multi-port switch",
-                    port_num
-                );
+            // Multi-function bit should be set (bit 7 of header type field = bit 23 of dword)
+            assert_eq!(
+                header_type_field & 0x80,
+                0x80,
+                "Multi-function bit should be set for downstream port {} in multi-port switch",
+                port_num
+            );
 
-                // Base header type should still be 01 (bridge)
-                assert_eq!(
-                    header_type_field & 0x7F,
-                    0x01,
-                    "Header type should be 01 (bridge) for downstream port {}",
-                    port_num
-                );
-            }
+            // Base header type should still be 01 (bridge)
+            assert_eq!(
+                header_type_field & 0x7F,
+                0x01,
+                "Header type should be 01 (bridge) for downstream port {}",
+                port_num
+            );
         }
 
         // Test that switches with single downstream port do NOT set the multi-function bit
-        let single_port_switch = build(switch_def(
+        let mut single_port_switch = build(switch_def(
             "single-port-switch",
             1,
             false,
@@ -1341,40 +1424,43 @@ mod tests {
             MsiTarget::disconnected(),
         ));
 
-        // Verify the single downstream port does NOT have the multi-function bit set
+        single_port_switch
+            .pci_cfg_write(
+                0x18,
+                ByteEnabledDwordWrite::with_all_bytes_enabled(0x0001_0100),
+            )
+            .unwrap();
         for p in single_port_switch.downstream_ports() {
             let port_num = p.devfn;
-            if let Some((_, _, downstream_port)) =
-                single_port_switch.downstream_ports.get(port_num as usize)
-            {
-                let header_type_value = downstream_port.cfg_space().read_u32(0x0C);
+            let header_type_value = read_config(&mut single_port_switch, 1, port_num, 0x0C);
 
-                // Extract the header type field (bits 16-23)
-                let header_type_field = (header_type_value >> 16) & 0xFF;
+            // Extract the header type field (bits 16-23)
+            let header_type_field = (header_type_value >> 16) & 0xFF;
 
-                // Multi-function bit should NOT be set
-                assert_eq!(
-                    header_type_field & 0x80,
-                    0x00,
-                    "Multi-function bit should NOT be set for downstream port {} in single-port switch",
-                    port_num
-                );
+            // Multi-function bit should NOT be set
+            assert_eq!(
+                header_type_field & 0x80,
+                0x00,
+                "Multi-function bit should NOT be set for downstream port {} in single-port switch",
+                port_num
+            );
 
-                // Base header type should still be 01 (bridge)
-                assert_eq!(
-                    header_type_field & 0x7F,
-                    0x01,
-                    "Header type should be 01 (bridge) for downstream port {}",
-                    port_num
-                );
-            }
+            // Base header type should still be 01 (bridge)
+            assert_eq!(
+                header_type_field & 0x7F,
+                0x01,
+                "Header type should be 01 (bridge) for downstream port {}",
+                port_num
+            );
         }
     }
 
+    // Test: Construct switches with hotplug disabled and enabled.
+    // Expected: Public names and guest slot capabilities retain their requested settings.
     #[test]
     fn test_hotplug_support() {
         // Test hotplug disabled
-        let switch_no_hotplug = build(switch_def(
+        let mut switch_no_hotplug = build(switch_def(
             "test-switch-no-hotplug",
             1,
             false,
@@ -1382,9 +1468,16 @@ mod tests {
             MsiTarget::disconnected(),
         ));
         assert_eq!(switch_no_hotplug.name().as_ref(), "test-switch-no-hotplug");
+        switch_no_hotplug
+            .pci_cfg_write(
+                0x18,
+                ByteEnabledDwordWrite::with_all_bytes_enabled(0x0001_0100),
+            )
+            .unwrap();
+        assert_eq!(read_config(&mut switch_no_hotplug, 1, 0, 0x54), 0);
 
         // Test hotplug enabled
-        let switch_with_hotplug = build(switch_def(
+        let mut switch_with_hotplug = build(switch_def(
             "test-switch-with-hotplug",
             1,
             true,
@@ -1395,8 +1488,19 @@ mod tests {
             switch_with_hotplug.name().as_ref(),
             "test-switch-with-hotplug"
         );
+        switch_with_hotplug
+            .pci_cfg_write(
+                0x18,
+                ByteEnabledDwordWrite::with_all_bytes_enabled(0x0001_0100),
+            )
+            .unwrap();
+        let slot = read_config(&mut switch_with_hotplug, 1, 0, 0x54);
+        assert_ne!(slot & (1 << 6), 0);
+        assert_eq!(slot >> 19, 1);
     }
 
+    // Test: Restore a three-port switch snapshot into a two-port switch.
+    // Expected: Restore rejects the incompatible topology.
     #[test]
     fn test_save_restore_port_mismatch_error() {
         use vmcore::save_restore::SaveRestore;
@@ -1428,6 +1532,8 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // Test: Save default switch state and restore into a fresh matching switch.
+    // Expected: The snapshot retains both downstream ports and default bus registers.
     #[test]
     fn test_save_restore_basic() {
         use vmcore::save_restore::SaveRestore;
@@ -1457,8 +1563,20 @@ mod tests {
         switch2
             .restore(saved_state)
             .expect("restore should succeed");
+        assert_eq!(switch2.upstream_port().cfg_space().read_u32(0x18), 0);
+        switch2
+            .pci_cfg_write(
+                0x18,
+                ByteEnabledDwordWrite::with_all_bytes_enabled(0x0001_0100),
+            )
+            .unwrap();
+        for devfn in [0, 1] {
+            assert_eq!(read_config(&mut switch2, 1, devfn, 0x18), 0);
+        }
     }
 
+    // Test: Save programmed upstream bus numbers and restore into a fresh switch.
+    // Expected: Secondary and subordinate bus numbers recover their distinct values.
     #[test]
     fn test_save_restore_with_bus_configuration() {
         use vmcore::save_restore::SaveRestore;
@@ -1514,6 +1632,8 @@ mod tests {
         assert_eq!(*restored_bus_range.end(), subordinate_bus);
     }
 
+    // Test: Save a programmed downstream bus range and restore into a fresh switch.
+    // Expected: The addressed port recovers its range without changing its peer.
     #[test]
     fn test_save_restore_downstream_port_state() {
         use vmcore::save_restore::SaveRestore;
@@ -1526,24 +1646,15 @@ mod tests {
             MsiTarget::disconnected(),
         ));
 
-        // Configure bus numbers on one of the downstream ports
-        // First, we need to get access to the downstream port and configure it
-        if let Some((_, _, downstream_port)) = switch.downstream_ports.get_mut(0) {
-            let secondary_bus = 10u8;
-            let subordinate_bus = 20u8;
-            let primary_bus = 5u8;
-            let bus_config = ((subordinate_bus as u32) << 16)
-                | ((secondary_bus as u32) << 8)
-                | (primary_bus as u32);
-            downstream_port.port.cfg_space.write_u32(0x18, bus_config);
-        }
-
-        // Verify the downstream port bus range is set
-        if let Some((_, _, downstream_port)) = switch.downstream_ports.first() {
-            let bus_range = downstream_port.cfg_space().assigned_bus_range();
-            assert_eq!(*bus_range.start(), 10);
-            assert_eq!(*bus_range.end(), 20);
-        }
+        switch
+            .pci_cfg_write(
+                0x18,
+                ByteEnabledDwordWrite::with_all_bytes_enabled(0x0014_0500),
+            )
+            .unwrap();
+        write_config(&mut switch, 5, 0, 0x18, 0x0014_0a05);
+        assert_eq!(read_config(&mut switch, 5, 0, 0x18), 0x0014_0a05);
+        assert_eq!(read_config(&mut switch, 5, 1, 0x18), 0);
 
         // Save the state
         let saved_state = switch.save().expect("save should succeed");
@@ -1557,25 +1668,25 @@ mod tests {
             MsiTarget::disconnected(),
         ));
 
-        // Verify the new switch has default bus range on downstream port before restore
-        if let Some((_, _, downstream_port)) = switch2.downstream_ports.first() {
-            let default_bus_range = downstream_port.cfg_space().assigned_bus_range();
-            assert_eq!(default_bus_range, 0..=0);
-        }
+        switch2
+            .pci_cfg_write(
+                0x18,
+                ByteEnabledDwordWrite::with_all_bytes_enabled(0x0014_0500),
+            )
+            .unwrap();
+        assert_eq!(read_config(&mut switch2, 5, 0, 0x18), 0);
 
         // Restore the state
         switch2
             .restore(saved_state)
             .expect("restore should succeed");
 
-        // Verify the downstream port bus range is restored
-        if let Some((_, _, downstream_port)) = switch2.downstream_ports.first() {
-            let restored_bus_range = downstream_port.cfg_space().assigned_bus_range();
-            assert_eq!(*restored_bus_range.start(), 10);
-            assert_eq!(*restored_bus_range.end(), 20);
-        }
+        assert_eq!(read_config(&mut switch2, 5, 0, 0x18), 0x0014_0a05);
+        assert_eq!(read_config(&mut switch2, 5, 1, 0x18), 0);
     }
 
+    // Test: Save distinct upstream and downstream bus ranges.
+    // Expected: Fresh restore retains both ranges on their original bridge identities.
     #[test]
     fn test_save_restore_preserves_upstream_and_downstream_cfg_space() {
         use vmcore::save_restore::SaveRestore;
@@ -1595,9 +1706,7 @@ mod tests {
             .write_u32(0x18, 0x0014_1200);
 
         // Downstream port 1 bus range.
-        if let Some((_, _, downstream_port)) = switch.downstream_ports.get_mut(1) {
-            downstream_port.port.cfg_space.write_u32(0x18, 0x0020_1f12);
-        }
+        write_config(&mut switch, 0x12, 1, 0x18, 0x0020_1f12);
 
         let saved_state = switch.save().expect("save should succeed");
 
@@ -1617,13 +1726,8 @@ mod tests {
         assert_eq!(*upstream_bus_range.start(), 0x12);
         assert_eq!(*upstream_bus_range.end(), 0x14);
 
-        if let Some((_, _, downstream_port)) = switch2.downstream_ports.get(1) {
-            let downstream_bus_range = downstream_port.cfg_space().assigned_bus_range();
-            assert_eq!(*downstream_bus_range.start(), 0x1f);
-            assert_eq!(*downstream_bus_range.end(), 0x20);
-        } else {
-            panic!("missing downstream port 1");
-        }
+        assert_eq!(read_config(&mut switch2, 0x12, 1, 0x18), 0x0020_1f12);
+        assert_eq!(read_config(&mut switch2, 0x12, 0, 0x18), 0);
     }
 
     /// Adapts a `GenericPcieSwitch` to the `GenericPciBusDevice` trait so it
@@ -1672,6 +1776,8 @@ mod tests {
         }
     }
 
+    // Test: Enumerate an attached switch through its parent downstream port.
+    // Expected: Function zero exposes the upstream ID; function one is absent.
     #[test]
     fn test_switch_enumeration_through_port() {
         use crate::port::PcieDownstreamPort;
@@ -1747,6 +1853,8 @@ mod tests {
         );
     }
 
+    // Test: Request ACS support on switch downstream ports.
+    // Expected: Only downstream config space exposes the requested ACS bits.
     #[test]
     fn test_switch_acs_only_applies_to_dsp() {
         use pci_core::spec::caps::ExtendedCapabilityId;
@@ -1782,6 +1890,8 @@ mod tests {
         assert_eq!(caps_control as u16, 0x0001);
     }
 
+    // Test: Mix an explicit downstream devfn with automatic placement.
+    // Expected: Public enumeration retains both name/devfn pairs.
     #[test]
     fn test_switch_explicit_devfn() {
         // A downstream port with an explicit devfn is placed there; the
@@ -1814,6 +1924,8 @@ mod tests {
         assert_eq!(ports, vec![("b".into(), 0), ("a".into(), 16)]);
     }
 
+    // Test: Request CXL on a switch downstream port.
+    // Expected: Construction rejects the unsupported CXL topology.
     #[test]
     fn test_switch_cxl_rejected() {
         // CXL is not supported on switch downstream ports.
@@ -1836,6 +1948,8 @@ mod tests {
         ));
     }
 
+    // Test: Request two downstream ports at devfn zero.
+    // Expected: Construction reports DevfnInUse rather than dropping either port.
     #[test]
     fn test_switch_duplicate_devfn_rejected() {
         let definition = GenericPcieSwitchDefinition {

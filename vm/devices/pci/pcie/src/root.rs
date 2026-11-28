@@ -1377,6 +1377,8 @@ mod tests {
         .unwrap()
     }
 
+    // Test: Decode distinct CONFIG_ADDRESS fields and the enable boundary.
+    // Expected: Bus, device, function and aligned offset retain their wire values.
     #[test]
     fn test_pio_config_address_decode() {
         // Distinct fields catch bit-position errors; low bits are not an offset.
@@ -1393,6 +1395,8 @@ mod tests {
         assert_eq!(address.byte_offset(), 0xfc);
     }
 
+    // Test: Write full and partial CONFIG_ADDRESS values containing reserved bits.
+    // Expected: Reserved bits clear while untouched address fields are retained.
     #[test]
     fn test_pio_config_address_write_mask() {
         let mut rc = instantiate_root_complex_with_pio();
@@ -1429,6 +1433,8 @@ mod tests {
             .unwrap()
     }
 
+    // Test: Select the root port through legacy CF8/CFC configuration ports.
+    // Expected: CFC returns the complete root-port hardware identity.
     #[test]
     fn test_pio_config_read() {
         let mut rc = instantiate_root_complex_with_pio();
@@ -1445,6 +1451,8 @@ mod tests {
         );
     }
 
+    // Test: Write byte, word and dword lanes through legacy configuration ports.
+    // Expected: ECAM sees merged payloads; disabled decode preserves both registers.
     #[test]
     fn test_pio_config_write() {
         const BUS: u8 = 3;
@@ -1508,6 +1516,8 @@ mod tests {
         assert_eq!(*registers.lock(), [0xbbcc_aa44, 0xa1b2_c3d4]);
     }
 
+    // Test: Remove an attached root-port endpoint and attach a replacement.
+    // Expected: The removed endpoint is absent and the port is reusable.
     #[test]
     fn test_remove_pcie_device_from_root_port() {
         let mut rc = instantiate_root_complex(0, 255, 1);
@@ -1516,12 +1526,17 @@ mod tests {
         rc.remove_pcie_device(0)
             .expect("removing the connected device should succeed");
 
-        let BusDevice::RootPort { port, .. } = &rc.devices[0].1 else {
-            panic!("expected a root port");
-        };
-        assert!(port.port.link.is_none());
+        rc.mmio_write(0x18, &0x0001_0100_u32.to_le_bytes()).unwrap();
+        let mut value = [0; 4];
+        rc.mmio_read(0x100000, &mut value).unwrap();
+        assert_eq!(value, [0xff; 4]);
+        rc.add_pcie_device(0, "replacement", Box::new(TestPciDevice))
+            .unwrap();
+        rc.remove_pcie_device(0).unwrap();
     }
 
+    // Test: Remove a root-port endpoint at an unknown devfn.
+    // Expected: Removal returns the requested devfn in its error.
     #[test]
     fn test_remove_pcie_device_rejects_invalid_root_port() {
         let mut rc = instantiate_root_complex(0, 255, 1);
@@ -1531,6 +1546,8 @@ mod tests {
         assert_eq!(error.to_string(), "devfn 1 is not a root port");
     }
 
+    // Test: Race removal with a config read held by an endpoint handshake.
+    // Expected: The read completes intact before removal acquires the shared lock.
     #[test]
     fn test_remove_pcie_device_waits_for_in_flight_config_access() {
         const SECONDARY_BUS_NUM_REG: u64 = 0x19;
@@ -1647,6 +1664,8 @@ mod tests {
         switch.lock().poll_device(&mut cx);
     }
 
+    // Test: Build single-bus and full-range roots with up to 256 ports.
+    // Expected: Public enumeration reports every requested port.
     #[test]
     fn test_create() {
         assert_eq!(
@@ -1707,6 +1726,8 @@ mod tests {
         );
     }
 
+    // Test: Compute ECAM apertures for one, two and all 256 buses.
+    // Expected: Each bus contributes exactly one MiB, including bus 255.
     #[test]
     fn test_ecam_size() {
         // Single bus
@@ -1723,6 +1744,8 @@ mod tests {
         assert_eq!(ecam_size_from_bus_numbers(0, 255), 0x1000_0000);
     }
 
+    // Test: Probe packed root functions and absent functions with dword/word reads.
+    // Expected: Present functions return their IDs; absent functions return all ones.
     #[test]
     fn test_probe_ports_via_config_space() {
         let mut rc = instantiate_root_complex(0, 255, 4);
@@ -1757,6 +1780,8 @@ mod tests {
         }
     }
 
+    // Test: Attach two endpoints to the same root port.
+    // Expected: The second attachment reports the original occupant.
     #[test]
     fn test_add_downstream_device_to_port() {
         let mut rc = instantiate_root_complex(0, 0, 1);
@@ -1779,10 +1804,16 @@ mod tests {
 
         rc.add_pcie_device(0, "ep1", Box::new(endpoint1)).unwrap();
 
-        rc.add_pcie_device(0, "ep2", Box::new(endpoint2))
-            .expect_err("should fail: port already occupied");
+        assert_eq!(
+            rc.add_pcie_device(0, "ep2", Box::new(endpoint2))
+                .expect_err("should fail: port already occupied")
+                .as_ref(),
+            "ep1"
+        );
     }
 
+    // Test: Read an endpoint before and after guest bus-number reassignment.
+    // Expected: Only its current secondary bus exposes the endpoint payload.
     #[test]
     fn test_root_port_cfg_forwarding() {
         const SECONDARY_BUS_NUM_REG: u64 = 0x19;
@@ -1853,6 +1884,8 @@ mod tests {
         assert_eq!(value_32, 0xDEAD_BEEF);
     }
 
+    // Test: Complete deferred endpoint reads/writes successfully and with errors.
+    // Expected: Polling delivers full payloads and preserves NoResponse failures.
     #[async_test]
     async fn test_ecam_deferred_downstream_cfg_access() {
         const SECONDARY_BUS_NUM_REG: u64 = 0x19;
@@ -1946,6 +1979,8 @@ mod tests {
         ));
     }
 
+    // Test: Complete a deferred config read through a root and attached switch.
+    // Expected: Polling both routing levels returns the endpoint's complete dword.
     #[async_test]
     async fn test_ecam_deferred_cfg_access_behind_switch_completes_from_poll() {
         const ROOT_SECONDARY_BUS_NUM_REG: u64 = 0x19;
@@ -2038,6 +2073,8 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(read_data), 0x5566_7788);
     }
 
+    // Test: Read the CXL component header through the host-bridge aperture.
+    // Expected: The guest receives the specified cache/memory header dword.
     #[test]
     fn test_chbcr_reads_cxl_component_header_in_cxl_mode() {
         let chbcr_start = 0x2000_0000;
@@ -2050,6 +2087,8 @@ mod tests {
         assert_eq!(header, 0x0011_0001);
     }
 
+    // Test: Write and read a registered CXL payload block through CHBCR.
+    // Expected: The guest-visible dword retains every programmed byte.
     #[test]
     fn test_chbcr_read_write_redirects_to_component_registers() {
         let chbcr_start = 0x3000_0000;
@@ -2076,6 +2115,8 @@ mod tests {
         assert_eq!(read_back, value);
     }
 
+    // Test: Write and read eight bytes of a CXL payload block through CHBCR.
+    // Expected: Both dword halves retain the full 64-bit payload.
     #[test]
     fn test_chbcr_8byte_read_write_redirects_to_component_registers() {
         let chbcr_start = 0x3001_0000;
@@ -2102,6 +2143,8 @@ mod tests {
         assert_eq!(read_back, value);
     }
 
+    // Test: Read reserved space within the CHBCR aperture.
+    // Expected: The handled read overwrites its entire buffer with zero.
     #[test]
     fn test_chbcr_unmapped_read_is_handled() {
         let chbcr_start = 0x3002_0000;
@@ -2109,12 +2152,14 @@ mod tests {
 
         // This offset is not synthesized/populated and should still be
         // treated as a handled CHBCR MMIO read.
-        let mut value: u64 = 0;
+        let mut value: u64 = u64::MAX;
         rc.mmio_read(chbcr_start + 0x800, value.as_mut_bytes())
             .unwrap();
         assert_eq!(value, 0);
     }
 
+    // Test: Write reserved space within the CHBCR aperture.
+    // Expected: The handled write leaves reserved space zero and the header intact.
     #[test]
     fn test_chbcr_unmapped_write_is_handled() {
         let chbcr_start = 0x3003_0000;
@@ -2124,8 +2169,16 @@ mod tests {
         let value = 0x0123_4567_89ab_cdefu64;
         rc.mmio_write(chbcr_start + 0x800, value.as_bytes())
             .unwrap();
+        let mut read_back = [0xff; 8];
+        rc.mmio_read(chbcr_start + 0x800, &mut read_back).unwrap();
+        assert_eq!(read_back, [0; 8]);
+        let mut header = [0; 4];
+        rc.mmio_read(chbcr_start + 0x1000, &mut header).unwrap();
+        assert_eq!(header, [1, 0, 0x11, 0]);
     }
 
+    // Test: Reset two programmed root ports and then reprogram their commands.
+    // Expected: Both commands clear on reset and accept new programming afterward.
     #[async_test]
     async fn test_reset() {
         const COMMAND_REG: u64 = 0x4;
@@ -2170,6 +2223,8 @@ mod tests {
         assert_eq!(value_16, COMMAND_REG_VALUE);
     }
 
+    // Test: Construct root ports with runtime hotplug disabled and slot 5 enabled.
+    // Expected: IDs are stable and guest slot capabilities reflect each setting.
     #[test]
     fn test_root_port_hotplug_options() {
         // Test with hotplug disabled (None)
@@ -2185,11 +2240,10 @@ mod tests {
                 PciePortSettings::default(),
             )
         };
-        // We can't easily verify hotplug is disabled without accessing internal state,
-        // but we can verify the port was created successfully
         let vendor_device_id = root_port_no_hotplug.port.cfg_space.read_u32(0x0);
         let expected = (ROOT_PORT_DEVICE_ID as u32) << 16 | (VENDOR_ID as u32);
         assert_eq!(vendor_device_id, expected);
+        assert_eq!(root_port_no_hotplug.port.cfg_space.read_u32(0x54), 0);
 
         // Test with hotplug enabled (Some(slot_number))
         let root_port_with_hotplug = {
@@ -2206,10 +2260,13 @@ mod tests {
         };
         let vendor_device_id_hotplug = root_port_with_hotplug.port.cfg_space.read_u32(0x0);
         assert_eq!(vendor_device_id_hotplug, expected);
-        // The slot number and hotplug capability would be tested via PCIe capability registers
-        // but that requires more complex setup
+        let slot = root_port_with_hotplug.port.cfg_space.read_u32(0x54);
+        assert_ne!(slot & (1 << 6), 0);
+        assert_eq!(slot >> 19, 5);
     }
 
+    // Test: Forward reads and writes through an unconfigured root port.
+    // Expected: Reads return all ones and writes are handled without routing.
     #[test]
     fn test_root_port_invalid_bus_range_handling() {
         let mut root_port = {
@@ -2237,6 +2294,7 @@ mod tests {
             ByteEnabledDwordRead::with_all_bytes_enabled(&mut value),
         );
         assert!(matches!(result, IoResult::Ok));
+        assert_eq!(value, u32::MAX);
 
         let result = root_port.port.forward_cfg_write_with_routing(
             addr,
@@ -2245,6 +2303,8 @@ mod tests {
         assert!(matches!(result, IoResult::Ok));
     }
 
+    // Test: Save an unconfigured four-port root and restore into a fresh root.
+    // Expected: The snapshot preserves bus bounds, port count and default registers.
     #[test]
     fn test_save_restore_basic() {
         use vmcore::save_restore::SaveRestore;
@@ -2262,8 +2322,15 @@ mod tests {
         // Restore the state to a new root complex
         let mut rc2 = instantiate_root_complex(0, 255, 4);
         rc2.restore(saved_state).expect("restore should succeed");
+        for devfn in 0..4 {
+            let mut value = [0xff; 4];
+            rc2.mmio_read(devfn * 4096 + 0x18, &mut value).unwrap();
+            assert_eq!(value, [0; 4]);
+        }
     }
 
+    // Test: Save distinct bus ranges on two ports and restore into a fresh root.
+    // Expected: Each port recovers its own secondary and subordinate bus numbers.
     #[test]
     fn test_save_restore_with_bus_configuration() {
         use vmcore::save_restore::SaveRestore;
@@ -2345,6 +2412,8 @@ mod tests {
         assert_eq!(restored_bus, 20);
     }
 
+    // Test: Restore a root snapshot into a root with different bus bounds.
+    // Expected: Restore rejects the incompatible bus range.
     #[test]
     fn test_save_restore_bus_number_mismatch_error() {
         use vmcore::save_restore::SaveRestore;
@@ -2363,6 +2432,8 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // Test: Restore a four-port root snapshot into a two-port root.
+    // Expected: Restore rejects the incompatible port count.
     #[test]
     fn test_save_restore_port_count_mismatch_error() {
         use vmcore::save_restore::SaveRestore;
@@ -2382,6 +2453,8 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // Test: Save a programmed CXL payload and restore into fresh matching backing.
+    // Expected: A CHBCR read returns the original full dword.
     #[test]
     fn test_save_restore_with_cxl_component_registers() {
         use vmcore::save_restore::SaveRestore;
@@ -2424,6 +2497,8 @@ mod tests {
         assert_eq!(read_back, programmed);
     }
 
+    // Test: Retain a public bus-range handle while the guest reprograms its port.
+    // Expected: The same handle follows both secondary/subordinate assignments.
     #[test]
     fn test_bus_range_updated_on_cfg_write() {
         const SECONDARY_BUS_NUM_REG: u64 = 0x19;
@@ -2455,6 +2530,8 @@ mod tests {
         assert_eq!(bus_range.bus_range(), (20, 30));
     }
 
+    // Test: Access an integrated endpoint alongside a root port and absent device.
+    // Expected: Config reads return independent IDs and writes reach only the RCiEP.
     #[test]
     fn test_rciep_ecam_read_write() {
         // Create a root complex with root ports starting at device 1,
@@ -2485,14 +2562,20 @@ mod tests {
         .unwrap();
 
         // Attach an RCiEP at device 0 function 0 (devfn 0).
+        let register = Arc::new(Mutex::new(0xDEAD_BEEF));
+        let read_register = register.clone();
+        let write_register = register.clone();
         let rciep = TestPcieEndpoint::new(
-            |offset, mut value| {
-                if offset == 0 {
-                    value.set(0xDEAD_BEEF);
-                }
+            move |offset, mut value| {
+                assert_eq!(offset, 0);
+                value.set(*read_register.lock());
                 Some(IoResult::Ok)
             },
-            |_, _| Some(IoResult::Ok),
+            move |offset, value| {
+                assert_eq!(offset, 0);
+                value.merge_into(&mut write_register.lock());
+                Some(IoResult::Ok)
+            },
         );
         rc.add_rciep(0, "rciep-0", Box::new(rciep)).unwrap();
 
@@ -2501,9 +2584,11 @@ mod tests {
         rc.mmio_read(0, vendor_device.as_mut_bytes()).unwrap();
         assert_eq!(vendor_device, 0xDEAD_BEEF);
 
-        // ECAM write at device 0, function 0 should route to the RCiEP
-        // (the test endpoint accepts all writes).
+        // ECAM writes must reach the integrated endpoint, not its peer root port.
         rc.mmio_write(0, &0x1234_5678u32.to_le_bytes()).unwrap();
+        rc.mmio_read(0, vendor_device.as_mut_bytes()).unwrap();
+        assert_eq!(vendor_device, 0x1234_5678);
+        assert_eq!(*register.lock(), 0x1234_5678);
 
         // Root port at device 1 should still be accessible.
         let mut root_port_vendor: u32 = 0;
@@ -2519,6 +2604,8 @@ mod tests {
         assert_eq!(empty, 0xFFFF_FFFF);
     }
 
+    // Test: Probe an RCiEP's function zero and unimplemented function one.
+    // Expected: Function zero returns its payload; function one returns all ones.
     #[test]
     fn test_rciep_function0_fallback() {
         // Test that a config read to function 1 of an RCiEP device falls
@@ -2562,6 +2649,8 @@ mod tests {
         assert_eq!(val_fn1, 0xFFFF_FFFF);
     }
 
+    // Test: Insert an RCiEP at a devfn already used by a root port.
+    // Expected: The collision error identifies the existing root port.
     #[test]
     fn test_rciep_collision_with_root_port() {
         // Verify that adding an RCiEP at a devfn already occupied by a
@@ -2575,6 +2664,8 @@ mod tests {
         assert_eq!(err.as_ref(), "test-port-0");
     }
 
+    // Test: Insert two RCiEPs at the same devfn.
+    // Expected: The collision error identifies the original integrated endpoint.
     #[test]
     fn test_rciep_collision_with_rciep() {
         // Verify that adding two RCiEPs at the same devfn returns an error.
@@ -2594,6 +2685,8 @@ mod tests {
         assert_eq!(err.as_ref(), "rciep-first");
     }
 
+    // Test: Insert an RCiEP at a reserved device number.
+    // Expected: Registration rejects the reserved slot with a descriptive error.
     #[test]
     fn test_rciep_collision_with_reserved_device_number() {
         // Reserve device 0 and verify RCiEP insertion at devfn 0 is rejected.
@@ -2612,6 +2705,8 @@ mod tests {
         assert_eq!(err.as_ref(), "reserved device number 0x0");
     }
 
+    // Test: Probe header types for single and multifunction root devices.
+    // Expected: Only the multifunction device advertises the multifunction bit.
     #[test]
     fn test_multi_function_header_bit() {
         // With >1 port, bit 23 of register 0x0C (header type bit 7) must be set
@@ -2640,6 +2735,8 @@ mod tests {
         );
     }
 
+    // Test: Place sole functions on two distinct devices.
+    // Expected: Neither device advertises a multifunction header.
     #[test]
     fn test_multi_function_bit_is_per_device() {
         // Two ports placed at explicit devfns on *distinct* devices (each the
@@ -2681,6 +2778,8 @@ mod tests {
         }
     }
 
+    // Test: Request 257 root ports where only 256 devfns exist.
+    // Expected: Construction rejects the request rather than truncating topology.
     #[test]
     fn test_too_many_ports_returns_error() {
         // 257 ports starting at device 0 requires device 32, which is out of range.
@@ -2739,6 +2838,8 @@ mod tests {
             .collect())
     }
 
+    // Test: Assign three automatically placed root ports.
+    // Expected: Names map to consecutive devfns zero through two.
     #[test]
     fn test_devfn_auto_allocation() {
         // All-None ports pack onto consecutive devfns starting at 0.
@@ -2749,6 +2850,8 @@ mod tests {
         );
     }
 
+    // Test: Automatically place ports starting at device one.
+    // Expected: Placement begins at devfn eight and preserves port-name mapping.
     #[test]
     fn test_devfn_auto_allocation_respects_first_device() {
         // None ports start at the first-port device number (device 1 → devfn 8).
@@ -2756,6 +2859,8 @@ mod tests {
         assert_eq!(ports, vec![("a".into(), 8), ("b".into(), 9)]);
     }
 
+    // Test: Mix explicit and automatic devfn requests.
+    // Expected: Explicit slots are honored and automatic placement skips used slots.
     #[test]
     fn test_devfn_explicit_and_auto_mix() {
         // Explicit devfn is honored; subsequent None ports skip used devfns.
@@ -2768,6 +2873,8 @@ mod tests {
         );
     }
 
+    // Test: Request explicit devfn zero after automatic placement consumes it.
+    // Expected: Ordered allocation reports DevfnInUse for zero.
     #[test]
     fn test_devfn_none_then_explicit_zero_conflicts() {
         // [None, Some(0)]: the None port takes devfn 0, so the explicit
@@ -2779,6 +2886,8 @@ mod tests {
         ));
     }
 
+    // Test: Request the same explicit devfn twice.
+    // Expected: Construction reports DevfnInUse for the duplicate value.
     #[test]
     fn test_devfn_explicit_duplicate_conflicts() {
         let err = build_with_devfns(vec![("a", Some(5)), ("b", Some(5))], 0).unwrap_err();
@@ -2788,6 +2897,8 @@ mod tests {
         ));
     }
 
+    // Test: Place function one of device five without function zero.
+    // Expected: Construction rejects the undiscoverable device.
     #[test]
     fn test_devfn_nonzero_function_without_function_zero_fails() {
         // device 5, function 1 (devfn 0x29) with no function 0 is undiscoverable.
@@ -2800,6 +2911,8 @@ mod tests {
         ));
     }
 
+    // Test: Place function zero and function one of device five.
+    // Expected: Both discoverable functions retain their requested name/devfn mapping.
     #[test]
     fn test_devfn_function_zero_present_allows_higher_functions() {
         // device 5 functions 0 and 1 present: discoverable, so this is allowed.
