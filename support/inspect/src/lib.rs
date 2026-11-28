@@ -2218,6 +2218,7 @@ mod tests {
     use pal_async::async_test;
     use pal_async::timer::Instant;
     use pal_async::timer::PolledTimer;
+    use test_with_tracing::test;
 
     fn expected_node(node: Node, expect: Expect) -> Node {
         expect.assert_eq(&std::format!("{node:#}|{}", node.json()));
@@ -2286,6 +2287,8 @@ mod tests {
         }
     }
 
+    // Test: Inspect a parent with indexed children and scalar fields.
+    // Expected: Text and JSON contain each child and the parent's own fields.
     #[test]
     fn test() {
         let f = Foo {
@@ -2324,16 +2327,19 @@ mod tests {
         );
     }
 
+    // Test: Resolve an inspection completed by a separate thread.
+    // Expected: The response is returned and the producer thread is joined.
     #[async_test]
     async fn test_deferred(driver: DefaultDriver) {
+        let mut worker = None;
         inspect_async_expect(
             &driver,
             "",
             None,
             Duration::from_secs(1),
-            adhoc(|req| {
+            adhoc_mut(|req| {
                 let foo = req.defer();
-                std::thread::spawn(|| foo.inspect(&Foo::default()));
+                worker = Some(std::thread::spawn(|| foo.inspect(&Foo::default())));
             }),
             expect!([r#"
                 {
@@ -2342,23 +2348,23 @@ mod tests {
                 }|{"xx":0,"xy":false}"#]),
         )
         .await;
+        worker.unwrap().join().unwrap();
     }
 
-    #[async_test]
-    async fn test_dropped(driver: DefaultDriver) {
-        inspect_async_expect(
-            &driver,
-            "",
-            None,
-            Duration::from_hours(24),
-            adhoc(|req| {
-                drop(req.defer());
-            }),
+    // Test: Drop a deferred request without responding to it.
+    // Expected: Resolution finishes with an unresolved error, not a hang.
+    #[test]
+    fn test_dropped() {
+        let mut inspection = inspect("", adhoc(|req| drop(req.defer())));
+        assert!(inspection.resolve().now_or_never().is_some());
+        expected_node(
+            inspection.results(),
             expect!([r#"error (unresolved)|{"$error":"unresolved"}"#]),
-        )
-        .await;
+        );
     }
 
+    // Test: Cancel resolution with one completed and one pending child, then resume.
+    // Expected: Completed results survive cancellation; resuming collects the rest.
     #[test]
     fn test_deferred_partial_results_and_resume() {
         for finish_pending in [false, true] {
@@ -2397,6 +2403,8 @@ mod tests {
         }
     }
 
+    // Test: Complete an external inspection for a nested path with safe filtering.
+    // Expected: Forwarded parameters and the returned value preserve the request.
     #[test]
     fn test_deferred_external_path() {
         let mut deferred = None;
@@ -2421,6 +2429,8 @@ mod tests {
         assert_eq!(inspection.results(), Node::Value(Value::new(7u32)));
     }
 
+    // Test: Complete external requests with filtered children or a sensitive root.
+    // Expected: Safe children survive; disallowed subtrees and roots are excluded.
     #[test]
     fn test_deferred_external_sensitivity() {
         for sensitivity in [SensitivityLevel::Safe, SensitivityLevel::Sensitive] {
@@ -2465,6 +2475,8 @@ mod tests {
         }
     }
 
+    // Test: Complete direct and converted deferred updates with success or failure.
+    // Expected: Requested input, hex formatting, and rejection errors reach callers.
     #[test]
     fn test_deferred_update_results() {
         for (direct, succeed) in [(true, true), (false, true), (true, false)] {
@@ -2499,6 +2511,8 @@ mod tests {
         }
     }
 
+    // Test: Send immutable and mutable proxy inspections through a mesh channel.
+    // Expected: Deferred responses return their fields and omit ignored children.
     #[test]
     fn test_deferred_mesh_response() {
         for mutable in [false, true] {
@@ -2528,6 +2542,8 @@ mod tests {
         }
     }
 
+    // Test: Forward valid and invalid updates to a remote mutable field.
+    // Expected: Only valid input changes the field; invalid input returns an error.
     #[test]
     fn test_deferred_update_dispatch() {
         for new_value in ["27", "invalid"] {
@@ -2563,6 +2579,8 @@ mod tests {
         }
     }
 
+    // Test: Look up directories and values with normal and repeated separators.
+    // Expected: Correct nodes are returned; missing and non-directory paths differ.
     #[test]
     fn test_path() {
         let mut obj = adhoc(|req| {
@@ -2610,25 +2628,26 @@ mod tests {
         );
     }
 
+    // Test: Time out resolution while the producer still owns the deferred request.
+    // Expected: The caller gets an unresolved error without waiting for a response.
     #[async_test]
     async fn test_timeout(driver: DefaultDriver) {
-        inspect_async_expect(
-            &driver,
-            "",
-            None,
-            Duration::from_millis(10),
-            adhoc(|req| {
-                let foo = req.defer();
-                std::thread::spawn(|| {
-                    std::thread::sleep(Duration::from_millis(250));
-                    foo.inspect(&Foo::default())
-                });
-            }),
+        let mut pending = None;
+        let mut inspection = inspect("", adhoc_mut(|req| pending = Some(req.defer())));
+        let mut timer = PolledTimer::new(&driver);
+        futures::select! {
+            _ = inspection.resolve().fuse() => panic!("unanswered request resolved"),
+            _ = timer.sleep_until(Instant::now() + Duration::from_millis(10)).fuse() => {}
+        };
+        expected_node(
+            inspection.results(),
             expect!([r#"error (unresolved)|{"$error":"unresolved"}"#]),
-        )
-        .await;
+        );
+        drop(pending.unwrap());
     }
 
+    // Test: Merge an unnamed producer into a directory and look up each field.
+    // Expected: Both producers' fields survive and absent fields report not found.
     #[test]
     fn test_merge() {
         let mut obj = adhoc(|req| {
@@ -2657,6 +2676,8 @@ mod tests {
         );
     }
 
+    // Test: Merge duplicate values and directories with overlapping field names.
+    // Expected: Later values win and distinct directory children remain available.
     #[test]
     fn test_named_merge() {
         let mut obj = adhoc(|req| {
@@ -2710,6 +2731,8 @@ mod tests {
         );
     }
 
+    // Test: Update mutable scalar and nested fields beside an immutable field.
+    // Expected: Targeted values change; immutable and non-directory updates fail.
     #[test]
     fn test_update() {
         struct Foo {
@@ -2770,6 +2793,8 @@ mod tests {
         assert_eq!(foo.child.as_ref().unwrap().mut_, 103);
     }
 
+    // Test: Inspect slash-separated field names with nested paths and depth limits.
+    // Expected: Names form directories and exhausted descendants are unevaluated.
     #[test]
     fn test_nest() {
         let mut obj = adhoc(|req| {
@@ -2823,6 +2848,8 @@ mod tests {
         );
     }
 
+    // Test: Limit inspection depth across nested and slash-separated children.
+    // Expected: Values remain visible and producers below the limit are not run.
     #[test]
     fn test_depth() {
         let mut obj = adhoc(|req| {
@@ -2879,6 +2906,8 @@ mod tests {
         );
     }
 
+    // Test: Expose signed and unsigned fields with hexadecimal formatting.
+    // Expected: Text and JSON retain their prefixed hexadecimal representations.
     #[test]
     fn test_hex() {
         let mut obj = adhoc(|req| {
@@ -2896,6 +2925,8 @@ mod tests {
         );
     }
 
+    // Test: Expose signed and unsigned fields with binary formatting.
+    // Expected: Text and JSON retain their prefixed binary representations.
     #[test]
     fn test_binary() {
         let mut obj = adhoc(|req| {
@@ -2915,6 +2946,8 @@ mod tests {
         );
     }
 
+    // Test: Compare snapshots with counters, ordinary values, and changed children.
+    // Expected: Counters become rates, new values survive, and removed children vanish.
     #[test]
     fn test_since() {
         let mut n = 500_u32;
@@ -2962,6 +2995,8 @@ mod tests {
         );
     }
 
+    // Test: Inspect an iterable byte source through AsBytes.
+    // Expected: Text uses hexadecimal bytes and JSON uses unpadded base64.
     #[test]
     fn test_bytes() {
         inspect_sync_expect(
@@ -2972,6 +3007,8 @@ mod tests {
         );
     }
 
+    // Test: Filter nested, unnamed, and slash-separated fields by sensitivity.
+    // Expected: Only permitted subtrees survive; default requests include all levels.
     #[test]
     fn test_sensitivity() {
         let mut obj = adhoc(|req| {
@@ -3097,6 +3134,8 @@ mod tests {
         );
     }
 
+    // Test: Inspect derived structures with renames, wrappers, flattening, and formats.
+    // Expected: Public output reflects the attributes and excludes skipped fields.
     #[test]
     fn test_derive() {
         use std::marker::PhantomData;
@@ -3262,6 +3301,8 @@ mod tests {
         );
     }
 
+    // Test: Inspect derived unit, tagged, externally tagged, and untagged enums.
+    // Expected: Variant names and fields use their declared output formats.
     #[test]
     fn test_derive_enum() {
         #[expect(dead_code)]
@@ -3355,6 +3396,8 @@ mod tests {
         );
     }
 
+    // Test: Inspect a derived structure that adds a computed field.
+    // Expected: Both stored fields and the computed sum appear in public output.
     #[test]
     fn test_derive_extra() {
         #[derive(Inspect)]
@@ -3383,6 +3426,8 @@ mod tests {
         );
     }
 
+    // Test: Filter derived nested structures using field sensitivity attributes.
+    // Expected: Each request retains only allowed descendants and their metadata.
     #[test]
     fn test_derive_sensitivity() {
         #[derive(Inspect)]
@@ -3486,6 +3531,8 @@ mod tests {
         );
     }
 
+    // Test: Inspect an indexed collection under a safe field.
+    // Expected: Index entries inherit sensitivity without exposing sensitive children.
     #[test]
     fn test_inherit_sensitivity() {
         fn inspect_sync(
@@ -3558,7 +3605,8 @@ mod tests {
         );
     }
 
-    /// Test that you can update via AtomicMut.
+    // Test: Apply a boolean update through AtomicMut.
+    // Expected: The public update succeeds and stores the requested value.
     #[test]
     fn test_atomic_mut() {
         let mut v = core::sync::atomic::AtomicBool::new(false);

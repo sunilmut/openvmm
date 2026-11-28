@@ -99,7 +99,10 @@ fn parse_prefix(v: &[u8], base: u32) -> (Option<u64>, usize) {
 mod tests {
     use super::compare;
     use alloc::vec;
+    use test_with_tracing::test;
 
+    // Test: Sort names containing decimal, hexadecimal, and alphabetic suffixes.
+    // Expected: Numeric segments sort numerically and alphabetic suffixes lexically.
     #[test]
     fn test_natural_sort() {
         let mut x = vec![
@@ -116,6 +119,8 @@ mod tests {
         );
     }
 
+    // Test: Compare numbers followed by hex-letter and non-hex-letter suffixes.
+    // Expected: Both suffix forms use string ordering rather than numeric ordering.
     #[test]
     fn test_hex_suffix_consistency() {
         // Numbers with hex-letter suffixes should behave the same as numbers
@@ -126,6 +131,8 @@ mod tests {
         assert_eq!(compare("3cab", "100cab"), Ordering::Greater);
     }
 
+    // Test: Compare a decimal prefix whose final addition would overflow u64.
+    // Expected: Comparison completes without panic and identical names compare equal.
     #[test]
     fn test_decimal_overflow_does_not_panic() {
         // Regression test: parsing a decimal numeric prefix where `n * 10`

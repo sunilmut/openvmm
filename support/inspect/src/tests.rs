@@ -4,6 +4,7 @@
 use crate::AsDebug;
 use crate::AsDisplay;
 use crate::AtomicMut;
+use crate::Entry;
 use crate::Error;
 use crate::InspectMut;
 use crate::InspectionBuilder;
@@ -29,6 +30,7 @@ use core::sync::atomic::AtomicU64;
 use core::sync::atomic::Ordering;
 use core::time::Duration;
 use futures::FutureExt;
+use test_with_tracing::test;
 
 fn read(obj: impl InspectMut) -> Node {
     let mut inspection = inspect("", obj);
@@ -338,5 +340,131 @@ fn nested_numeric_updates_preserve_bounds_and_sibling_values() {
     assert_eq!(
         read(&mut obj).json().to_string(),
         r#"{"left":{"limit":255},"right":{"limit":0}}"#
+    );
+}
+
+// Test: Cancel a pending resolver, poll a replacement, and complete its request.
+// Expected: Completion wakes the current resolver and preserves the returned value.
+#[test]
+fn deferred_completion_wakes_replacement_resolver() {
+    use core::future::Future;
+    use core::sync::atomic::AtomicUsize;
+    use core::task::Context;
+    use futures::task::ArcWake;
+    use futures::task::waker;
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl ArcWake for WakeCount {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    let first = Arc::new(WakeCount::default());
+    let replacement = Arc::new(WakeCount::default());
+    let mut pending = None;
+    let mut inspection = inspect("", adhoc_mut(|req| pending = Some(req.defer())));
+    for counter in [&first, &replacement] {
+        let waker = waker(counter.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut resolve = core::pin::pin!(inspection.resolve());
+        assert!(resolve.as_mut().poll(&mut context).is_pending());
+    }
+    assert_eq!(replacement.0.load(Ordering::Relaxed), 0);
+    pending.unwrap().value(37u32);
+    assert!(replacement.0.load(Ordering::Relaxed) > 0);
+    assert!(inspection.resolve().now_or_never().is_some());
+    assert_eq!(inspection.results(), Node::Value(Value::new(37u32)));
+}
+
+// Test: Reject synchronous and deferred updates with a nested error cause.
+// Expected: Both public errors and JSON retain the outer message and its cause.
+#[test]
+fn update_rejections_preserve_error_causes() {
+    #[derive(Debug, thiserror::Error)]
+    #[error("setting rejected")]
+    struct Rejection(#[source] std::io::Error);
+
+    for deferred in [false, true] {
+        let result = update(
+            "",
+            "invalid",
+            adhoc(|req| {
+                let req = req.update().ok().unwrap();
+                let error = Rejection(std::io::Error::other("invalid input"));
+                if deferred {
+                    req.defer().fail(error);
+                } else {
+                    req.fail(error);
+                }
+            }),
+        )
+        .now_or_never()
+        .unwrap();
+        let error = Error::Update("setting rejected: invalid input".into());
+        assert_eq!(result, Err(error.clone()));
+        assert_eq!(
+            Node::Failed(error).json().to_string(),
+            r#"{"$error":"update error: setting rejected: invalid input"}"#
+        );
+    }
+}
+
+// Test: Serialize and deserialize diagnostic bytes, formats, and sensitivity.
+// Expected: A fresh decoded tree preserves metadata, payloads, and public JSON.
+#[test]
+fn serialized_tree_preserves_formats_bytes_and_sensitivity() {
+    let tree = Node::Dir(vec![
+        Entry {
+            name: "payload".into(),
+            node: Node::Value(Value::new([0xffu8, 0x00])),
+            sensitivity: SensitivityLevel::Sensitive,
+        },
+        Entry {
+            name: "address".into(),
+            node: Node::Value(Value::hex(u64::MAX)),
+            sensitivity: SensitivityLevel::Safe,
+        },
+        Entry {
+            name: "count".into(),
+            node: Node::Value(Value::counter(42u64)),
+            sensitivity: SensitivityLevel::Unspecified,
+        },
+        Entry {
+            name: "mask".into(),
+            node: Node::Value(Value::binary(5u32)),
+            sensitivity: SensitivityLevel::Safe,
+        },
+    ]);
+    let (encoded, resources) = mesh::Message::new(tree.clone()).serialize();
+    assert!(resources.is_empty());
+    let decoded: Node = mesh::Message::serialized(&encoded, resources)
+        .parse()
+        .unwrap();
+    assert_eq!(decoded, tree);
+    assert_eq!(
+        decoded.json().to_string(),
+        r#"{"payload":"/wA","address":"0xffffffffffffffff","count":42,"mask":"0b101"}"#
+    );
+}
+
+// Test: Inspect an open file through the optional filepath implementation.
+// Expected: The public value identifies the actual file's canonical path.
+#[cfg(feature = "filepath")]
+#[test]
+fn file_inspection_reports_open_file_path() {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "The filepath API resolves symlinks, so the independent oracle must too."
+    )]
+    let path =
+        std::fs::canonicalize(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
+            .unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    assert_eq!(
+        read(&file),
+        Node::Value(Value::new(path.display().to_string()))
     );
 }
