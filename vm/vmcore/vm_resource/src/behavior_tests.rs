@@ -3,7 +3,11 @@
 
 use super::*;
 use pal_async::async_test;
+use std::future::Future;
+use std::future::poll_fn;
 use std::io;
+use std::task::Poll;
+use test_with_tracing::test;
 
 enum ValueKind {}
 impl ResourceKind for ValueKind {
@@ -246,11 +250,10 @@ async fn resolution_errors_keep_resource_identity_and_source() {
     );
     assert_eq!(error.to_string(), "no resolver for behavior_value:platform");
     let resolver = resolver();
-    for resource in [
-        Resource::new(Value { value: 0 }),
-        Resource::new(AsyncValue { value: 0 }),
+    for (resource, expected_id) in [
+        (Resource::new(Value { value: 0 }), "value"),
+        (Resource::new(AsyncValue { value: 0 }), "async"),
     ] {
-        let expected_id = resource.id().to_owned();
         let error = resolver.resolve(resource, "").await.unwrap_err();
         let ResolveError::ResolverError { kind, id, source } = error else {
             panic!("expected backend failure");
@@ -261,6 +264,10 @@ async fn resolution_errors_keep_resource_identity_and_source() {
         while let Some(next) = source.source() {
             source = next;
         }
+        assert_eq!(
+            source.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::Other
+        );
         assert_eq!(source.to_string(), "zero value rejected");
     }
 }
@@ -360,4 +367,169 @@ async fn serialized_resource_failures_do_not_poison_later_resolution() {
             .unwrap();
         assert_eq!(resolver.resolve(resource, &prefix).await.unwrap(), expected);
     }
+}
+
+enum OwnedKind {}
+impl ResourceKind for OwnedKind {
+    const NAME: &'static str = "behavior_owned";
+}
+impl CanResolveTo<OwnedResult> for OwnedKind {
+    type Input<'a> = &'a str;
+}
+
+#[derive(MeshPayload)]
+struct OwnedRequest {
+    label: String,
+    lanes: Vec<u64>,
+    bytes: Vec<u8>,
+    gate: mesh::OneshotReceiver<()>,
+    lease: mesh::OneshotSender<()>,
+}
+impl ResourceId<OwnedKind> for OwnedRequest {
+    const ID: &'static str = "owned";
+}
+
+struct OwnedResult {
+    label: String,
+    lanes: Vec<u64>,
+    bytes: Vec<u8>,
+    prefix: String,
+    lease: mesh::OneshotSender<()>,
+}
+
+struct OwnedResolver;
+#[async_trait]
+impl AsyncResolveResource<OwnedKind, OwnedRequest> for OwnedResolver {
+    type Output = OwnedResult;
+    type Error = io::Error;
+
+    async fn resolve(
+        &self,
+        _resolver: &ResourceResolver,
+        resource: OwnedRequest,
+        input: &str,
+    ) -> Result<OwnedResult, Self::Error> {
+        resource
+            .gate
+            .await
+            .map_err(|err| io::Error::new(io::ErrorKind::BrokenPipe, err))?;
+        Ok(OwnedResult {
+            label: resource.label,
+            lanes: resource.lanes,
+            bytes: resource.bytes,
+            prefix: input.to_owned(),
+            lease: resource.lease,
+        })
+    }
+}
+
+// Test: Resolve fresh owned payloads directly and through serialized envelopes.
+// Expected: Every payload field and borrowed input survives type erasure, including
+//       wide integers and binary data; the returned object owns the channel lease.
+#[async_test]
+async fn owned_payload_resolution_preserves_all_fields_and_transfers_ownership() {
+    let mut resolver = ResourceResolver::new();
+    resolver.add_async_resolver(OwnedResolver);
+    let prefix = String::from("borrowed=");
+    for serialized in [false, true] {
+        let (ready, gate) = mesh::oneshot();
+        let (lease, mut released) = mesh::oneshot();
+        let resource = Resource::new(OwnedRequest {
+            label: "disk-λ".into(),
+            lanes: vec![0, 0x1_0000_0001, u64::MAX],
+            bytes: vec![0, 0x80, 0xff, 7],
+            gate,
+            lease,
+        });
+        let resource = if serialized {
+            OwnedMessage::serialized(OwnedMessage::new(resource).serialize())
+                .parse::<Resource<OwnedKind>>()
+                .unwrap()
+        } else {
+            resource
+        };
+        ready.send(());
+        let output = resolver.resolve(resource, &prefix).await.unwrap();
+        assert_eq!(output.label, "disk-λ");
+        assert_eq!(output.lanes, [0, 0x1_0000_0001, u64::MAX]);
+        assert_eq!(output.bytes, [0, 0x80, 0xff, 7]);
+        assert_eq!(output.prefix, "borrowed=");
+        poll_fn(|cx| {
+            assert!(std::pin::Pin::new(&mut released).poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        output.lease.send(());
+        assert_eq!(released.await.unwrap(), ());
+    }
+}
+
+// Test: Cancel a pending serialized request while a cloned resolver serves peers.
+// Expected: Cancellation closes both owned endpoints without changing peer
+//       resolution; a fresh request of the cancelled type still resolves normally.
+#[async_test]
+async fn cancelled_resolution_releases_ownership_without_poisoning_peers() {
+    let mut resolver = resolver();
+    resolver.add_async_resolver(OwnedResolver);
+    let peer_resolver = resolver.clone();
+    let peer = Resource::new(AsyncValue { value: 9 });
+    let (ready, gate) = mesh::oneshot();
+    let (lease, mut released) = mesh::oneshot();
+    let resource = OwnedMessage::serialized(
+        OwnedMessage::new(Resource::new(OwnedRequest {
+            label: "cancelled".into(),
+            lanes: vec![11],
+            bytes: vec![19],
+            gate,
+            lease,
+        }))
+        .serialize(),
+    )
+    .parse::<Resource<OwnedKind>>()
+    .unwrap();
+    let mut pending = Box::pin(resolver.resolve(resource, "cancel="));
+    poll_fn(|cx| {
+        assert!(pending.as_mut().poll(cx).is_pending());
+        assert!(std::pin::Pin::new(&mut released).poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    assert!(!ready.is_closed());
+    assert_eq!(
+        peer_resolver.resolve(peer, "peer=").await.unwrap(),
+        "peer=27"
+    );
+    drop(pending);
+    assert!(ready.is_closed());
+    assert!(released.await.is_err());
+
+    let (ready, gate) = mesh::oneshot();
+    let (lease, released) = mesh::oneshot();
+    ready.send(());
+    let output = peer_resolver
+        .resolve(
+            Resource::new(OwnedRequest {
+                label: "fresh".into(),
+                lanes: vec![23, 29],
+                bytes: vec![31, 37],
+                gate,
+                lease,
+            }),
+            "after=",
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.label, "fresh");
+    assert_eq!(output.lanes, [23, 29]);
+    assert_eq!(output.bytes, [31, 37]);
+    assert_eq!(output.prefix, "after=");
+    output.lease.send(());
+    assert_eq!(released.await.unwrap(), ());
+    assert_eq!(
+        resolver
+            .resolve(Resource::<ValueKind>::new(Value { value: 5 }), "original=")
+            .await
+            .unwrap(),
+        "original=15"
+    );
 }

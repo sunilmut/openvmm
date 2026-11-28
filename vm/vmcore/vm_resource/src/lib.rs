@@ -639,6 +639,7 @@ mod tests {
     use mesh::payload::Protobuf;
     use pal_async::async_test;
     use std::convert::Infallible;
+    use test_with_tracing::test;
 
     enum TestConfigKind {}
 
@@ -718,6 +719,9 @@ mod tests {
 
     register_static_resolvers!(TestResolver);
 
+    // Test: Resolve a configuration into an owned handle and then a concrete object.
+    // Expected: Both link-time registrations preserve the configured value through
+    //       the two resource kinds, producing the independently expected result.
     #[async_test]
     async fn test_resources() {
         let resolver = ResourceResolver::new();
