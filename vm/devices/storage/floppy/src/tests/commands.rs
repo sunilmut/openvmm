@@ -42,10 +42,6 @@ fn mounted_image_geometry_controls_accepted_sector_ranges() {
 fn invalid_media_size_and_multiple_drive_ribbons_are_rejected() {
     let disk = Disk::new(TestDisk::new(512)).unwrap();
     assert!(DriveRibbon::from_vec(vec![disk.clone(), disk.clone()]).is_err());
-    assert!(matches!(
-        DriveRibbon::from_vec(Vec::new()).unwrap(),
-        DriveRibbon::None
-    ));
     let drive = DriveRibbon::from_vec(vec![disk]).unwrap();
     let result = FloppyDiskController::new(
         GuestMemory::empty(),
@@ -154,29 +150,32 @@ fn unsupported_extended_commands_drain_parameters_and_allow_the_next_command() {
     assert_eq!(rig.read(0x3f5), 0x90);
 }
 
-// Test: Seek with head selection, restore pending seek status, and then recalibrate.
-// Expected: Restored IRQ and cylinder/head information agree; recalibration returns to cylinder zero.
+// Test: Restore pending seek status onto a fresh controller, then recalibrate.
+// Expected: The destination asserts its own IRQ and preserves head/cylinder;
+//       acknowledging it leaves the source IRQ unchanged.
 #[test]
 fn seek_status_and_interrupt_level_survive_restore_before_recalibration() {
     let mut rig = Rig::without_disk();
     rig.issue(&[0x0f, 4, 37]);
     assert!(rig.interrupt.0.load(Ordering::SeqCst));
     let saved = rig.device.save().unwrap();
-    rig.write(0x3f2, 0);
-    assert!(!rig.interrupt.0.load(Ordering::SeqCst));
-    rig.device.restore(saved).unwrap();
+    let mut restored = Rig::without_disk();
+    assert!(!restored.interrupt.0.load(Ordering::SeqCst));
+    restored.device.restore(saved).unwrap();
+    assert!(restored.interrupt.0.load(Ordering::SeqCst));
+    restored.issue(&[8]);
+    assert_eq!(restored.read(0x3f5), 0x24);
+    assert_eq!(restored.read(0x3f5), 37);
+    assert!(!restored.interrupt.0.load(Ordering::SeqCst));
     assert!(rig.interrupt.0.load(Ordering::SeqCst));
-    rig.issue(&[8]);
-    assert_eq!(rig.read(0x3f5), 0x24);
-    assert_eq!(rig.read(0x3f5), 37);
-    rig.issue(&[7, 4]);
-    rig.issue(&[8]);
-    assert_eq!(rig.read(0x3f5), 0x24);
-    assert_eq!(rig.read(0x3f5), 0);
-    rig.issue(&[0x0f, 7, 80]);
-    rig.issue(&[8]);
-    assert_eq!(rig.read(0x3f5), 0x24);
-    assert_eq!(rig.read(0x3f5), 0);
+    restored.issue(&[7, 4]);
+    restored.issue(&[8]);
+    assert_eq!(restored.read(0x3f5), 0x24);
+    assert_eq!(restored.read(0x3f5), 0);
+    restored.issue(&[0x0f, 7, 80]);
+    restored.issue(&[8]);
+    assert_eq!(restored.read(0x3f5), 0x24);
+    assert_eq!(restored.read(0x3f5), 0);
 }
 
 // Test: Change DMA interrupt gating and perform a DSR software reset.

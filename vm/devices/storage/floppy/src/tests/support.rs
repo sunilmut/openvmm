@@ -198,7 +198,21 @@ impl Rig {
         Self::with_drive(DriveRibbon::None)
     }
 
+    pub fn without_disk_with_interrupt(line: LineInterrupt, interrupt: Arc<Interrupt>) -> Self {
+        Self::with_drive_and_interrupt(DriveRibbon::None, line, interrupt)
+    }
+
     fn with_drive(drive: DriveRibbon) -> Self {
+        let interrupt = Arc::new(Interrupt::default());
+        let line = LineInterrupt::new_with_target("floppy", interrupt.clone(), 6);
+        Self::with_drive_and_interrupt(drive, line, interrupt)
+    }
+
+    fn with_drive_and_interrupt(
+        drive: DriveRibbon,
+        line: LineInterrupt,
+        interrupt: Arc<Interrupt>,
+    ) -> Self {
         let memory = GuestMemory::allocate(0x20000);
         let dma = Arc::new(Mutex::new(DmaState {
             buffer: Some(IsaDmaBuffer {
@@ -209,10 +223,9 @@ impl Rig {
             requests: Vec::new(),
             completions: 0,
         }));
-        let interrupt = Arc::new(Interrupt::default());
         let device = FloppyDiskController::new(
             memory.clone(),
-            LineInterrupt::new_with_target("floppy", interrupt.clone(), 6),
+            line,
             &mut ExternallyManagedPortIoIntercepts,
             0x3f0,
             drive,

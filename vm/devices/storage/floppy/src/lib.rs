@@ -2336,6 +2336,7 @@ mod tests {
     }
 
     mod commands;
+    mod lifecycle;
     mod media;
     mod support;
 }
