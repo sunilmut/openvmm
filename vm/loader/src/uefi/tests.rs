@@ -11,6 +11,7 @@ use crate::importer::{
     BootPageAcceptance, IgvmParameterType, IsolationType, StartupMemoryType, X86Register,
 };
 use crate::paravisor::tests::RecordingImporter;
+use crate::paravisor::tests::assert_register;
 use hvdef::HV_PAGE_SIZE;
 use test_with_tracing::test;
 use zerocopy::FromBytes;
@@ -122,21 +123,9 @@ fn x64_uefi_load_preserves_firmware_and_sets_sec_boot_registers() {
     assert_eq!(tables.base, 0x700000 / HV_PAGE_SIZE);
     assert_eq!(tables.count, 6);
     assert_eq!(tables.data.len(), 6 * HV_PAGE_SIZE as usize);
-    assert!(importer.registers.iter().any(
-        |register| matches!(register, X86Register::Rip(address) if *address == 0x100000 + entry)
-    ));
-    assert!(
-        importer
-            .registers
-            .iter()
-            .any(|register| matches!(register, X86Register::Cr3(0x700000)))
-    );
-    assert!(
-        importer
-            .registers
-            .iter()
-            .any(|register| matches!(register, X86Register::Rbp(0x6e0000)))
-    );
+    assert_register(&importer.registers, X86Register::Rip(0x100000 + entry));
+    assert_register(&importer.registers, X86Register::Cr3(0x700000));
+    assert_register(&importer.registers, X86Register::Rbp(0x6e0000));
     assert!(importer.areas.is_empty());
     assert!(importer.parameters.is_empty());
 }
@@ -296,12 +285,7 @@ fn x64_uefi_igvm_offsets_reference_parameter_areas_and_snp_special_pages() {
                 params.vp_context_page_number,
                 base.base + u64::from(params.parameter_page_count)
             );
-            assert!(
-                importer
-                    .registers
-                    .iter()
-                    .any(|register| matches!(register, X86Register::R12(0x709000)))
-            );
+            assert_register(&importer.registers, X86Register::R12(0x709000));
         } else {
             assert_eq!(params.vp_context_page_number, 0xfffff);
             assert_eq!(importer.vp_context_page, None);
@@ -345,38 +329,16 @@ fn arm64_uefi_imports_firmware_stack_tables_and_platform_boot_arguments() {
             .unwrap();
         assert_eq!(tables.base * HV_PAGE_SIZE, 0x820000);
         assert_eq!(tables.count, 4);
-        assert!(
-            importer
-                .registers
-                .iter()
-                .any(|register| matches!(register, Aarch64Register::Pc(0x1000)))
-        );
-        assert!(
-            importer
-                .registers
-                .iter()
-                .any(|register| matches!(register, Aarch64Register::X0(0x1000)))
-        );
-        assert!(
-            importer
-                .registers
-                .iter()
-                .any(|register| matches!(register, Aarch64Register::X1(0x820000)))
-        );
-        assert!(
-            importer
-                .registers
-                .iter()
-                .any(|register| matches!(register, Aarch64Register::Ttbr0El1(0x820000)))
-        );
+        assert_register(&importer.registers, Aarch64Register::Pc(0x1000));
+        assert_register(&importer.registers, Aarch64Register::X0(0x1000));
+        assert_register(&importer.registers, Aarch64Register::X1(0x820000));
+        assert_register(&importer.registers, Aarch64Register::Ttbr0El1(0x820000));
         let platform = if hyperv {
             loader_defs::uefi::SecPlatformType::HYPERV
         } else {
             loader_defs::uefi::SecPlatformType::GENERIC
         };
-        assert!(importer.registers.iter().any(
-            |register| matches!(register, Aarch64Register::X2(value) if *value == platform.0)
-        ));
+        assert_register(&importer.registers, Aarch64Register::X2(platform.0));
     }
 }
 

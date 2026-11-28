@@ -1506,7 +1506,11 @@ where
 #[cfg(test)]
 mod page_table_layout_tests {
     use super::*;
+    use test_with_tracing::test;
 
+    // Test: Place x86 and ARM page tables on and just below a large-page edge.
+    // Expected: Only an exact boundary is shifted by one small page, preventing
+    //       the bootshim's page-table placement ambiguity.
     #[test]
     fn page_table_region_avoids_large_page_boundary() {
         for large_page_size in [X64_LARGE_PAGE_SIZE, u64::from(Arm64PageSize::Large)] {

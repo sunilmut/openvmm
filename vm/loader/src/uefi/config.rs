@@ -454,6 +454,11 @@ pub struct PcieBarApertureEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
+
+    fn wire_words(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
 
     fn read<T>(bytes: &[u8]) -> T
     where
@@ -465,7 +470,7 @@ mod tests {
     }
 
     fn add_one_dynamic(length: usize) {
-        let padded_length = align_8(length);
+        let padded_length = length.div_ceil(8) * 8;
         let madt = vec![0xCC; length];
 
         let data = {
@@ -513,14 +518,22 @@ mod tests {
         assert_eq!(header.structure_type, header_exp.structure_type);
         assert_eq!(header.length, header_exp.length);
         assert_eq!(structure, structure_exp);
+        let padded_u32 = u32::try_from(padded_length).unwrap();
+        let mut expected = wire_words(&[0, 16, 2, 24 + padded_u32, 0x16, 8 + padded_u32]);
+        expected.extend_from_slice(&madt);
+        expected.resize(24 + padded_length, 0);
+        assert_eq!(data, expected);
     }
 
+    // Test: Complete a config blob without any additional records.
+    // Expected: The complete wire blob contains only its 16-byte count record.
     #[test]
     fn add_none() {
         let data = {
             let blob = Blob::new();
             blob.complete()
         };
+        assert_eq!(data, wire_words(&[0, 16, 1, 16]));
 
         assert_eq!(data.len() % 8, 0);
 
@@ -548,6 +561,9 @@ mod tests {
         );
     }
 
+    // Test: Append fixed BIOS information with a high-bit flags value.
+    // Expected: The complete 32-byte wire blob preserves every little-endian
+    //       header and payload field, with no extra bytes.
     #[test]
     fn add_one_fixed() {
         let biosinfo = BiosInformation {
@@ -557,10 +573,7 @@ mod tests {
 
         let data = {
             let mut blob = Blob::new();
-            blob.add(&BiosInformation {
-                bios_size_pages: 12345678,
-                flags: 1 << 31,
-            });
+            blob.add(&biosinfo);
             blob.complete()
         };
 
@@ -604,18 +617,30 @@ mod tests {
         assert_eq!(header.length, header_exp.length);
         assert_eq!(structure.bios_size_pages, biosinfo.bios_size_pages);
         assert_eq!(structure.flags, biosinfo.flags);
+        assert_eq!(
+            data,
+            wire_words(&[0, 16, 2, 32, 1, 16, 12345678, 0x8000_0000])
+        );
     }
 
+    // Test: Append a 43-byte dynamic ACPI record.
+    // Expected: The exact record has five zero padding bytes and independently
+    //       calculated lengths in both wire headers.
     #[test]
     fn add_one_dynamic_misaligned() {
         add_one_dynamic(43);
     }
 
+    // Test: Append an already aligned 40-byte dynamic ACPI record.
+    // Expected: All wire bytes are exact and no padding or extra record appears.
     #[test]
     fn add_one_dynamic_aligned() {
         add_one_dynamic(40);
     }
 
+    // Test: Append an unaligned ACPI record followed by processor information.
+    // Expected: The complete wire blob preserves ordering, all fields, and
+    //       exactly three zero padding bytes before the next record.
     #[test]
     fn add_two() {
         const LENGTH: usize = 93;
@@ -701,5 +726,10 @@ mod tests {
             structure.threads_per_processor,
             procinfo.threads_per_processor
         );
+        let mut expected = wire_words(&[0, 16, 3, 144, 0x16, 104]);
+        expected.extend_from_slice(&madt);
+        expected.extend_from_slice(&[0; 3]);
+        expected.extend(wire_words(&[0x13, 24, 4, 3, 2, 1]));
+        assert_eq!(data, expected);
     }
 }

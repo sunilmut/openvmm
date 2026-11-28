@@ -29,6 +29,8 @@ pub(crate) struct RecordingImporter<Register: GuestArch> {
     pub(crate) areas: Vec<ParameterArea>,
     pub(crate) parameters: Vec<(u32, u32, IgvmParameterType)>,
     pub(crate) vp_context_page: Option<u64>,
+    imported_regions_config_page: Option<u64>,
+    expected_page_hashes_config_page: Option<u64>,
     pub(crate) startup: Vec<(u64, u64, StartupMemoryType)>,
 }
 
@@ -45,9 +47,22 @@ impl<Register: GuestArch> RecordingImporter<Register> {
             areas: Vec::new(),
             parameters: Vec::new(),
             vp_context_page: None,
+            imported_regions_config_page: None,
+            expected_page_hashes_config_page: None,
             startup: Vec::new(),
         }
     }
+}
+
+// A later write must not hide behind an earlier matching boot value.
+pub(crate) fn assert_register<Register: PartialEq + std::fmt::Debug>(
+    registers: &[Register],
+    expected: Register,
+) {
+    let actual = registers
+        .iter()
+        .rfind(|register| std::mem::discriminant(*register) == std::mem::discriminant(&expected));
+    assert_eq!(actual, Some(&expected));
 }
 
 impl<Register: GuestArch> ImageLoad<Register> for RecordingImporter<Register> {
@@ -152,7 +167,29 @@ impl<Register: GuestArch> ImageLoad<Register> for RecordingImporter<Register> {
     fn page_table_relocation(&mut self, _: u64, _: u64, _: u64, _: u16) -> anyhow::Result<()> {
         Ok(())
     }
-    fn set_imported_regions_config_page(&mut self, _: u64) {}
+    fn set_imported_regions_config_page(&mut self, page_base: u64) {
+        self.imported_regions_config_page = Some(page_base);
+    }
+    fn set_expected_page_hashes_config_page(&mut self, page_base: u64) {
+        self.expected_page_hashes_config_page = Some(page_base);
+    }
+}
+
+fn assert_config_announcements<Register: GuestArch>(importer: &RecordingImporter<Register>) {
+    let measured = importer
+        .pages
+        .iter()
+        .find(|region| region.tag == "underhill-vtl2-measured-config")
+        .unwrap();
+    let config_base = measured.base - PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_INDEX;
+    assert_eq!(
+        importer.imported_regions_config_page,
+        Some(config_base + PARAVISOR_MEASURED_VTL2_CONFIG_ACCEPTED_MEMORY_PAGE_INDEX)
+    );
+    assert_eq!(
+        importer.expected_page_hashes_config_page,
+        Some(config_base + PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_HASHES_PAGE_INDEX)
+    );
 }
 
 fn no_vtl0() -> Vtl0Config<'static> {
@@ -277,7 +314,7 @@ fn x64_sidecar_alignment_and_shim_extent_follow_the_boot_abi() {
         .find(|region| region.tag == "underhill-boot-shim")
         .unwrap();
     assert_eq!(shim.base * HV_PAGE_SIZE, 0x801000);
-    assert!(importer.registers.contains(&X86Register::Rip(0x801000)));
+    assert_register(&importer.registers, X86Register::Rip(0x801000));
     let params = importer
         .pages
         .iter()
@@ -318,7 +355,9 @@ fn x64_unaligned_memory_is_rejected_before_guest_imports() {
 }
 
 // Test: Load minimal kernel/shim ELF images into fixed-address OpenHCL memory with a static command line.
-// Expected: Images and RIP use the boot ABI addresses, command bytes are preserved, and all parameter references fit guest memory.
+// Expected: Images and RIP use the boot ABI addresses, command bytes are
+//       preserved, parameter references fit guest memory, and accepted-region
+//       and expected-hash announcements reference the measured config layout.
 #[test]
 fn x64_fixed_load_places_images_boot_registers_command_and_parameter_areas() {
     let mut importer = RecordingImporter::<X86Register>::new();
@@ -348,12 +387,7 @@ fn x64_fixed_load_places_images_boot_registers_command_and_parameter_areas() {
         assert!(matches!(image.acceptance, BootPageAcceptance::Exclusive));
         assert!(image.data.iter().all(|byte| *byte == 0));
     }
-    assert!(
-        importer
-            .registers
-            .iter()
-            .any(|register| matches!(register, X86Register::Rip(0x601000)))
-    );
+    assert_register(&importer.registers, X86Register::Rip(0x601000));
     let command = importer
         .pages
         .iter()
@@ -389,6 +423,7 @@ fn x64_fixed_load_places_images_boot_registers_command_and_parameter_areas() {
         let area = &importer.areas[*area as usize];
         assert!(u64::from(*offset) < u64::from(area.count) * HV_PAGE_SIZE);
     }
+    assert_config_announcements(&importer);
 }
 
 // Test: Load an initrd with the standard CRC32 test vector and an appendable host command line.
@@ -416,6 +451,7 @@ fn x64_initrd_bytes_crc_and_appendable_command_are_preserved() {
         .unwrap();
     assert_eq!(initrd.base * HV_PAGE_SIZE, 0x602000);
     assert_eq!(initrd.count, 1);
+    assert!(initrd.data.len() <= HV_PAGE_SIZE as usize);
     assert!(matches!(initrd.acceptance, BootPageAcceptance::Exclusive));
     assert_eq!(&initrd.data[..9], b"123456789");
     assert!(initrd.data[9..].iter().all(|byte| *byte == 0));
@@ -443,7 +479,9 @@ fn x64_initrd_bytes_crc_and_appendable_command_are_preserved() {
 }
 
 // Test: Load the same minimal OpenHCL image for SNP and TDX isolation.
-// Expected: Kernel pages are shared, boot metadata remains exclusive, bounce memory is reserved, and SNP alone emits special pages.
+// Expected: Kernel pages are shared, boot metadata remains exclusive, bounce
+//       memory is reserved, and SNP alone emits special pages. Both config
+//       announcements retain their measured-layout references.
 #[test]
 fn x64_confidential_loads_use_shared_kernel_and_isolation_specific_pages() {
     for isolation in [IsolationType::Snp, IsolationType::Tdx] {
@@ -517,6 +555,7 @@ fn x64_confidential_loads_use_shared_kernel_and_isolation_specific_pages() {
             assert!(matches!(cpuid.acceptance, BootPageAcceptance::CpuidPage));
             assert_eq!(cpuid.data.len(), size_of::<HV_PSP_CPUID_PAGE>());
         }
+        assert_config_announcements(&importer);
     }
 }
 
@@ -567,7 +606,9 @@ fn arm_vtl0() -> Vtl0Config<'static> {
 }
 
 // Test: Load ARM64 OpenHCL from a flat kernel and ELF shim, with and without an initrd and with VTL0 UEFI support.
-// Expected: Imported kernel/context bytes, PC/X0, relative boot metadata, CRC, and measured UEFI descriptors match the ABI.
+// Expected: Kernel/context bytes, PC/X0, boot metadata, CRC, UEFI descriptors,
+//       and config announcements match the ABI. Optional initrd bytes and
+//       their zero-filled remainder preserve exclusive ownership.
 #[test]
 fn arm64_load_preserves_kernel_initrd_boot_registers_and_uefi_context() {
     for with_initrd in [false, true] {
@@ -601,15 +642,8 @@ fn arm64_load_preserves_kernel_initrd_boot_registers_and_uefi_context() {
         assert_eq!(kernel.data, expected_kernel);
         assert!(matches!(kernel.acceptance, BootPageAcceptance::Exclusive));
         let shim_base = if with_initrd { 0x801000 } else { 0x601000 };
-        assert!(importer.registers.iter().any(
-            |register| matches!(register, Aarch64Register::Pc(address) if *address == shim_base)
-        ));
-        assert!(
-            importer
-                .registers
-                .iter()
-                .any(|register| matches!(register, Aarch64Register::X0(8192)))
-        );
+        assert_register(&importer.registers, Aarch64Register::Pc(shim_base));
+        assert_register(&importer.registers, Aarch64Register::X0(8192));
         let params = importer
             .pages
             .iter()
@@ -618,6 +652,13 @@ fn arm64_load_preserves_kernel_initrd_boot_registers_and_uefi_context() {
         let params = ShimParamsRaw::read_from_prefix(&params.data).unwrap().0;
         assert_eq!(params.initrd_size, if with_initrd { 9 } else { 0 });
         assert_eq!(params.initrd_crc, if with_initrd { 0xcbf43926 } else { 0 });
+        assert_eq!(
+            importer
+                .pages
+                .iter()
+                .any(|region| region.tag == "linux-initrd"),
+            with_initrd
+        );
         if with_initrd {
             assert_eq!(params.initrd_offset, -(HV_PAGE_SIZE as i64));
             let initrd = importer
@@ -626,7 +667,11 @@ fn arm64_load_preserves_kernel_initrd_boot_registers_and_uefi_context() {
                 .find(|region| region.tag == "linux-initrd")
                 .unwrap();
             assert_eq!(initrd.base * HV_PAGE_SIZE, 0x800000);
+            assert_eq!(initrd.count, 1);
+            assert_eq!(initrd.acceptance, BootPageAcceptance::Exclusive);
+            assert!(initrd.data.len() <= HV_PAGE_SIZE as usize);
             assert_eq!(&initrd.data[..9], b"123456789");
+            assert!(initrd.data[9..].iter().all(|byte| *byte == 0));
         }
         assert_eq!(params.bounce_buffer_size, 0);
         assert_eq!(params.sidecar_size, 0);
@@ -656,6 +701,7 @@ fn arm64_load_preserves_kernel_initrd_boot_registers_and_uefi_context() {
             measured.uefi_info.firmware.page_count,
             0x20000 / HV_PAGE_SIZE
         );
+        assert_config_announcements(&importer);
     }
 }
 

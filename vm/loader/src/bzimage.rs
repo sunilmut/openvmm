@@ -219,6 +219,8 @@ fn parse_bzimage_inner(kernel_image: &mut (impl Read + Seek)) -> Result<BzImageI
 pub(crate) mod tests {
     use super::*;
     use std::io::Cursor;
+    use test_with_tracing::test;
+    use zerocopy::IntoBytes;
 
     /// Build a minimal synthetic bzImage for testing.
     pub(crate) fn make_test_bzimage() -> Vec<u8> {
@@ -256,38 +258,47 @@ pub(crate) mod tests {
         image
     }
 
+    // Test: Detect a valid bzImage starting from a nonzero stream position.
+    // Expected: Detection succeeds and rewinds the stream for the loader.
     #[test]
     fn test_is_bzimage_positive() {
         let bzimage = make_test_bzimage();
         let mut cursor = Cursor::new(bzimage);
+        cursor.set_position(17);
         assert!(is_bzimage(&mut cursor).unwrap());
+        assert_eq!(cursor.position(), 0);
     }
 
+    // Test: Detect an ELF image and empty or truncated setup-header buffers.
+    // Expected: Each is rejected without an I/O error and the stream rewinds.
     #[test]
     fn test_is_bzimage_negative_elf() {
         let mut elf = vec![0u8; 0x1000];
         elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
-        let mut cursor = Cursor::new(elf);
-        assert!(!is_bzimage(&mut cursor).unwrap());
+        for image in [elf, Vec::new(), vec![0; 0x200]] {
+            let mut cursor = Cursor::new(image);
+            cursor.set_position(17);
+            assert!(!is_bzimage(&mut cursor).unwrap());
+            assert_eq!(cursor.position(), 0);
+        }
     }
 
+    // Test: Parse a valid bzImage from a nonzero stream position.
+    // Expected: The complete setup header and load metadata are preserved,
+    //       and parsing rewinds the stream for payload loading.
     #[test]
     fn test_parse_bzimage() {
         let bzimage = make_test_bzimage();
+        let expected_header = bzimage[0x1f1..0x1f1 + size_of::<defs::setup_header>()].to_vec();
         let mut cursor = Cursor::new(bzimage);
+        cursor.set_position(17);
 
         let info = parse_bzimage(&mut cursor).unwrap();
+        assert_eq!(info.setup_header.as_bytes(), expected_header);
         assert_eq!(info.setup_sects, 1);
         assert_eq!(info.protected_mode_size, 1024);
         assert_eq!(info.entry_offset, 0x200);
         assert_eq!(info.init_size, 0x1000000);
-    }
-
-    #[test]
-    fn test_not_bzimage_returns_false() {
-        let mut elf = vec![0u8; 0x1000];
-        elf[0..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
-        let mut cursor = Cursor::new(elf);
-        assert!(!is_bzimage(&mut cursor).unwrap());
+        assert_eq!(cursor.position(), 0);
     }
 }

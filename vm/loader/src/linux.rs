@@ -1281,6 +1281,9 @@ pub(crate) mod tests {
         );
     }
 
+    // Test: Build a Linux zero page with unaligned ACPI and SMBIOS lengths.
+    // Expected: All six e820 entries have exact aligned extents and types,
+    //       covering low RAM without gaps or overlaps.
     #[test]
     fn zero_page_layout_with_smbios() {
         let acpi_len = 0x1800; // aligns up to 0x2000
@@ -1318,6 +1321,9 @@ pub(crate) mod tests {
         assert_contiguous(&p, 256 * MB);
     }
 
+    // Test: Build a Linux zero page without an SMBIOS structure table.
+    // Expected: No empty reserved entry is emitted and the exact remaining
+    //       e820 entries cover low RAM contiguously.
     #[test]
     fn zero_page_skips_empty_smbios_region() {
         // With no SMBIOS structure table, the reserved SMBIOS region collapses
@@ -1353,6 +1359,9 @@ pub(crate) mod tests {
         assert_contiguous(&p, 256 * MB);
     }
 
+    // Test: Build the zero page for RAM split by the low MMIO gap.
+    // Expected: All seven e820 entries preserve their complete extents and
+    //       types, including every byte of RAM above the gap.
     #[test]
     fn zero_page_multiple_ram_ranges() {
         // 8 GiB of RAM splits around the 4 GiB MMIO gap into two ranges; the
@@ -1369,20 +1378,26 @@ pub(crate) mod tests {
         )
         .unwrap()
         .boot_params;
-        assert_eq!(p.e820_entries, 7);
-        let last = &p.e820_map[6];
-        assert_eq!(u64::from(last.addr), 4 * GB);
-        assert_eq!(u32::from(last.typ), defs::E820_RAM);
-        // The six fixed low-memory entries are contiguous from 0; the second
-        // RAM range sits above the 4 GiB MMIO gap, so contiguity legitimately
-        // breaks there.
-        let below_gap = &p.e820_map[5];
-        assert_eq!(
-            u64::from(below_gap.addr) + u64::from(below_gap.size),
-            4 * GB - 128 * MB
-        );
+        let smbios_end = ACPI_TABLES_BASE + 0x2000;
+        let expected = [
+            (0, ACPI_TABLES_BASE, defs::E820_RAM),
+            (ACPI_TABLES_BASE, 0x1000, defs::E820_ACPI),
+            (ACPI_TABLES_BASE + 0x1000, 0x1000, defs::E820_RESERVED),
+            (smbios_end, RSDP_BASE - smbios_end, defs::E820_RAM),
+            (RSDP_BASE, MB - RSDP_BASE, defs::E820_RESERVED),
+            (MB, 4 * GB - 128 * MB - MB, defs::E820_RAM),
+            (4 * GB, 4 * GB + 128 * MB, defs::E820_RAM),
+        ];
+        assert_eq!(p.e820_entries as usize, expected.len());
+        for (entry, (address, size, kind)) in p.e820_map.iter().zip(expected) {
+            assert_eq!(u64::from(entry.addr), address);
+            assert_eq!(u64::from(entry.size), size);
+            assert_eq!(u32::from(entry.typ), kind);
+        }
     }
 
+    // Test: Build low-memory tables that extend into the reserved RSDP region.
+    // Expected: The zero-page builder rejects the oversized table allocation.
     #[test]
     fn zero_page_tables_too_large() {
         // ACPI tables large enough to run past the RSDP reserved region.
@@ -1548,21 +1563,25 @@ pub(crate) mod tests {
         }
     }
 
+    // Test: Import distinct ACPI, SMBIOS, and command-line payloads.
+    // Expected: Guest-visible destinations, page counts, complete bytes, and
+    //       exclusive ownership match the Linux boot layout.
     #[test]
     fn import_config_places_tables_at_fixed_addresses() {
         let acpi = AcpiTables {
-            rsdp: vec![0u8; 0x1000],
-            tables: vec![0u8; 0x1800],
+            rsdp: vec![0x11; 0x1000],
+            tables: vec![0x22; 0x1800],
         };
         let smbios = crate::smbios::BuiltSmbios {
-            entry_point: vec![0u8; crate::smbios::ENTRY_POINT_SIZE],
-            structure_table: vec![0u8; 0x100],
+            entry_point: vec![0x33; crate::smbios::ENTRY_POINT_SIZE],
+            structure_table: vec![0x44; 0x100],
         };
+        let command = CString::new("console=ttyS0").unwrap();
         let mut importer = RecordingImporter::default();
         import_config(
             &mut importer,
             &test_load_info(),
-            &CString::new("console=ttyS0").unwrap(),
+            &command,
             &make_layout(256 * MB),
             &acpi,
             Some(&smbios),
@@ -1588,7 +1607,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             importer.page_base("linux-smbios-tables"),
-            Some(smbios_struct_table_base(acpi.tables.len()) / HV_PAGE_SIZE)
+            Some((ACPI_TABLES_BASE + 0x2000) / HV_PAGE_SIZE)
         );
         // Boot metadata at its fixed low-memory homes.
         assert_eq!(
@@ -1603,8 +1622,26 @@ pub(crate) mod tests {
             importer.page_base("linux-pagetables"),
             Some(CR3_BASE / HV_PAGE_SIZE)
         );
+        for (tag, count, expected) in [
+            ("linux-rsdp", 1, acpi.rsdp.as_slice()),
+            ("linux-acpi-tables", 2, acpi.tables.as_slice()),
+            ("linux-smbios-anchor", 1, smbios.entry_point.as_slice()),
+            ("linux-smbios-tables", 1, smbios.structure_table.as_slice()),
+            ("linux-commandline", 1, command.as_bytes_with_nul()),
+        ] {
+            let imported = importer
+                .imports
+                .iter()
+                .find(|record| record.tag == tag)
+                .unwrap();
+            assert_eq!(imported.page_count, count, "{tag}");
+            assert_eq!(imported.data, expected, "{tag}");
+            assert_eq!(imported.acceptance, BootPageAcceptance::Exclusive, "{tag}");
+        }
     }
 
+    // Test: Import a command line that exceeds its fixed guest allocation.
+    // Expected: The typed size error occurs before any guest page import.
     #[test]
     fn import_config_rejects_oversized_command_line() {
         let acpi = AcpiTables {
@@ -1628,6 +1665,9 @@ pub(crate) mod tests {
         assert!(importer.pages.is_empty(), "importer used before the check");
     }
 
+    // Test: Import Linux identity maps with and without SNP encryption.
+    // Expected: Both maps contain present entries; every present entry has the
+    //       C-bit set only for SNP, with a complete page-sized import.
     #[test]
     fn import_config_sets_snp_c_bit_in_page_tables() {
         const C_BIT: u8 = 51;
@@ -1635,32 +1675,47 @@ pub(crate) mod tests {
             rsdp: vec![0u8; 0x1000],
             tables: vec![0u8; 0x1000],
         };
-        let mut importer = RecordingImporter::default();
-        import_config(
-            &mut importer,
-            &test_load_info(),
-            &CString::new("").unwrap(),
-            &make_layout(256 * MB),
-            &acpi,
-            None,
-            Some(SnpBootConfig { c_bit: C_BIT }),
-        )
-        .unwrap();
-
-        let page_tables = importer
-            .imports
-            .iter()
-            .find(|import| import.tag == "linux-pagetables")
+        for snp_boot in [None, Some(SnpBootConfig { c_bit: C_BIT })] {
+            let mut importer = RecordingImporter::default();
+            import_config(
+                &mut importer,
+                &test_load_info(),
+                &CString::new("").unwrap(),
+                &make_layout(256 * MB),
+                &acpi,
+                None,
+                snp_boot,
+            )
             .unwrap();
-        for entry in page_tables.data.chunks_exact(8).map(|entry| {
-            u64::from_ne_bytes(entry.try_into().expect("page table entry is eight bytes"))
-        }) {
-            if entry & 1 != 0 {
-                assert_ne!(entry & (1 << C_BIT), 0);
+
+            let page_tables = importer
+                .imports
+                .iter()
+                .find(|import| import.tag == "linux-pagetables")
+                .unwrap();
+            assert_eq!(page_tables.page_base, CR3_BASE / HV_PAGE_SIZE);
+            assert_eq!(
+                page_tables.data.len() as u64,
+                page_tables.page_count * HV_PAGE_SIZE
+            );
+            let mut present_entries = 0;
+            for entry in page_tables.data.chunks_exact(8).map(|entry| {
+                u64::from_ne_bytes(entry.try_into().expect("page table entry is eight bytes"))
+            }) {
+                if entry & 1 != 0 {
+                    present_entries += 1;
+                    assert_eq!(
+                        entry & (1 << C_BIT),
+                        if snp_boot.is_some() { 1 << C_BIT } else { 0 }
+                    );
+                }
             }
+            assert!(present_entries > 0);
         }
     }
 
+    // Test: Import Linux configuration with no ACPI table bytes.
+    // Expected: The empty-table error is returned instead of a zero-page import.
     #[test]
     fn import_config_rejects_empty_acpi_tables() {
         // Empty tables would import zero pages; the loader must reject them
@@ -1683,6 +1738,9 @@ pub(crate) mod tests {
         assert!(matches!(err, Error::EmptyAcpiTables), "got {err:?}");
     }
 
+    // Test: Reserve and import SNP secret/CPUID pages and Linux CC descriptors.
+    // Expected: All four imports have exact addresses, counts, and ownership;
+    //       wire descriptors and e820 reservations reference those same pages.
     #[test]
     fn imports_snp_boot_pages_with_linux_cc_blob() {
         let acpi_len = 0x1800;
@@ -1727,6 +1785,7 @@ pub(crate) mod tests {
             importer.imports[1].page_base,
             allocated_range.start() / HV_PAGE_SIZE + 1
         );
+        assert_eq!(importer.imports[1].page_count, 1);
         assert_eq!(
             importer.imports[1].acceptance,
             BootPageAcceptance::CpuidPage
@@ -1751,6 +1810,17 @@ pub(crate) mod tests {
             assert_eq!(entry.xss_in, 0);
         }
 
+        for index in [2, 3] {
+            assert_eq!(
+                importer.imports[index].page_base,
+                allocated_range.start() / HV_PAGE_SIZE + index as u64
+            );
+            assert_eq!(importer.imports[index].page_count, 1);
+            assert_eq!(
+                importer.imports[index].acceptance,
+                BootPageAcceptance::Exclusive
+            );
+        }
         let cc_blob = defs::cc_blob_sev_info::read_from_bytes(&importer.imports[2].data).unwrap();
         assert_eq!(cc_blob.magic, defs::CC_BLOB_SEV_INFO_MAGIC);
         assert_eq!(cc_blob.version, 0);
@@ -1888,6 +1958,8 @@ pub(crate) mod tests {
         Cursor::new(image)
     }
 
+    // Test: Load an ELF kernel without loadable segments.
+    // Expected: The typed no-segment error occurs without any page import.
     #[test]
     fn elf_without_load_segments_is_rejected() {
         let mut importer = RecordingImporter::default();
@@ -1901,6 +1973,8 @@ pub(crate) mod tests {
         assert!(importer.imports.is_empty());
     }
 
+    // Test: Use the MP-table loader with an ELF lacking loadable segments.
+    // Expected: The same typed ELF error occurs before any guest import.
     #[test]
     fn mptable_loader_rejects_elf_without_load_segments() {
         let mut importer = RecordingImporter::default();
@@ -1927,6 +2001,8 @@ pub(crate) mod tests {
         assert!(importer.imports.is_empty());
     }
 
+    // Test: Load an ELF whose only load segment has zero memory size.
+    // Expected: The empty segment is rejected without importing guest pages.
     #[test]
     fn elf_with_only_empty_load_segment_is_rejected() {
         let mut importer = RecordingImporter::default();
@@ -1940,6 +2016,8 @@ pub(crate) mod tests {
         assert!(importer.imports.is_empty());
     }
 
+    // Test: Load an ELF whose entrypoint falls between nonempty load segments.
+    // Expected: The typed entrypoint error occurs without any page import.
     #[test]
     fn elf_entrypoint_outside_load_segments_is_rejected() {
         let mut importer = RecordingImporter::default();
@@ -1959,6 +2037,8 @@ pub(crate) mod tests {
         assert!(importer.imports.is_empty());
     }
 
+    // Test: Place an initrd after a kernel whose alignment would overflow u64.
+    // Expected: The typed address error occurs before any initrd page import.
     #[test]
     fn initrd_after_kernel_alignment_overflow_is_rejected() {
         let mut importer = RecordingImporter::default();

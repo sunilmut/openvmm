@@ -245,10 +245,15 @@ mod tests {
         record
     }
 
+    // Test: Parse a valid version record with both provenance flags set.
+    // Expected: The complete version header, interface, flags, and ASCII
+    //       strings are preserved.
     #[test]
     fn parses_record() {
         let record = record(1, 2);
         let version = parse_record(&record).unwrap();
+        assert_eq!(version.struct_version, firmware_version::STRUCT_VERSION);
+        assert_eq!(version.header_size as usize, firmware_version::HEADER_SIZE);
         assert_eq!(version.interface_version_major, 1);
         assert_eq!(version.interface_version_minor, 2);
         assert_eq!(version.base_version, "26.0");
@@ -259,19 +264,25 @@ mod tests {
         );
     }
 
+    // Test: Parse a version signature without the required record header.
+    // Expected: Parsing returns the typed truncated-record error.
     #[test]
     fn rejects_truncated_record() {
         assert_eq!(parse_record(b"MVFW").unwrap_err(), Error::TruncatedRecord);
     }
 
+    // Test: Parse non-ASCII bytes in either version-record string field.
+    // Expected: The typed error identifies the exact invalid field.
     #[test]
     fn rejects_non_ascii_string() {
-        let mut record = record(1, 0);
-        record[16..19].copy_from_slice(b"\xc3\xa9\0");
-        assert_eq!(
-            parse_record(&record).unwrap_err(),
-            Error::InvalidString("base version")
-        );
+        for (offset, field) in [(16, "base version"), (32, "git commit")] {
+            let mut record = record(1, 0);
+            record[offset..offset + 3].copy_from_slice(b"\xc3\xa9\0");
+            assert_eq!(
+                parse_record(&record).unwrap_err(),
+                Error::InvalidString(field)
+            );
+        }
     }
 
     fn volume(length: usize, interface: Option<(u16, u16)>) -> Vec<u8> {
@@ -299,18 +310,27 @@ mod tests {
         fv
     }
 
+    // Test: Find the dedicated version FFS file through volume and image APIs.
+    // Expected: Both entrypoints return the complete original version record.
     #[test]
     fn finds_record_by_ffs_file_guid() {
         let fv = volume(0x1000, Some((1, 0)));
         let version = find_in_firmware_volume(&fv).unwrap().unwrap();
-        assert_eq!(version.interface_version_major, 1);
-        assert_eq!(version.interface_version_minor, 0);
+        let expected = MsvmFirmwareVersion {
+            struct_version: firmware_version::STRUCT_VERSION,
+            header_size: firmware_version::HEADER_SIZE as u16,
+            flags: firmware_version::FLAG_DIRTY | firmware_version::FLAG_OFFICIAL,
+            interface_version_major: 1,
+            interface_version_minor: 0,
+            base_version: "26.0",
+            git_commit: "deadbee",
+        };
+        assert_eq!(version, expected);
 
         let mut image = vec![0; FIRST_FIRMWARE_VOLUME_OFFSET];
         image.extend_from_slice(&fv);
         let version = find_in_firmware_image(&image).unwrap().unwrap();
-        assert_eq!(version.interface_version_major, 1);
-        assert_eq!(version.interface_version_minor, 0);
+        assert_eq!(version, expected);
     }
 
     fn image(split: bool, interface: Option<(u16, u16)>) -> Vec<u8> {
@@ -322,30 +342,42 @@ mod tests {
         image
     }
 
+    // Test: Read combined firmware layouts with both supported interfaces and
+    //       with no dedicated version file.
+    // Expected: Interface values are preserved and an absent file returns None.
     #[test]
     fn parses_combined_layout_with_both_interface_versions() {
         for major in [1, 2] {
-            let image = image(false, Some((major, 0)));
+            let image = image(/* split: */ false, Some((major, 0)));
             let version = find_in_firmware_image(&image).unwrap().unwrap();
             assert_eq!(version.interface_version_major, major);
             assert_eq!(version.interface_version_minor, 0);
         }
-        assert_eq!(find_in_firmware_image(&image(false, None)).unwrap(), None);
-    }
-
-    #[test]
-    #[cfg(guest_arch = "aarch64")]
-    fn parses_old_split_layout() {
-        let image = image(true, Some((1, 0)));
-        let version = find_in_firmware_image(&image).unwrap().unwrap();
-        assert_eq!(version.interface_version_major, 1);
-        assert_eq!(version.interface_version_minor, 0);
         assert_eq!(
-            find_in_firmware_image(&self::image(true, None)).unwrap(),
+            find_in_firmware_image(&image(/* split: */ false, None)).unwrap(),
             None
         );
     }
 
+    // Test: Read ARM firmware with separate PEI/DXE volumes, with and without
+    //       a dedicated version file in the later volume.
+    // Expected: The later record is found, or absence returns None.
+    #[test]
+    #[cfg(guest_arch = "aarch64")]
+    fn parses_old_split_layout() {
+        let image = image(/* split: */ true, Some((1, 0)));
+        let version = find_in_firmware_image(&image).unwrap().unwrap();
+        assert_eq!(version.interface_version_major, 1);
+        assert_eq!(version.interface_version_minor, 0);
+        assert_eq!(
+            find_in_firmware_image(&self::image(/* split: */ true, None)).unwrap(),
+            None
+        );
+    }
+
+    // Test: Read invalid volume lengths/signatures, truncated images, and a
+    //       malformed version signature in each supported layout.
+    // Expected: Each returns its exact volume-header or record-signature error.
     #[test]
     fn rejects_malformed_volumes_and_records() {
         let layouts = cfg_select! {
@@ -377,11 +409,13 @@ mod tests {
         assert_eq!(find_in_firmware_image(&[]), Err(Error::VolumeHeader));
     }
 
+    // Test: Read ARM split volumes with a zero or undersized first volume.
+    // Expected: Parsing rejects both before walking a non-progressing volume.
     #[test]
     #[cfg(guest_arch = "aarch64")]
     fn rejects_non_progressing_volume_lengths() {
         for length in [0_u64, 1] {
-            let mut malformed = image(true, Some((1, 0)));
+            let mut malformed = image(/* split: */ true, Some((1, 0)));
             malformed[0x1000 + 32..0x1000 + 40].copy_from_slice(&length.to_le_bytes());
             assert_eq!(find_in_firmware_image(&malformed), Err(Error::VolumeHeader));
         }

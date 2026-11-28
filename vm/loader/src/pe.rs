@@ -236,6 +236,9 @@ mod tests {
         file
     }
 
+    // Test: Lay out PE sections with excess raw text bytes and a data BSS tail.
+    // Expected: Entry/alignment and initialized bytes are exact; all gaps and
+    //       bytes beyond each section's initialized extent are zero.
     #[test]
     fn lays_out_sections() {
         let file = test_image();
@@ -253,6 +256,8 @@ mod tests {
         assert!(pe.image[0x3000..].iter().all(|&b| b == 0));
     }
 
+    // Test: Load a non-PE buffer and a PE image for the wrong machine.
+    // Expected: Detection rejects the buffer and loading returns typed errors.
     #[test]
     fn rejects_non_pe_and_wrong_machine() {
         assert!(!is_pe(&[0; 0x100]));
@@ -269,6 +274,8 @@ mod tests {
         ));
     }
 
+    // Test: Load a PE section whose virtual extent exceeds the image.
+    // Expected: Loading rejects the exact offending section.
     #[test]
     fn rejects_section_outside_image() {
         let mut file = test_image();
@@ -282,6 +289,9 @@ mod tests {
         assert!(matches!(layout(&file), Err(Error::BadSection(1))));
     }
 
+    // Test: Load padding relocation entries, then replace one with DIR64.
+    // Expected: Padding preserves the complete laid-out image and metadata;
+    //       a relocation requiring address fixups is rejected.
     #[test]
     fn accepts_padding_relocations_and_rejects_real_ones() {
         let mut file = test_image();
@@ -292,7 +302,14 @@ mod tests {
         put(&mut file, 0x2104, &12u32.to_le_bytes());
         put(&mut file, 0x2108, &0x0008u16.to_le_bytes());
         put(&mut file, 0x210a, &0u16.to_le_bytes());
-        layout(&file).unwrap();
+        let loaded = layout(&file).unwrap();
+        let mut expected = vec![0; 0x4000];
+        expected[..0x1000].copy_from_slice(&file[..0x1000]);
+        expected[0x1000..0x1010].fill(0xaa);
+        expected[0x2000..0x3000].copy_from_slice(&file[0x2000..0x3000]);
+        assert_eq!(loaded.image, expected);
+        assert_eq!(loaded.entry_offset, 0x1010);
+        assert_eq!(loaded.alignment, 0x1000);
 
         // A DIR64 entry needs relocation.
         put(&mut file, 0x2108, &0xa008u16.to_le_bytes());

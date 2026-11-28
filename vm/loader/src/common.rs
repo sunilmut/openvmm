@@ -414,6 +414,7 @@ impl ChunkBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
 
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
@@ -439,100 +440,128 @@ mod tests {
         .unwrap()
     }
 
-    /// Count MTRR base/mask pairs in the register list.
-    fn pair_count(regs: &[X86Register]) -> usize {
-        assert_eq!(regs.len() % 2, 0, "MTRR registers come in pairs");
-        regs.len() / 2
-    }
-
+    // Test: Compute the PCAT-compatible MTRRs for exactly 128 MiB of RAM.
+    // Expected: One exact base/mask pair selects the 128-MiB span at 46 bits.
     #[test]
     fn mtrr_128mb_exactly() {
-        // 128 MB = pcat_mtrr_size → only pair 0 (base covers 128 MB)
         let layout = make_layout(128 * MB);
         let regs = compute_variable_mtrrs(&layout, 46, standard_low_mmio(), standard_high_mmio());
-        assert_eq!(pair_count(&regs), 1);
-        assert_eq!(regs[0], X86Register::MtrrPhysBase0(0x6));
+        assert_eq!(
+            regs,
+            [
+                X86Register::MtrrPhysBase0(0x6),
+                X86Register::MtrrPhysMask0(0x3fff_f800_0800),
+            ]
+        );
     }
 
+    // Test: Compute the boot MTRRs for 256 MiB below the configured MMIO gaps.
+    // Expected: The exact PCAT and low-memory register pairs use 46-bit masks.
     #[test]
     fn mtrr_256mb() {
-        // 256 MB: pair 0 (128 MB) + pair 1 (128 MB..low_gap_start)
         let layout = make_layout(256 * MB);
         let regs = compute_variable_mtrrs(&layout, 46, standard_low_mmio(), standard_high_mmio());
-        assert_eq!(pair_count(&regs), 2);
-        assert_eq!(regs[0], X86Register::MtrrPhysBase0(0x6));
-        // Pair 1 base = 128 MB | WRITEBACK
-        assert_eq!(regs[2], X86Register::MtrrPhysBase1((128 * MB) | 0x6));
+        assert_eq!(
+            regs,
+            [
+                X86Register::MtrrPhysBase0(0x6),
+                X86Register::MtrrPhysMask0(0x3fff_f800_0800),
+                X86Register::MtrrPhysBase1(0x0800_0006),
+                X86Register::MtrrPhysMask1(0x3fff_0000_0800),
+            ]
+        );
     }
 
+    // Test: Compute boot MTRRs for 2 GiB of RAM below the low MMIO gap.
+    // Expected: Only the exact PCAT and low-memory register pairs are emitted.
     #[test]
     fn mtrr_2gb() {
-        // 2 GB: same structure as 256 MB (RAM is below 4 GiB)
         let layout = make_layout(2 * GB);
         let regs = compute_variable_mtrrs(&layout, 46, standard_low_mmio(), standard_high_mmio());
-        assert_eq!(pair_count(&regs), 2);
-        assert_eq!(regs[2], X86Register::MtrrPhysBase1((128 * MB) | 0x6));
+        assert_eq!(
+            regs,
+            [
+                X86Register::MtrrPhysBase0(0x6),
+                X86Register::MtrrPhysMask0(0x3fff_f800_0800),
+                X86Register::MtrrPhysBase1(0x0800_0006),
+                X86Register::MtrrPhysMask1(0x3fff_0000_0800),
+            ]
+        );
     }
 
+    // Test: Compute 46-bit boot MTRRs with RAM above both configured MMIO gaps.
+    // Expected: All five register pairs retain their exact bases, masks, and
+    //       compatibility split at 8 TiB.
     #[test]
     fn mtrr_8gb() {
-        // 8 GB: RAM above 4 GiB and above high MMIO end → pairs 0–4
         let layout = make_layout(8 * GB);
         let regs = compute_variable_mtrrs(&layout, 46, standard_low_mmio(), standard_high_mmio());
-        // Pair 0: 0..128 MB
-        // Pair 1: 128 MB..low gap start
-        // Pair 2: low gap end (4 GiB)..high gap start (4 GiB) — effectively empty but still emitted
-        // Pair 3: high gap end..8 TB boundary
-        // Pair 4: 8 TB.. (gpa_space_size > 43)
-        assert_eq!(pair_count(&regs), 5);
-
-        // Verify key base addresses
-        assert_eq!(regs[0], X86Register::MtrrPhysBase0(0x6));
-        assert_eq!(regs[2], X86Register::MtrrPhysBase1((128 * MB) | 0x6));
         assert_eq!(
-            regs[4],
-            X86Register::MtrrPhysBase2(standard_low_mmio().end() | 0x6)
+            regs,
+            [
+                X86Register::MtrrPhysBase0(0x6),
+                X86Register::MtrrPhysMask0(0x3fff_f800_0800),
+                X86Register::MtrrPhysBase1(0x0800_0006),
+                X86Register::MtrrPhysMask1(0x3fff_0000_0800),
+                X86Register::MtrrPhysBase2(0x1_0000_0006),
+                X86Register::MtrrPhysMask2(0x3fff_0000_0800),
+                X86Register::MtrrPhysBase3(0x1_2000_0006),
+                X86Register::MtrrPhysMask3(0x3800_0000_0800),
+                X86Register::MtrrPhysBase4(0x0800_0000_0006),
+                X86Register::MtrrPhysMask4(0x800),
+            ]
         );
-        assert_eq!(
-            regs[6],
-            X86Register::MtrrPhysBase3(standard_high_mmio().end() | 0x6)
-        );
-        assert_eq!(regs[8], X86Register::MtrrPhysBase4((1u64 << 43) | 0x6));
     }
 
+    // Test: Compute 46-bit boot MTRRs without a high MMIO gap.
+    // Expected: Three exact pairs describe the PCAT, low-memory, and rounded
+    //       high-memory spans; no high-MMIO compatibility pairs are emitted.
     #[test]
     fn mtrr_8gb_no_high_mmio() {
-        // No high MMIO gap. RAM above 4 GiB is contiguous.
-        // WB MTRRs should cover only up to end of RAM, leaving
-        // everything above (ECAM, MMIO64 windows) as default UC.
         let low = standard_low_mmio();
         let layout = MemoryLayout::new(8 * GB, &[low], &[], &[], None).unwrap();
         let regs = compute_variable_mtrrs(&layout, 46, low, MemoryRange::EMPTY);
-        // Pair 0: 0..128 MB
-        // Pair 1: 128 MB..low gap start
-        // Pair 2: low gap end..end of RAM (8 GB)
-        assert_eq!(pair_count(&regs), 3);
-        assert_eq!(regs[4], X86Register::MtrrPhysBase2(low.end() | 0x6));
-    }
-
-    #[test]
-    fn mtrr_narrow_address_width() {
-        // 40-bit address width (< 43): the 8 TB split is not needed.
-        let layout = make_layout(8 * GB);
-        let regs = compute_variable_mtrrs(&layout, 40, standard_low_mmio(), standard_high_mmio());
-        // No pair 4 because gpa_space_size <= 43
-        assert_eq!(pair_count(&regs), 4);
         assert_eq!(
-            regs[6],
-            X86Register::MtrrPhysBase3(standard_high_mmio().end() | 0x6)
+            regs,
+            [
+                X86Register::MtrrPhysBase0(0x6),
+                X86Register::MtrrPhysMask0(0x3fff_f800_0800),
+                X86Register::MtrrPhysBase1(0x0800_0006),
+                X86Register::MtrrPhysMask1(0x3fff_0000_0800),
+                X86Register::MtrrPhysBase2(0x1_0000_0006),
+                X86Register::MtrrPhysMask2(0x3ffc_0000_0800),
+            ]
         );
     }
 
+    // Test: Compute boot MTRRs using a 40-bit physical address width.
+    // Expected: All masks respect that width and the 8-TiB split is absent.
+    #[test]
+    fn mtrr_narrow_address_width() {
+        let layout = make_layout(8 * GB);
+        let regs = compute_variable_mtrrs(&layout, 40, standard_low_mmio(), standard_high_mmio());
+        assert_eq!(
+            regs,
+            [
+                X86Register::MtrrPhysBase0(0x6),
+                X86Register::MtrrPhysMask0(0x00ff_f800_0800),
+                X86Register::MtrrPhysBase1(0x0800_0006),
+                X86Register::MtrrPhysMask1(0x00ff_0000_0800),
+                X86Register::MtrrPhysBase2(0x1_0000_0006),
+                X86Register::MtrrPhysMask2(0x00ff_0000_0800),
+                X86Register::MtrrPhysBase3(0x1_2000_0006),
+                X86Register::MtrrPhysMask3(0x800),
+            ]
+        );
+    }
+
+    // Test: Check activation of every variable MTRR in the five-pair layout.
+    // Expected: Exactly five mask registers are emitted and all are enabled.
     #[test]
     fn mtrr_masks_have_enabled_bit() {
-        // Every mask register should have the ENABLED bit (bit 11) set.
         let layout = make_layout(8 * GB);
         let regs = compute_variable_mtrrs(&layout, 46, standard_low_mmio(), standard_high_mmio());
+        let mut masks = 0;
         for (i, reg) in regs.iter().enumerate() {
             match reg {
                 X86Register::MtrrPhysMask0(v)
@@ -540,10 +569,12 @@ mod tests {
                 | X86Register::MtrrPhysMask2(v)
                 | X86Register::MtrrPhysMask3(v)
                 | X86Register::MtrrPhysMask4(v) => {
+                    masks += 1;
                     assert!(v & (1 << 11) != 0, "mask at index {i} missing ENABLED bit");
                 }
                 _ => {} // base registers
             }
         }
+        assert_eq!(masks, 5);
     }
 }

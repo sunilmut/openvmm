@@ -281,6 +281,9 @@ mod tests {
     use super::*;
     use test_with_tracing::test;
 
+    // Test: Build MP tables for one through fifteen processors.
+    // Expected: Both independent byte sums are zero; processor IDs, BSP flags,
+    //       entry counts, and interrupt destinations match the topology.
     #[test]
     fn builds_valid_checksums_and_processor_entries() {
         for processor_count in [1usize, 2, 4, 8, 15] {
@@ -298,10 +301,19 @@ mod tests {
                 floating_pointer.config_table_address.get(),
                 MP_CONFIG_TABLE_ADDR as u32
             );
-            assert_eq!(checksum(&[&tables.floating_pointer]), 0);
+            assert_eq!(
+                tables
+                    .floating_pointer
+                    .iter()
+                    .fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+                0
+            );
 
             let table = &tables.configuration_table;
-            assert_eq!(checksum(&[table]), 0);
+            assert_eq!(
+                table.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
+                0
+            );
             let (header, rest) = ConfigTableHeader::ref_from_prefix(table).unwrap();
             assert_eq!(usize::from(header.base_table_length.get()), table.len());
             assert_eq!(
@@ -326,8 +338,8 @@ mod tests {
         }
     }
 
-    /// Pins the guest-visible bytes of two processors with ISA IRQ 5
-    /// active-high and level-triggered.
+    // Test: Describe two processors and active-high, level-triggered ISA IRQ 5.
+    // Expected: Both complete guest-visible MP byte sequences match the ABI.
     #[test]
     fn builds_expected_bytes() {
         let tables = build(&MpTableConfig {
@@ -380,6 +392,9 @@ mod tests {
         );
     }
 
+    // Test: Build empty, noncontiguous, oversized, or invalid-IRQ topologies.
+    // Expected: The exact offending processor or IRQ is rejected with a typed
+    //       error; sixteen processors leave no representable I/O APIC ID.
     #[test]
     fn rejects_invalid_inputs() {
         assert_eq!(
@@ -389,13 +404,17 @@ mod tests {
             }),
             Err(Error::NoProcessors)
         );
-        assert!(matches!(
+        assert_eq!(
             build(&MpTableConfig {
                 apic_ids: &[0, 2],
                 level_triggered_irqs: &[],
             }),
-            Err(Error::InvalidApicId { .. })
-        ));
+            Err(Error::InvalidApicId {
+                index: 1,
+                apic_id: 2,
+                expected: 1
+            })
+        );
         assert_eq!(
             build(&MpTableConfig {
                 apic_ids: &[0],

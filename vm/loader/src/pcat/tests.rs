@@ -81,6 +81,9 @@ fn invalid_bios_size_and_ram_ceiling_fail_before_imports() {
     assert!(importer.registers.is_empty());
 }
 
+// IGNORED: The existing PCAT loader subtracts the BIOS size before rejecting
+//       this undersized ceiling. Keep this regression until the product fix.
+//
 // Test: Supply a page-aligned RAM ceiling smaller than the BIOS image itself.
 // Expected: The loader reports an invalid ceiling instead of panicking or wrapping the firmware address.
 #[test]

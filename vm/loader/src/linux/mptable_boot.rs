@@ -519,6 +519,7 @@ mod tests {
     use crate::importer::StartupMemoryType;
     use crate::linux::InitrdInfo;
     use crate::linux::KernelInfo;
+    use crate::paravisor::tests::assert_register;
     use test_with_tracing::test;
     use zerocopy::FromBytes;
 
@@ -560,6 +561,7 @@ mod tests {
         page_base: u64,
         page_count: u64,
         tag: String,
+        acceptance: BootPageAcceptance,
         data: Vec<u8>,
     }
 
@@ -614,7 +616,7 @@ mod tests {
             page_base: u64,
             page_count: u64,
             debug_tag: &'static str,
-            _acceptance: BootPageAcceptance,
+            acceptance: BootPageAcceptance,
             data: &[u8],
         ) -> anyhow::Result<()> {
             self.pages
@@ -623,6 +625,7 @@ mod tests {
                 page_base,
                 page_count,
                 tag: debug_tag.to_string(),
+                acceptance,
                 data: data.to_vec(),
             });
             Ok(())
@@ -706,6 +709,9 @@ mod tests {
         defs::boot_params::read_from_bytes(data).unwrap()
     }
 
+    // Test: Import MP-table boot configuration without ACPI or SMBIOS firmware.
+    // Expected: Tables, boot pointers, and required registers are valid and
+    //       exclusively imported; no PAT or MTRR-default write is issued.
     #[test]
     fn mptable_config_places_boot_data_without_firmware_tables() {
         let apic_ids = [0, 1, 2, 3];
@@ -761,35 +767,29 @@ mod tests {
             MPTABLE_CMDLINE_BASE as u32
         );
         assert_eq!(u32::from(boot_params.hdr.cmdline_size), 12);
+        assert_register(&importer.registers, X86Register::Rsi(ZERO_PAGE_BASE));
+        assert_register(&importer.registers, X86Register::Cr3(CR3_BASE));
+        assert_register(
+            &importer.registers,
+            X86Register::Cr0(x86defs::X64_CR0_PG | x86defs::X64_CR0_PE),
+        );
+        assert_register(&importer.registers, X86Register::Cr4(x86defs::X64_CR4_PAE));
+        assert_register(&importer.registers, X86Register::Rip(KERNEL_BASE));
+        assert!(importer.registers.iter().all(|register| !matches!(
+            register,
+            X86Register::Pat(_) | X86Register::MtrrDefType(_)
+        )));
         assert!(
             importer
-                .registers
-                .contains(&X86Register::Rsi(ZERO_PAGE_BASE))
-        );
-        assert!(importer.registers.contains(&X86Register::Cr3(CR3_BASE)));
-        assert!(
-            importer
-                .registers
-                .contains(&X86Register::Cr0(x86defs::X64_CR0_PG | x86defs::X64_CR0_PE))
-        );
-        assert!(
-            importer
-                .registers
-                .contains(&X86Register::Cr4(x86defs::X64_CR4_PAE))
-        );
-        assert!(importer.registers.contains(&X86Register::Rip(KERNEL_BASE)));
-        assert!(
-            !importer
-                .registers
-                .contains(&X86Register::Pat(x86defs::X86X_MSR_DEFAULT_PAT))
-        );
-        assert!(
-            !importer
-                .registers
-                .contains(&X86Register::MtrrDefType(0xc00))
+                .imports
+                .iter()
+                .all(|import| import.acceptance == BootPageAcceptance::Exclusive)
         );
     }
 
+    // Test: Import a command line filling the allocation, then one extra byte.
+    // Expected: Every accepted byte and its NUL are preserved; overflow returns
+    //       the exact size error before any page import.
     #[test]
     fn mptable_config_supports_full_command_line_region() {
         let cmdline = CString::new(vec![b'a'; 65_535]).unwrap();
@@ -811,7 +811,7 @@ mod tests {
         assert_eq!(imported.page_base, MPTABLE_CMDLINE_BASE / HV_PAGE_SIZE);
         assert_eq!(imported.page_count, 16);
         assert_eq!(imported.data.len(), 65_536);
-        assert_eq!(imported.data[65_535], 0);
+        assert_eq!(imported.data, cmdline.as_bytes_with_nul());
 
         let mut importer = RecordingImporter::default();
         let cmdline = CString::new(vec![b'a'; 65_536]).unwrap();
@@ -828,6 +828,8 @@ mod tests {
         assert!(importer.imports.is_empty());
     }
 
+    // Test: Place fixed MP-table boot data outside the supplied RAM layout.
+    // Expected: The layout error occurs before any guest page import.
     #[test]
     fn mptable_config_rejects_fixed_boot_data_outside_ram() {
         let layout = MemoryLayout::new(
@@ -852,6 +854,8 @@ mod tests {
         assert!(importer.imports.is_empty());
     }
 
+    // Test: Import kernel and reserved extents spanning adjacent NUMA ranges.
+    // Expected: The serialized zero page retains the exact merged e820 map.
     #[test]
     fn mptable_config_accepts_ranges_spanning_numa_nodes() {
         let layout = MemoryLayout::new_with_numa(
@@ -883,38 +887,44 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            build_mptable_e820(&layout, &[reserved]).unwrap(),
-            [
-                E820Range {
-                    start: 0,
-                    end: MPTABLE_ISA_HOLE_BASE,
-                    entry_type: defs::E820_RAM,
-                },
-                E820Range {
-                    start: MPTABLE_ISA_HOLE_BASE,
-                    end: MPTABLE_ISA_HOLE_END,
-                    entry_type: defs::E820_RESERVED,
-                },
-                E820Range {
-                    start: MPTABLE_ISA_HOLE_END,
-                    end: reserved.start(),
-                    entry_type: defs::E820_RAM,
-                },
-                E820Range {
-                    start: reserved.start(),
-                    end: reserved.end(),
-                    entry_type: defs::E820_RESERVED,
-                },
-                E820Range {
-                    start: reserved.end(),
-                    end: layout.end_of_ram(),
-                    entry_type: defs::E820_RAM,
-                },
-            ]
-        );
+        let expected = [
+            E820Range {
+                start: 0,
+                end: MPTABLE_ISA_HOLE_BASE,
+                entry_type: defs::E820_RAM,
+            },
+            E820Range {
+                start: MPTABLE_ISA_HOLE_BASE,
+                end: MPTABLE_ISA_HOLE_END,
+                entry_type: defs::E820_RESERVED,
+            },
+            E820Range {
+                start: MPTABLE_ISA_HOLE_END,
+                end: reserved.start(),
+                entry_type: defs::E820_RAM,
+            },
+            E820Range {
+                start: reserved.start(),
+                end: reserved.end(),
+                entry_type: defs::E820_RESERVED,
+            },
+            E820Range {
+                start: reserved.end(),
+                end: layout.end_of_ram(),
+                entry_type: defs::E820_RAM,
+            },
+        ];
+        let boot = imported_zero_page(&importer);
+        assert_eq!(boot.e820_entries as usize, expected.len());
+        for (entry, expected) in boot.e820_map.iter().zip(expected) {
+            assert_eq!(u64::from(entry.addr), expected.start);
+            assert_eq!(u64::from(entry.size), expected.end - expected.start);
+            assert_eq!(u32::from(entry.typ), expected.entry_type);
+        }
     }
 
+    // Test: Build the e820 map with a status page, ISA hole, and MMIO gap.
+    // Expected: All RAM/reserved extents are exact and the MMIO gap is omitted.
     #[test]
     fn mptable_e820_reserves_status_and_isa_hole_and_leaves_mmio_gap() {
         let entries = build_mptable_e820(
@@ -959,6 +969,8 @@ mod tests {
         );
     }
 
+    // Test: Build e820 maps with invalid reservations or excessive entry count.
+    // Expected: Invalid ranges and the exact 128-entry capacity are rejected.
     #[test]
     fn mptable_e820_rejects_invalid_reservations_and_capacity() {
         let layout = make_mptable_layout(256 * MB);
@@ -995,6 +1007,8 @@ mod tests {
         ));
     }
 
+    // Test: Encode an initrd address and size containing high 32-bit values.
+    // Expected: Both low and extended fields preserve every original bit.
     #[test]
     fn mptable_zero_page_preserves_high_initrd_bits() {
         let initrd_base = 0x1_2345_6789;
@@ -1013,6 +1027,8 @@ mod tests {
         assert_eq!(boot_params.ext_ramdisk_size, (initrd_size >> 32) as u32);
     }
 
+    // Test: Reserve memory overlapping the already loaded kernel.
+    // Expected: The reservation error occurs before any configuration import.
     #[test]
     fn mptable_config_rejects_reservation_overlapping_loaded_image() {
         let mut importer = RecordingImporter::default();
@@ -1029,6 +1045,9 @@ mod tests {
         assert!(importer.imports.is_empty());
     }
 
+    // Test: Import boot configuration for unaligned kernel and initrd lengths.
+    // Expected: Valid placement succeeds and the zero page preserves exact
+    //       initrd address and byte size.
     #[test]
     fn mptable_config_accepts_unaligned_image_sizes() {
         let initrd_base = KERNEL_BASE + 2 * MB;
@@ -1061,6 +1080,8 @@ mod tests {
         assert_eq!(u32::from(boot_params.hdr.ramdisk_size), initrd_size as u32);
     }
 
+    // Test: Place a kernel or initrd inside the legacy ISA hole.
+    // Expected: The exact image/reserved overlap is returned before imports.
     #[test]
     fn mptable_config_rejects_images_overlapping_isa_hole() {
         let kernel_above_hole = || KernelInfo {
@@ -1143,6 +1164,8 @@ mod tests {
         }
     }
 
+    // Test: Place an initrd immediately above the ISA hole.
+    // Expected: The boundary is accepted and its address/size remain exact.
     #[test]
     fn mptable_config_accepts_initrd_just_above_isa_hole() {
         let load_info = LoadInfo {
@@ -1176,6 +1199,8 @@ mod tests {
         assert_eq!(u32::from(boot_params.hdr.ramdisk_size), HV_PAGE_SIZE as u32);
     }
 
+    // Test: Place an initrd beyond the MP boot identity map.
+    // Expected: The unbootable layout is rejected without any page import.
     #[test]
     fn mptable_config_rejects_initrd_above_identity_map() {
         let load_info = LoadInfo {
@@ -1205,6 +1230,8 @@ mod tests {
         assert!(importer.imports.is_empty());
     }
 
+    // Test: Supply an out-of-image entrypoint or initrd in fixed/MMIO regions.
+    // Expected: Each unbootable layout is rejected before page imports.
     #[test]
     fn mptable_config_rejects_unbootable_loaded_ranges() {
         let invalid_load_info = [
@@ -1270,6 +1297,8 @@ mod tests {
         }
     }
 
+    // Test: Supply more processor IDs than the I/O APIC can represent.
+    // Expected: The typed MP-topology error occurs before any page import.
     #[test]
     fn mptable_config_rejects_unrepresentable_ioapic_id_before_import() {
         let apic_ids = (0..200).collect::<Vec<_>>();

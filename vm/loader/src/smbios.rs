@@ -237,6 +237,7 @@ pub fn build(tables: &SmbiosTables<'_>, table_gpa: u64) -> BuiltSmbios {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
 
     fn test_smbios_tables() -> SmbiosTables<'static> {
         SmbiosTables {
@@ -259,9 +260,13 @@ mod tests {
         }
     }
 
+    // Test: Build a populated SMBIOS 3.1 entry point.
+    // Expected: The 24-byte anchor is present and its complete checksum is zero.
     #[test]
     fn entry_point_checksum_is_zero() {
         let built = build(&test_smbios_tables(), 0xf0020);
+        assert_eq!(built.entry_point.len(), 24);
+        assert_eq!(&built.entry_point[..5], b"_SM3_");
         let sum = built
             .entry_point
             .iter()
@@ -269,37 +274,49 @@ mod tests {
         assert_eq!(sum, 0);
     }
 
+    // Test: Build SMBIOS entry points for low and high-bit table addresses.
+    // Expected: Version, reserved fields, declared table size, and all address
+    //       bits match the guest-visible SMBIOS 3.1 format.
     #[test]
     fn entry_point_fields() {
-        let table_gpa = 0xf0020;
-        let built = build(&test_smbios_tables(), table_gpa);
-        assert_eq!(built.entry_point.len(), 0x18);
-        assert_eq!(&built.entry_point[0..5], b"_SM3_");
-        assert_eq!(built.entry_point[6], 0x18); // length
-        assert_eq!(built.entry_point[7], 3); // major
-        assert_eq!(built.entry_point[8], 1); // minor
+        for table_gpa in [0xf0020, 0x1234_5678_9abc_def0] {
+            let built = build(&test_smbios_tables(), table_gpa);
+            assert_eq!(built.entry_point.len(), 0x18);
+            assert_eq!(&built.entry_point[0..5], b"_SM3_");
+            assert_eq!(&built.entry_point[6..12], &[24, 3, 1, 0, 1, 0]);
 
-        // max_size (offset 0x0c) == structure table length.
-        let max_size = u32::from_le_bytes(built.entry_point[0x0c..0x10].try_into().unwrap());
-        assert_eq!(max_size as usize, built.structure_table.len());
+            // max_size (offset 0x0c) == structure table length.
+            let max_size = u32::from_le_bytes(built.entry_point[0x0c..0x10].try_into().unwrap());
+            assert_eq!(max_size as usize, built.structure_table.len());
 
-        // table_addr (offset 0x10) == the GPA we passed in.
-        let addr = u64::from_le_bytes(built.entry_point[0x10..0x18].try_into().unwrap());
-        assert_eq!(addr, table_gpa);
+            // table_addr (offset 0x10) == the GPA we passed in.
+            let addr = u64::from_le_bytes(built.entry_point[0x10..0x18].try_into().unwrap());
+            assert_eq!(addr, table_gpa);
+        }
     }
 
+    // Test: Serialize BIOS/system information with a distinguishable UUID.
+    // Expected: Both complete formatted structures preserve their fields,
+    //       string indices and UUID bytes, followed by the exact end marker.
     #[test]
     fn structure_table_layout() {
-        let built = build(&test_smbios_tables(), 0xf0020);
+        let mut tables = test_smbios_tables();
+        tables.system.uuid = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+        let built = build(&tables, 0xf0020);
         let table = &built.structure_table;
 
-        // Type 0 header.
-        assert_eq!(table[0], 0); // type
-        assert_eq!(table[1], 0x1a); // length
-
-        // Type 0 string indices are assigned in order.
-        assert_eq!(table[4], 1); // vendor -> string #1
-        assert_eq!(table[5], 2); // bios_version -> string #2
+        assert_eq!(
+            &table[..26],
+            &[
+                0, 26, 0, 0, 1, 2, 0, 0, 3, 0, 0x80, 0, 0, 0, 0, 0, 0, 0, 1, 0x10, 1, 2, 0xff,
+                0xff, 0, 0,
+            ]
+        );
+        let t1_off = struct_offset(table, 1).expect("Type 1 present");
+        let mut expected = vec![1, 27, 1, 0, 1, 2, 3, 0];
+        expected.extend_from_slice(&tables.system.uuid);
+        expected.extend_from_slice(&[6, 4, 5]);
+        assert_eq!(&table[t1_off..t1_off + 27], expected);
 
         // The structure table must end with the Type 127 end-of-table marker
         // (type, length, handle) followed by the double-NUL terminator. The
@@ -308,31 +325,62 @@ mod tests {
         assert_eq!(&table[n - 6..], &[127, 4, 0x02, 0x00, 0, 0]);
     }
 
+    // Test: Serialize every nonempty BIOS and system string.
+    // Expected: Both complete string sets preserve ordering and double-NUL
+    //       framing, without omitted, substituted, or extra strings.
     #[test]
     fn strings_resolve() {
         let built = build(&test_smbios_tables(), 0);
-        // The first string in the table (after the 0x1a-byte Type 0 formatted
-        // area) is the BIOS vendor.
-        let strings_start = 0x1a;
-        let nul = built.structure_table[strings_start..]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap();
-        let vendor = &built.structure_table[strings_start..strings_start + nul];
-        assert_eq!(vendor, "Test BIOS Vendor".as_bytes());
+        let table = &built.structure_table;
+        let t1 = struct_offset(table, 1).expect("Type 1 present");
+        let end = struct_offset(table, 127).expect("End marker present");
+        assert_eq!(
+            &table[26..t1],
+            b"Test BIOS Vendor\0Test BIOS Version\0Test BIOS Release Date\0\0"
+        );
+        assert_eq!(
+            &table[t1 + 27..end],
+            b"Test Manufacturer\0Test Product\0Test Version\0Test SKU\0Test Family\0\0"
+        );
     }
 
+    // Test: Serialize an empty serial number, then empty all string fields.
+    // Expected: Empty fields use index zero and each empty string set emits
+    //       exactly two NULs without swallowing the next structure.
     #[test]
     fn empty_string_uses_index_zero() {
-        let tables = test_smbios_tables();
+        let mut tables = test_smbios_tables();
         let built = build(&tables, 0);
         let t1_off = struct_offset(&built.structure_table, 1).expect("Type 1 present");
         // serial_number is the 4th string field, at offset 7 within the Type 1
         // formatted area (type, length, handle:2, manufacturer, product_name,
         // version, serial_number).
         assert_eq!(built.structure_table[t1_off + 7], 0);
+        tables.bios.vendor = "";
+        tables.bios.version = "";
+        tables.bios.release_date = "";
+        tables.system.manufacturer = "";
+        tables.system.product_name = "";
+        tables.system.version = "";
+        tables.system.sku_number = "";
+        tables.system.family = "";
+        let built = build(&tables, 0);
+        assert_eq!(&built.structure_table[4..6], &[0, 0]);
+        assert_eq!(built.structure_table[8], 0);
+        assert_eq!(&built.structure_table[26..28], &[0, 0]);
+        let t1 = struct_offset(&built.structure_table, 1).expect("Type 1 present");
+        assert_eq!(t1, 28);
+        assert_eq!(&built.structure_table[t1 + 4..t1 + 8], &[0; 4]);
+        assert_eq!(&built.structure_table[t1 + 25..t1 + 27], &[0; 2]);
+        assert_eq!(
+            &built.structure_table[t1 + 27..],
+            &[0, 0, 127, 4, 2, 0, 0, 0]
+        );
     }
 
+    // Test: Serialize a manufacturer containing an interior NUL and extra text.
+    // Expected: Only the prefix survives; all subsequent indices and complete
+    //       string-set framing remain intact.
     #[test]
     fn interior_nul_is_truncated() {
         let mut tables = test_smbios_tables();
@@ -348,10 +396,11 @@ mod tests {
         // The string set holds the truncated manufacturer and none of the bytes
         // after the interior NUL.
         let len = built.structure_table[t1_off + 1] as usize;
-        let strings = &built.structure_table[t1_off + len..];
-        let first_nul = strings.iter().position(|&b| b == 0).unwrap();
-        assert_eq!(&strings[..first_nul], b"Mfg");
-        assert!(!strings.array_windows::<4>().any(|w| w == b"evil"));
+        let end = struct_offset(&built.structure_table, 127).expect("End marker present");
+        assert_eq!(
+            &built.structure_table[t1_off + len..end],
+            b"Mfg\0Test Product\0Test Version\0Test SKU\0Test Family\0\0"
+        );
     }
 
     /// Walks the structure table and returns the byte offset of the first
