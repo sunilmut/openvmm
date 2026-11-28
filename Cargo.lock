@@ -10321,6 +10321,7 @@ dependencies = [
  "cvm_tracing",
  "guestmem",
  "hvdef",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracelimit",
  "tracing",

@@ -554,6 +554,7 @@ mod tests {
     use aarch64defs::SctlrEl1;
     use aarch64defs::TranslationControlEl1;
     use guestmem::GuestMemory;
+    use test_with_tracing::test;
 
     /// Helper: set up a 2-level page table walk for a 4KB granule.
     ///
@@ -587,6 +588,8 @@ mod tests {
         }
     }
 
+    // Test: Execute a user page beneath a table with user execute-never set.
+    // Expected: The table restriction denies execution despite the leaf allowing it.
     #[test]
     fn test_table_level_uxn_should_deny_execution() {
         let gm = GuestMemory::allocate(0x4000);
@@ -629,6 +632,8 @@ mod tests {
         assert!(matches!(result, Err(Error::PrivilegeViolation(_))));
     }
 
+    // Test: Read a user-accessible page through an unrestricted parent table.
+    // Expected: Translation returns the leaf's guest physical address.
     #[test]
     fn test_user_read_succeeds_on_user_accessible_page() {
         let gm = GuestMemory::allocate(0x4000);
@@ -666,6 +671,8 @@ mod tests {
         assert_eq!(result.unwrap(), 0x2000);
     }
 
+    // Test: Execute a supervisor page beneath a privileged execute-never table.
+    // Expected: The parent restriction denies execution despite an executable leaf.
     #[test]
     fn test_table_level_pxn_should_deny_execution() {
         let gm = GuestMemory::allocate(0x4000);

@@ -12,6 +12,7 @@ use std::pin::pin;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
+use test_with_tracing::test;
 
 struct Monitor {
     writes: RefCell<Vec<(u64, Vec<u8>)>>,
@@ -218,6 +219,26 @@ fn run(
         gm,
         devices,
     ))
+}
+
+fn assert_exception(event: &HvAarch64PendingEvent, syndrome: EsrEl2, address: u64) {
+    let bytes = event.as_bytes();
+    assert!(event.header.event_pending());
+    assert_eq!(
+        event.header.event_type(),
+        HvAarch64PendingEventType::EXCEPTION
+    );
+    assert_eq!(event.header.reserved(), 0);
+    assert_eq!(&bytes[1..8], &[0; 7]);
+    assert_eq!(
+        u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        u64::from(syndrome)
+    );
+    assert_eq!(
+        u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+        address
+    );
+    assert_eq!(&bytes[24..32], &[0; 8]);
 }
 
 // Test: Execute load and store instructions against ordinary guest RAM.
@@ -470,10 +491,7 @@ fn translation_faults_inject_the_provided_guest_event() {
     support.xs[1] = 0x2000;
     run(0xf9400020, &mut support, &gm, &devices).unwrap();
     assert_eq!(support.events.len(), 1);
-    assert_eq!(
-        support.events[0].as_bytes(),
-        make_exception_event(syndrome, 0x2000).as_bytes()
-    );
+    assert_exception(&support.events[0], syndrome, 0x2000);
     assert_eq!(support.pc, 0);
     assert!(devices.fatals.borrow().is_empty());
 }
@@ -501,10 +519,7 @@ fn vtl_execute_denial_injects_an_instruction_abort() {
         .with_ifsc(FaultStatusCode::PERMISSION_FAULT_LEVEL2)
         .into();
     expected.set_il(false);
-    assert_eq!(
-        support.events[0].as_bytes(),
-        make_exception_event(expected, 0x1000).as_bytes()
-    );
+    assert_exception(&support.events[0], expected, 0x1000);
     assert!(devices.reads.borrow().is_empty());
 }
 
@@ -591,7 +606,12 @@ fn monitor_fast_path_declines_without_side_effects() {
             ..Default::default()
         };
         assert_eq!(
-            emulate_mnf_write_fast_path(0, &mut support, &gm, &devices),
+            emulate_mnf_write_fast_path(
+                if interrupted { 0x38223000 } else { 0 },
+                &mut support,
+                &gm,
+                &devices,
+            ),
             None
         );
         assert_eq!(support.pc, 0);
@@ -599,41 +619,124 @@ fn monitor_fast_path_declines_without_side_effects() {
     }
 }
 
-// Test: Update distinct architectural register classes through the CPU adapter.
-// Expected: Widths and register identities are preserved in the backing CPU.
+// Test: Load and store SIMD registers at byte through quadword widths.
+// Expected: Loads clear upper bits and stores preserve the exact low bytes.
 #[test]
-fn cpu_adapter_preserves_architectural_register_identity() {
-    let gm = GuestMemory::allocate(0);
+fn simd_instructions_transfer_data_without_changing_other_registers() {
+    let gm = GuestMemory::allocate(0x4000);
     let devices = Devices::default();
-    let mut support = Support::default();
-    let mut cpu = EmulatorCpu::new(&gm, &devices, &mut support, EsrEl2::new());
-    cpu.update_q(0, u128::MAX);
-    cpu.update_d(1, u64::MAX);
-    cpu.update_h(2, u32::MAX);
-    cpu.update_s(3, u16::MAX);
-    cpu.update_b(4, u8::MAX);
-    cpu.update_sp(11);
-    cpu.update_fp(12);
-    cpu.update_lr(13);
-    assert_eq!(
-        (cpu.q(0), cpu.d(1), cpu.h(2), cpu.s(3), cpu.b(4)),
-        (u128::MAX, u64::MAX, u32::MAX, u16::MAX, u8::MAX)
-    );
-    assert_eq!((cpu.sp(), cpu.fp(), cpu.lr()), (11, 12, 13));
-    cpu.commit();
-    assert_eq!(
-        support.qs[..5],
-        [
-            u128::MAX,
-            u64::MAX as u128,
-            u32::MAX as u128,
-            u16::MAX as u128,
-            u8::MAX as u128
-        ]
-    );
-    assert_eq!(support.xs[29..], [12, 13]);
-    assert_eq!(support.sp, 11);
+    let data = [
+        0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32,
+        0x10,
+    ];
+    for (load, store, width) in [
+        (0x3d400023, 0x3d000023, 1),  // LDR/STR B3, [X1]
+        (0x7d400023, 0x7d000023, 2),  // LDR/STR H3, [X1]
+        (0xbd400023, 0xbd000023, 4),  // LDR/STR S3, [X1]
+        (0xfd400023, 0xfd000023, 8),  // LDR/STR D3, [X1]
+        (0x3dc00023, 0x3d800023, 16), // LDR/STR Q3, [X1]
+    ] {
+        let mut support = Support {
+            mapped: true,
+            ..Default::default()
+        };
+        support.xs[1] = 0x2000;
+        support.qs.fill(u128::MAX);
+        gm.write_at(0x2000, &data).unwrap();
+        run(load, &mut support, &gm, &devices).unwrap();
+        let mut expected = [0; 16];
+        expected[..width].copy_from_slice(&data[..width]);
+        assert_eq!(support.qs[3], u128::from_le_bytes(expected));
+        assert!(
+            support.qs[..3]
+                .iter()
+                .chain(&support.qs[4..])
+                .all(|v| *v == u128::MAX)
+        );
+        gm.write_at(0x2000, &[0x55; 16]).unwrap();
+        run(store, &mut support, &gm, &devices).unwrap();
+        let mut stored = [0; 16];
+        gm.read_at(0x2000, &mut stored).unwrap();
+        assert_eq!(&stored[..width], &data[..width]);
+        assert_eq!(&stored[width..], &vec![0x55; 16 - width]);
+        assert_eq!(support.xs[1], 0x2000);
+        assert_eq!(support.pc, 8);
+        assert_eq!(support.commits, 2);
+        assert!(support.events.is_empty());
+    }
+    assert!(devices.reads.borrow().is_empty());
+    assert!(devices.writes.borrow().is_empty());
+}
+
+// Test: Restore distinct frame/link values with a post-indexed stack pair load.
+// Expected: Both registers load from consecutive RAM slots and SP advances once.
+#[test]
+fn stack_pair_load_preserves_frame_and_link_registers() {
+    let gm = GuestMemory::allocate(0x4000);
+    let devices = Devices::default();
+    let mut support = Support {
+        mapped: true,
+        sp: 0x2010,
+        ..Default::default()
+    };
+    gm.write_plain(0x2010, &0x1122334455667788u64).unwrap();
+    gm.write_plain(0x2018, &0x8877665544332211u64).unwrap();
+    run(0xa8c17bfd, &mut support, &gm, &devices).unwrap(); // LDP X29, X30, [SP], #16
+    assert_eq!(support.xs[29..], [0x1122334455667788, 0x8877665544332211]);
+    assert_eq!(support.sp, 0x2020);
+    assert_eq!(support.pc, 4);
     assert_eq!(support.commits, 1);
+    assert_eq!(gm.read_plain::<u64>(0x2010).unwrap(), 0x1122334455667788);
+    assert_eq!(gm.read_plain::<u64>(0x2018).unwrap(), 0x8877665544332211);
+    assert!(support.events.is_empty());
+    assert!(devices.reads.borrow().is_empty());
+    assert!(devices.writes.borrow().is_empty());
+}
+
+// Test: Execute a store with an intercept translation for each access mode.
+// Expected: Only write permission can reuse the translation; other modes fault.
+#[test]
+fn intercept_translation_is_not_reused_for_a_different_access_mode() {
+    let gm = GuestMemory::allocate(0x4000);
+    for mode in [
+        TranslateMode::Read,
+        TranslateMode::Execute,
+        TranslateMode::Write,
+    ] {
+        let devices = Devices::default();
+        gm.write_plain(0x2010, &0x1122334455667788u64).unwrap();
+        let syndrome = EsrEl2::new().with_ec(aarch64defs::ExceptionClass::DATA_ABORT.0);
+        let mut support = Support {
+            mapped: true,
+            initial: Some(InitialTranslation {
+                gva: 0x8000,
+                gpa: 0x2000,
+                translate_mode: mode,
+            }),
+            translation_error: Some(Code::PRIVILEGE_VIOLATION),
+            translation_event: Some(syndrome),
+            pc: 0x1000,
+            ..Default::default()
+        };
+        support.xs[0] = 0x8877665544332211;
+        support.xs[1] = 0x8010;
+        run(0xf9000020, &mut support, &gm, &devices).unwrap();
+        if mode == TranslateMode::Write {
+            assert_eq!(gm.read_plain::<u64>(0x2010).unwrap(), 0x8877665544332211);
+            assert_eq!(support.pc, 0x1004);
+            assert!(support.events.is_empty());
+        } else {
+            assert_eq!(gm.read_plain::<u64>(0x2010).unwrap(), 0x1122334455667788);
+            assert_eq!(support.pc, 0x1000);
+            assert_eq!(support.events.len(), 1);
+            assert_exception(&support.events[0], syndrome, 0x8010);
+        }
+        assert_eq!(support.xs[0], 0x8877665544332211);
+        assert_eq!(support.xs[1], 0x8010);
+        assert!(devices.reads.borrow().is_empty());
+        assert!(devices.writes.borrow().is_empty());
+        assert!(devices.fatals.borrow().is_empty());
+    }
 }
 
 // Test: Convert hypervisor translation flags for each privilege-selection mode.
@@ -798,25 +901,37 @@ fn translation_wrapper_reports_walk_failures_as_guest_exceptions() {
             fail_registers: false,
             calls: Vec::new(),
         };
-        let expected = match kind {
+        let (expected, status) = match kind {
             0 => {
                 support.registers.tcr.set_t0sz(0);
-                Code::INVALID_PAGE_TABLE_FLAGS
+                (
+                    Code::INVALID_PAGE_TABLE_FLAGS,
+                    FaultStatusCode::ADDRESS_SIZE_FAULT_LEVEL0,
+                )
             }
             1 => {
                 support
                     .registers
                     .tcr
                     .set_tg0(aarch64defs::TranslationGranule0(3));
-                Code::INVALID_PAGE_TABLE_FLAGS
+                (
+                    Code::INVALID_PAGE_TABLE_FLAGS,
+                    FaultStatusCode::TRANSLATION_FAULT_LEVEL0,
+                )
             }
             2 => {
                 support.registers.ttbr0 = 0x9000;
-                Code::GPA_UNMAPPED
+                (
+                    Code::GPA_UNMAPPED,
+                    FaultStatusCode::ACCESS_FLAG_FAULT_LEVEL1,
+                )
             }
             3 => {
                 support.memory.write_plain(0, &0u64).unwrap();
-                Code::PAGE_NOT_PRESENT
+                (
+                    Code::PAGE_NOT_PRESENT,
+                    FaultStatusCode::ACCESS_FLAG_FAULT_LEVEL1,
+                )
             }
             _ => {
                 let mut leaf =
@@ -826,7 +941,10 @@ fn translation_wrapper_reports_walk_failures_as_guest_exceptions() {
                     .memory
                     .write_plain(0x1000, &u64::from(leaf))
                     .unwrap();
-                Code::PRIVILEGE_VIOLATION
+                (
+                    Code::PRIVILEGE_VIOLATION,
+                    FaultStatusCode::PERMISSION_FAULT_LEVEL2,
+                )
             }
         };
         let error = crate::translate::emulate_translate_gva(&mut support, 0, TranslateMode::Read)
@@ -834,7 +952,10 @@ fn translation_wrapper_reports_walk_failures_as_guest_exceptions() {
             .err()
             .unwrap();
         assert_eq!(error.code, expected);
-        assert!(error.event_info.unwrap().il());
+        let syndrome = error.event_info.unwrap();
+        assert!(syndrome.il());
+        assert_eq!(syndrome.ec(), aarch64defs::ExceptionClass::DATA_ABORT.0);
+        assert_eq!(syndrome.lower_iss(), status.0);
         assert_eq!(support.calls, ["lock", "registers"]);
     }
 }
@@ -851,13 +972,18 @@ fn page_walks_support_both_address_spaces_and_all_granules() {
         (G0::TG_64KB, G1::TG_64KB, 16),
     ] {
         for upper in [false, true] {
-            let gm = GuestMemory::allocate(0x10000);
+            let gm = GuestMemory::allocate(0x20000);
             let mut registers = translation_registers();
             registers.tcr.set_t0sz(39);
             registers.tcr.set_t1sz(39);
             registers.tcr.set_tg0(g0);
             registers.tcr.set_tg1(g1);
-            let gva = if upper { !((1u64 << 25) - 1) } else { 0 };
+            registers.ttbr1 = 0x10000;
+            let gva = if upper {
+                !((1u64 << 25) - 1) | 0x123
+            } else {
+                0x123
+            };
             // A level-zero or block descriptor maps the aligned output base.
             let leaf = aarch64defs::Pte::new()
                 .with_valid(true)
@@ -865,9 +991,15 @@ fn page_walks_support_both_address_spaces_and_all_granules() {
                 .with_ap_unprivileged(true)
                 .with_access_flag(true);
             gm.write_plain(0, &u64::from(leaf)).unwrap();
+            gm.write_plain(0x10000, &u64::from(leaf.with_pfn(0x200)))
+                .unwrap();
             let result =
                 crate::translate::translate_gva_to_gpa(&gm, gva, &registers, read_flags()).unwrap();
-            assert_eq!(result, 0x100000, "granule shift {shift}, upper={upper}");
+            assert_eq!(
+                result,
+                if upper { 0x200123 } else { 0x100123 },
+                "granule shift {shift}, upper={upper}"
+            );
         }
     }
 }
@@ -898,20 +1030,20 @@ fn page_walks_reject_invalid_virtual_address_bits() {
 }
 
 // Test: Walk mappings under different physical address-size configurations.
-// Expected: Every supported output width preserves the mapped guest address.
+// Expected: Supported widths retain offsets and reject representable out-of-range GPAs.
 #[test]
 fn page_walks_validate_the_configured_physical_address_size() {
     use aarch64defs::IntermPhysAddrSize as Size;
     let gm = page_tables();
-    for size in [
-        Size::IPA_32_BITS_4_GB,
-        Size::IPA_36_BITS_64_GB,
-        Size::IPA_40_BITS_1_TB,
-        Size::IPA_42_BITS_4_TB,
-        Size::IPA_44_BITS_16_TB,
-        Size::IPA_48_BITS_256_TB,
-        Size::IPA_52_BITS_4_PB,
-        Size::IPA_56_BITS_64_PB,
+    for (size, bits) in [
+        (Size::IPA_32_BITS_4_GB, 32),
+        (Size::IPA_36_BITS_64_GB, 36),
+        (Size::IPA_40_BITS_1_TB, 40),
+        (Size::IPA_42_BITS_4_TB, 42),
+        (Size::IPA_44_BITS_16_TB, 44),
+        (Size::IPA_48_BITS_256_TB, 48),
+        (Size::IPA_52_BITS_4_PB, 52),
+        (Size::IPA_56_BITS_64_PB, 56),
     ] {
         let mut registers = translation_registers();
         registers.tcr.set_ips(size);
@@ -919,6 +1051,28 @@ fn page_walks_validate_the_configured_physical_address_size() {
             crate::translate::translate_gva_to_gpa(&gm, 3, &registers, read_flags()).unwrap(),
             0x2003
         );
+        // The descriptor's PFN field represents addresses only through bit 47.
+        let last_page = (1u64 << bits.min(48)) - 0x1000;
+        let leaf = aarch64defs::Pte::new()
+            .with_valid(true)
+            .with_access_flag(true)
+            .with_ap_unprivileged(true)
+            .with_pfn(last_page >> 12);
+        gm.write_plain(0x1000, &u64::from(leaf)).unwrap();
+        assert_eq!(
+            crate::translate::translate_gva_to_gpa(&gm, 0xfff, &registers, read_flags()).unwrap(),
+            last_page + 0xfff,
+        );
+        if bits < 48 {
+            gm.write_plain(0x1000, &u64::from(leaf.with_pfn(1u64 << (bits - 12))))
+                .unwrap();
+            assert!(matches!(
+                crate::translate::translate_gva_to_gpa(&gm, 3, &registers, read_flags()),
+                Err(crate::translate::Error::InvalidPageTableFlags(2)),
+            ));
+        }
+        gm.write_plain(0x1000, &u64::from(leaf.with_pfn(2)))
+            .unwrap();
     }
 }
 
