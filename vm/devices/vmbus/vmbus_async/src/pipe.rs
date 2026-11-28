@@ -912,13 +912,13 @@ mod tests {
     use crate::pipe::connected_message_pipes;
     use futures::AsyncReadExt;
     use futures::AsyncWriteExt;
-    use pal_async::DefaultDriver;
     use pal_async::async_test;
-    use pal_async::timer::PolledTimer;
     use std::io::ErrorKind;
-    use std::time::Duration;
+    use test_with_tracing::test;
     use zerocopy::IntoBytes;
 
+    // Test: Disconnect a peer after an empty message receive becomes pending.
+    // Expected: The next receive returns ConnectionReset rather than data.
     #[async_test]
     async fn test_async_channel_close() {
         let (mut host, guest) = connected_message_pipes(4096);
@@ -931,8 +931,10 @@ mod tests {
         );
     }
 
+    // Test: Publish a message only after its peer has registered a pending read.
+    // Expected: The reader wakes and receives exactly the complete message.
     #[async_test]
-    async fn test_async_read(driver: DefaultDriver) {
+    async fn test_async_read() {
         let (mut host, mut guest) = connected_message_pipes(4096);
         let guest_read = async {
             let mut b = [0; 3];
@@ -941,16 +943,18 @@ mod tests {
             assert_eq!(read.await.unwrap(), 3);
             assert_eq!(&b, b"abc");
         };
+        let mut guest_read = Box::pin(guest_read);
+        assert!(futures::poll!(&mut guest_read).is_pending());
         let host_write = async {
-            let mut timer = PolledTimer::new(&driver);
-            timer.sleep(Duration::from_millis(200)).await;
             host.send(b"abc").await.unwrap();
         };
         futures::future::join(guest_read, host_write).await;
     }
 
+    // Test: Fill the ring, register a blocked send, then drain it from the peer.
+    // Expected: The send resumes and both full ordered datagrams arrive intact.
     #[async_test]
-    async fn test_async_write(driver: DefaultDriver) {
+    async fn test_async_write() {
         let (mut host, mut guest) = connected_message_pipes(4096);
         let v: Vec<_> = (0..2000_u16).collect();
         guest.send(v.as_bytes()).await.unwrap();
@@ -960,9 +964,9 @@ mod tests {
             assert!(futures::poll!(&mut write).is_pending());
             write.await.unwrap();
         };
+        let mut guest_write = Box::pin(guest_write);
+        assert!(futures::poll!(&mut guest_write).is_pending());
         let host_read = async {
-            let mut timer = PolledTimer::new(&driver);
-            timer.sleep(Duration::from_millis(200)).await;
             let mut v = [0_u16; 2000];
             let n = host.recv(v.as_mut_bytes()).await.unwrap();
             assert_eq!(n, v.as_bytes().len());
@@ -974,8 +978,10 @@ mod tests {
         futures::future::join(guest_write, host_read).await;
     }
 
+    // Test: Transfer a byte stream larger than the ring after its writer blocks.
+    // Expected: Peer reads wake the writer and preserve every byte in order.
     #[async_test]
-    async fn test_byte_pipe(driver: DefaultDriver) {
+    async fn test_byte_pipe() {
         let (mut host, mut guest) = connected_byte_pipes(4096);
         let guest_write = async {
             let v: Vec<_> = (0..10000_u16).collect();
@@ -983,9 +989,9 @@ mod tests {
             assert!(futures::poll!(&mut write).is_pending());
             write.await.unwrap();
         };
+        let mut guest_write = Box::pin(guest_write);
+        assert!(futures::poll!(&mut guest_write).is_pending());
         let host_read = async {
-            let mut timer = PolledTimer::new(&driver);
-            timer.sleep(Duration::from_millis(200)).await;
             let mut v = [0_u16; 10000];
             host.read_exact(v.as_mut_bytes()).await.unwrap();
             assert!(v.iter().copied().eq(0..10000_u16));

@@ -11,6 +11,7 @@ use futures::{AsyncReadExt, AsyncWriteExt};
 use guestmem::MemoryRead;
 use pal_async::async_test;
 use std::io::{ErrorKind, IoSlice, IoSliceMut};
+use test_with_tracing::test;
 use vmbus_channel::connected_async_channels;
 use vmbus_ring::{OutgoingPacketType, PacketSize, PipeHeader};
 use zerocopy::IntoBytes;
@@ -416,4 +417,111 @@ async fn cancelled_blocked_datagram_does_not_publish_or_block_reuse() {
     assert!(futures::poll!(guest.recv(&mut extra)).is_pending());
     let (_, mut writer) = host.split();
     writer.wait_empty().await.unwrap();
+}
+
+// Test: Poll both split message halves while a send is blocked and input is empty.
+// Expected: Peer progress wakes both tasks; the send completes intact, input
+//       remains pending until a peer message arrives, and both directions recover.
+#[async_test]
+async fn split_message_halves_wake_on_peer_progress() {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Wake, Waker};
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+
+    impl Wake for WakeCount {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let (mut host, mut guest) = connected_message_pipes(4096);
+    host.send(&[0x51; 4000]).await.unwrap();
+    let (mut reader, mut writer) = host.split();
+    let read_wakes = Arc::new(WakeCount::default());
+    let write_wakes = Arc::new(WakeCount::default());
+    let read_waker = Waker::from(read_wakes.clone());
+    let write_waker = Waker::from(write_wakes.clone());
+    let mut read_cx = Context::from_waker(&read_waker);
+    let mut write_cx = Context::from_waker(&write_waker);
+    let mut received = [0; 8];
+    let mut read = Box::pin(reader.recv_exact(&mut received));
+    let mut send = Box::pin(writer.send(&[0xa3; 4000]));
+    assert!(send.as_mut().poll(&mut write_cx).is_pending());
+    assert!(read.as_mut().poll(&mut read_cx).is_pending());
+
+    let mut payload = [0; 4000];
+    guest.recv_exact(&mut payload).await.unwrap();
+    assert_eq!(payload, [0x51; 4000]);
+    assert!(read_wakes.0.load(Ordering::SeqCst) > 0);
+    assert!(write_wakes.0.load(Ordering::SeqCst) > 0);
+    send.await.unwrap();
+    assert!(read.as_mut().poll(&mut read_cx).is_pending());
+    let previous_wakes = read_wakes.0.load(Ordering::SeqCst);
+    guest.send(b"response").await.unwrap();
+    assert!(read_wakes.0.load(Ordering::SeqCst) > previous_wakes);
+    read.await.unwrap();
+    assert_eq!(&received, b"response");
+    guest.recv_exact(&mut payload).await.unwrap();
+    assert_eq!(payload, [0xa3; 4000]);
+    writer.wait_empty().await.unwrap();
+    writer.send(b"reused").await.unwrap();
+    let mut tail = [0; 6];
+    guest.recv_exact(&mut tail).await.unwrap();
+    assert_eq!(&tail, b"reused");
+}
+
+// Test: Drop a partially consumed queue batch while a replacement write is blocked.
+// Expected: Only consumed packets release space; the unread packet survives, the
+//       writer resumes after batch drop, and replacement payload and ID are intact.
+#[async_test]
+async fn queue_batch_drop_releases_only_consumed_packets() {
+    let (mut host, mut guest) = connected_queues(4096);
+    let mut writer = host.split().1;
+    for (id, payload) in [(11, &[0x61; 2000]), (12, &[0x72; 2000])] {
+        writer
+            .write(OutgoingPacket {
+                transaction_id: id,
+                packet_type: OutgoingPacketType::InBandWithCompletion,
+                payload: &[payload],
+            })
+            .await
+            .unwrap();
+    }
+    let mut replacement = writer.write(OutgoingPacket {
+        transaction_id: 13,
+        packet_type: OutgoingPacketType::InBandWithCompletion,
+        payload: &[&[0x83; 2000]],
+    });
+    assert!(futures::poll!(&mut replacement).is_pending());
+    let mut bytes = [0; 2000];
+    {
+        let mut reader = guest.split().0;
+        let mut batch = reader.read_batch().await.unwrap();
+        let IncomingPacket::Data(first) = batch.packets().next().unwrap().unwrap() else {
+            panic!("expected data")
+        };
+        assert_eq!(first.transaction_id(), Some(11));
+        first.reader().read(&mut bytes).unwrap();
+        assert_eq!(bytes, [0x61; 2000]);
+        assert!(futures::poll!(&mut replacement).is_pending());
+    }
+    replacement.await.unwrap();
+    for (id, expected) in [(12, 0x72), (13, 0x83)] {
+        let mut reader = guest.split().0;
+        let packet = reader.read().await.unwrap();
+        let IncomingPacket::Data(data) = &*packet else {
+            panic!("expected data")
+        };
+        assert_eq!(data.transaction_id(), Some(id));
+        data.reader().read(&mut bytes).unwrap();
+        assert_eq!(bytes, [expected; 2000]);
+    }
+    assert!(matches!(
+        guest.split().0.try_read(),
+        Err(crate::queue::TryReadError::Empty)
+    ));
 }

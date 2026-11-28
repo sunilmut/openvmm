@@ -792,16 +792,15 @@ pub fn connected_queues(ring_size: usize) -> (Queue<FlatRingMem>, Queue<FlatRing
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pal_async::DefaultDriver;
     use pal_async::async_test;
-    use pal_async::task::Spawn;
-    use pal_async::timer::PolledTimer;
     use ring::OutgoingPacketType;
     use std::future::poll_fn;
-    use std::time::Duration;
+    use test_with_tracing::test;
     use vmbus_channel::gpadl::GpadlId;
     use vmbus_channel::gpadl::GpadlMap;
 
+    // Test: Round-trip a data packet containing two external GPA ranges.
+    // Expected: The full payload and both ranges retain their offsets and pages.
     #[async_test]
     async fn test_gpa_direct() {
         use guestmem::ranges::PagedRange;
@@ -862,6 +861,8 @@ mod tests {
             .unwrap();
     }
 
+    // Test: Decode a GPA-direct packet containing an empty external range.
+    // Expected: The payload survives and the malformed range returns GpaRange.
     #[async_test]
     async fn test_gpa_direct_empty_external_data() {
         use guestmem::ranges::PagedRange;
@@ -913,6 +914,8 @@ mod tests {
             .unwrap();
     }
 
+    // Test: Resolve transfer-page descriptors across a mapped page boundary.
+    // Expected: Payload, buffer ID, offsets, lengths and page numbers are intact.
     #[async_test]
     async fn test_transfer_pages() {
         use guestmem::ranges::PagedRange;
@@ -1003,8 +1006,11 @@ mod tests {
             .unwrap();
     }
 
+    // Test: Fill the queue and register readiness before consuming its packet.
+    // Expected: Full reports a size, readiness resumes after consumption, and
+    //       both original and replacement packets arrive with intact payloads.
     #[async_test]
-    async fn test_ring_full(driver: DefaultDriver) {
+    async fn test_ring_full() {
         let (mut host_queue, mut guest_queue) = connected_queues(4096);
 
         assert!(
@@ -1019,7 +1025,7 @@ mod tests {
             .try_write(&OutgoingPacket {
                 transaction_id: 0,
                 packet_type: OutgoingPacketType::InBandNoCompletion,
-                payload: &[&[0u8; 4000]],
+                payload: &[&[0x51u8; 4000]],
             })
             .unwrap();
 
@@ -1047,13 +1053,16 @@ mod tests {
         .boxed();
 
         assert!(futures::poll!(&mut poll).is_pending());
-        let poll = driver.spawn("test", poll);
-
-        PolledTimer::new(&driver)
-            .sleep(Duration::from_millis(50))
-            .await;
-
-        guest_queue.split().0.read().await.unwrap();
+        {
+            let mut reader = guest_queue.split().0;
+            let packet = reader.read().await.unwrap();
+            let IncomingPacket::Data(data) = &*packet else {
+                panic!("expected data")
+            };
+            let mut bytes = [0; 4000];
+            data.reader().read(&mut bytes).unwrap();
+            assert_eq!(bytes, [0x51; 4000]);
+        }
         assert!(guest_queue.split().0.try_read().is_err());
 
         let mut host_queue = poll.await;
@@ -1064,8 +1073,16 @@ mod tests {
             .try_write(&OutgoingPacket {
                 transaction_id: 0,
                 packet_type: OutgoingPacketType::InBandNoCompletion,
-                payload: &[&[0u8; 4000]],
+                payload: &[&[0xa3u8; 4000]],
             })
             .unwrap();
+        let mut reader = guest_queue.split().0;
+        let packet = reader.read().await.unwrap();
+        let IncomingPacket::Data(data) = &*packet else {
+            panic!("expected data")
+        };
+        let mut bytes = [0; 4000];
+        data.reader().read(&mut bytes).unwrap();
+        assert_eq!(bytes, [0xa3; 4000]);
     }
 }
