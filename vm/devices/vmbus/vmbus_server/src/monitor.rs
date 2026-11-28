@@ -44,6 +44,8 @@ mod tests {
     use super::*;
     use test_with_tracing::test;
 
+    // Test: Exhaust monitor IDs and release holes at both ends and a word boundary.
+    // Expected: Allocation reuses each free ID in order without sharing occupied IDs.
     #[test]
     fn assign_monitor_reuses_lowest_free_bit() {
         let mut monitors = AssignedMonitors { bitmap: u128::MAX };
@@ -57,6 +59,8 @@ mod tests {
         assert_eq!(monitors.assign_monitor(), None);
     }
 
+    // Test: Allocate all monitor IDs, then release and reallocate one.
+    // Expected: Exhaustion is reported and the released ID becomes available again.
     #[test]
     fn test_assign_release() {
         let mut monitors = AssignedMonitors::new();
@@ -72,6 +76,8 @@ mod tests {
         assert_eq!(id, Some(MonitorId(10)));
     }
 
+    // Test: Claim an explicit monitor ID before and after release.
+    // Expected: Duplicate claims fail and ordinary allocation avoids claimed IDs.
     #[test]
     fn test_claim() {
         let mut monitors = AssignedMonitors::new();

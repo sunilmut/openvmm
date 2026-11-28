@@ -622,3 +622,142 @@ fn full_sized_gpadl_fragments_preserve_page_order_and_defer_completion() {
             status: protocol::STATUS_SUCCESS,
         }));
 }
+
+// Test: Receive full-sized firmware GPADL messages with padding beyond the declared range.
+// Expected: Header and body padding never become mapped pages; device acceptance gates success.
+#[test]
+fn padded_wire_gpadls_preserve_only_the_declared_range() {
+    for fragmented in [false, true] {
+        let mut env = TestEnv::new();
+        let offer = env.offer(1);
+        env.connect(Version::Copper, FeatureFlags::new());
+        env.c().handle_request_offers().unwrap();
+        env.notifier.messages.clear();
+        let expected = [8192u64, 0x81, 0x34];
+        let mut header = in_msg(
+            protocol::MessageType::GPADL_HEADER,
+            protocol::GpadlHeader {
+                channel_id: ChannelId(1),
+                gpadl_id: GpadlId(57),
+                count: 1,
+                len: 24,
+            },
+        );
+        if fragmented {
+            header.data.extend_from_slice(expected[..2].as_bytes());
+        } else {
+            header.data.extend_from_slice(expected.as_bytes());
+            header.data.resize(protocol::MAX_MESSAGE_SIZE, 0xff);
+        }
+        env.send_message(header);
+        if fragmented {
+            assert!(matches!(
+                env.recv.try_recv(),
+                Err(mpsc::TryRecvError::Empty)
+            ));
+            assert!(env.notifier.messages.is_empty());
+            let mut body = in_msg(
+                protocol::MessageType::GPADL_BODY,
+                protocol::GpadlBody {
+                    rsvd: 0,
+                    gpadl_id: GpadlId(57),
+                },
+            );
+            body.data.extend_from_slice(expected[2..].as_bytes());
+            body.data.resize(protocol::MAX_MESSAGE_SIZE, 0xff);
+            env.send_message(body);
+        }
+        let (actual_offer, action) = env.recv.try_recv().unwrap();
+        assert_eq!(actual_offer, offer);
+        let Action::Gpadl(id, count, pages) = action else {
+            panic!("expected firmware mapping");
+        };
+        assert_eq!(id, GpadlId(57));
+        assert_eq!(count, 1);
+        assert_eq!(pages, expected);
+        assert!(env.notifier.messages.is_empty());
+        env.c()
+            .gpadl_create_complete(offer, GpadlId(57), protocol::STATUS_SUCCESS);
+        env.notifier
+            .check_message(OutgoingMessage::new(&protocol::GpadlCreated {
+                channel_id: ChannelId(1),
+                gpadl_id: GpadlId(57),
+                status: protocol::STATUS_SUCCESS,
+            }));
+    }
+}
+
+// Test: Release one channel while it and a peer have distinct partial GPADLs.
+// Expected: The peer completes unchanged; the released mapping's ID can start a fresh range.
+#[test]
+fn release_discards_only_the_released_channels_partial_gpadl() {
+    let mut env = TestEnv::new();
+    env.offer(1);
+    let peer = env.offer(2);
+    env.connect(Version::Copper, FeatureFlags::new());
+    env.c().handle_request_offers().unwrap();
+    env.notifier.messages.clear();
+    for (channel_id, id, page) in [(1, 41, 0x81), (2, 42, 0x34)] {
+        let mut header = in_msg(
+            protocol::MessageType::GPADL_HEADER,
+            protocol::GpadlHeader {
+                channel_id: ChannelId(channel_id),
+                gpadl_id: GpadlId(id),
+                count: 1,
+                len: 24,
+            },
+        );
+        header.data.extend_from_slice([8192u64, page].as_bytes());
+        env.send_message(header);
+    }
+    env.send_message(in_msg(
+        protocol::MessageType::REL_ID_RELEASED,
+        protocol::RelIdReleased {
+            channel_id: ChannelId(1),
+        },
+    ));
+    let mut body = in_msg(
+        protocol::MessageType::GPADL_BODY,
+        protocol::GpadlBody {
+            rsvd: 0,
+            gpadl_id: GpadlId(42),
+        },
+    );
+    body.data.extend_from_slice([0x35u64].as_bytes());
+    env.send_message(body);
+    let (offer, action) = env.recv.try_recv().unwrap();
+    assert_eq!(offer, peer);
+    let Action::Gpadl(id, count, pages) = action else {
+        panic!("expected peer mapping");
+    };
+    assert_eq!(id, GpadlId(42));
+    assert_eq!(count, 1);
+    assert_eq!(pages, [8192, 0x34, 0x35]);
+    env.c()
+        .gpadl_create_complete(peer, GpadlId(42), protocol::STATUS_SUCCESS);
+    env.notifier
+        .check_message(OutgoingMessage::new(&protocol::GpadlCreated {
+            channel_id: ChannelId(2),
+            gpadl_id: GpadlId(42),
+            status: protocol::STATUS_SUCCESS,
+        }));
+
+    // A second independent channel can claim the freed incomplete GPADL ID.
+    env.gpadl(2, 41);
+    let (offer, action) = env.recv.try_recv().unwrap();
+    assert_eq!(offer, peer);
+    let Action::Gpadl(id, count, pages) = action else {
+        panic!("expected fresh mapping");
+    };
+    assert_eq!(id, GpadlId(41));
+    assert_eq!(count, 1);
+    assert_eq!(pages, [1, 0]);
+    env.c()
+        .gpadl_create_complete(peer, GpadlId(41), protocol::STATUS_SUCCESS);
+    env.notifier
+        .check_message(OutgoingMessage::new(&protocol::GpadlCreated {
+            channel_id: ChannelId(2),
+            gpadl_id: GpadlId(41),
+            status: protocol::STATUS_SUCCESS,
+        }));
+}

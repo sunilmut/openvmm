@@ -13,6 +13,8 @@ use test_with_tracing::test;
 use vmbus_core::protocol::TargetInfo;
 use zerocopy::FromBytes;
 
+// Test: Offer a message pipe carrying opaque data and GPA-direct flags.
+// Expected: The guest wire offer preserves pipe mode, data, and flags.
 #[test]
 fn pipe_offer_data_is_encoded_in_user_defined_data() {
     let pipe_flags = protocol::PipeFlags::new().with_gpa_direct(true);
@@ -27,17 +29,21 @@ fn pipe_offer_data_is_encoded_in_user_defined_data() {
     }
     .into();
 
-    assert_eq!(
-        params.user_defined.as_pipe_params().pipe_type,
-        protocol::PipeType::MESSAGE
-    );
-    assert_eq!(
-        params.user_defined.as_pipe_params().user_defined,
-        user_defined
-    );
-    assert_eq!(params.user_defined.as_pipe_params().flags, pipe_flags);
+    let mut env = TestEnv::new();
+    env.c().offer_channel(params).unwrap();
+    env.connect(Version::Copper, FeatureFlags::new());
+    env.c().handle_request_offers().unwrap();
+    let offer: protocol::OfferChannel = env.notifier.get_message();
+    let pipe = offer.user_defined.as_pipe_params();
+    assert_eq!(pipe.pipe_type, protocol::PipeType::MESSAGE);
+    assert_eq!(pipe.user_defined, user_defined);
+    assert_eq!(pipe.flags, pipe_flags);
+    env.notifier
+        .check_message(OutgoingMessage::new(&protocol::AllOffersDelivered {}));
 }
 
+// Test: Request an unknown protocol version.
+// Expected: Negotiation rejects it without installing connection resources.
 #[test]
 fn test_version_negotiation_not_supported() {
     let mut env = TestEnv::new();
@@ -45,6 +51,8 @@ fn test_version_negotiation_not_supported() {
     test_initiate_contact(&mut env, TestVersion::Unsupported(0xffffffff), 0);
 }
 
+// Test: Request a supported Win10 protocol version.
+// Expected: Negotiation installs the requested resources and reports support.
 #[test]
 fn test_version_negotiation_success() {
     let mut env = TestEnv::new();
@@ -59,6 +67,8 @@ fn test_version_negotiation_success() {
     );
 }
 
+// Test: Request a nonstandard SINT on multiclient and ordinary message ports.
+// Expected: Multiclient rejects at the requested target; ordinary contact ignores SINT.
 #[test]
 fn test_version_negotiation_multiclient_sint() {
     let mut env = TestEnv::new();
@@ -108,6 +118,8 @@ fn test_version_negotiation_multiclient_sint() {
     );
 }
 
+// Test: Request another VTL through multiclient and ordinary message ports.
+// Expected: Multiclient forwards without connecting locally; ordinary contact stays local.
 #[test]
 fn test_version_negotiation_multiclient_vtl() {
     let mut env = TestEnv::new();
@@ -152,6 +164,8 @@ fn test_version_negotiation_multiclient_vtl() {
     assert!(env.notifier.forward_request.is_none());
 }
 
+// Test: Negotiate supported, unknown, and client-ID feature bits across reconnects.
+// Expected: Responses retain supported requested bits and mask unknown features.
 #[test]
 fn test_version_negotiation_feature_flags() {
     let mut env = TestEnv::new();
@@ -223,6 +237,8 @@ fn test_version_negotiation_feature_flags() {
     );
 }
 
+// Test: Request GPA pinning with and without server capability.
+// Expected: Pinning is negotiated only when the server supports it.
 #[test]
 fn test_version_negotiation_gpa_pinning_requires_server_support() {
     let requested_features = FeatureFlags::new().with_gpa_pinning(true);
@@ -252,6 +268,8 @@ fn test_version_negotiation_gpa_pinning_requires_server_support() {
     );
 }
 
+// Test: Negotiate legacy and modern versions with an interrupt-page address.
+// Expected: Only pre-Win8 versions install the shared interrupt page.
 #[test]
 fn test_version_negotiation_interrupt_page() {
     let mut env = TestEnv::new();
@@ -407,21 +425,29 @@ fn test_initiate_contact(env: &mut TestEnv, version: TestVersion, target_info: u
     }
 }
 
+// Test: Offer, open, retarget, revoke, and release a Win10Rs5 channel.
+// Expected: Wire identities and device requests retain legacy routing semantics.
 #[test]
 fn test_channel_lifetime() {
     test_channel_lifetime_helper(Version::Win10Rs5, FeatureFlags::new());
 }
 
+// Test: Exercise a channel lifetime with Iron protocol responses.
+// Expected: Retarget completion returns the correlated modern response.
 #[test]
 fn test_channel_lifetime_iron() {
     test_channel_lifetime_helper(Version::Iron, FeatureFlags::new());
 }
 
+// Test: Exercise a Copper channel lifetime without optional routing features.
+// Expected: Offers and opens use default routing and completion identities.
 #[test]
 fn test_channel_lifetime_copper() {
     test_channel_lifetime_helper(Version::Copper, FeatureFlags::new());
 }
 
+// Test: Open a Copper channel with guest-selected signal parameters.
+// Expected: Device requests preserve the guest event flag and connection ID.
 #[test]
 fn test_channel_lifetime_copper_guest_signal() {
     test_channel_lifetime_helper(
@@ -430,6 +456,8 @@ fn test_channel_lifetime_copper_guest_signal() {
     );
 }
 
+// Test: Open a Copper channel requesting interrupt redirection and unknown bits.
+// Expected: The negotiated redirection flag survives and unrecognized bits are masked.
 #[test]
 fn test_channel_lifetime_copper_open_flags() {
     test_channel_lifetime_helper(
@@ -635,16 +663,22 @@ fn test_channel_lifetime_helper(version: Version, feature_flags: FeatureFlags) {
         .unwrap();
 }
 
+// Test: Request a socket using the original Win10 request format.
+// Expected: Service and endpoint reach the host without an unsupported failure reply.
 #[test]
 fn test_hvsock() {
     test_hvsock_helper(Version::Win10, false);
 }
 
+// Test: Reject socket connection attempts from a Win10Rs3 client.
+// Expected: Failure replies retain service and endpoint with connection-refused status.
 #[test]
 fn test_hvsock_rs3() {
     test_hvsock_helper(Version::Win10Rs3_0, false);
 }
 
+// Test: Parse both short and extended socket requests from Win10Rs5.
+// Expected: Both formats preserve endpoint correlation and report connection refusal.
 #[test]
 fn test_hvsock_rs5() {
     test_hvsock_helper(Version::Win10Rs5, false);
@@ -739,6 +773,8 @@ fn test_hvsock_helper(version: Version, force_small_message: bool) {
 }
 
 /// Ensure that channels can be offered at each stage of connection.
+// Test: Hot-add channels before, during, and after connection and offer enumeration.
+// Expected: Every channel can open and reset completes after device closes.
 #[test]
 fn test_hot_add() {
     let mut env = TestEnv::new();
@@ -782,6 +818,8 @@ fn test_hot_add() {
     assert!(env.notifier.is_reset());
 }
 
+// Test: Save and restore a server that has offers but no guest connection.
+// Expected: Closed devices can be reclaimed without manufacturing a connection.
 #[test]
 fn test_save_restore_with_no_connection() {
     let mut env = TestEnv::new();
@@ -796,6 +834,8 @@ fn test_save_restore_with_no_connection() {
     env.c().restore_channel(offer_id1, false).unwrap();
 }
 
+// Test: Restore a negotiated version above the destination's compatibility limit.
+// Expected: Restore reports the exact unsupported version.
 #[test]
 fn test_restore_max_version_rejects_higher_version() {
     // Save a state that was negotiated at the Copper protocol version, then
@@ -817,6 +857,8 @@ fn test_restore_max_version_rejects_higher_version() {
     );
 }
 
+// Test: Restore a connection whose features exceed the destination's permitted mask.
+// Expected: Restore reports the unsupported feature bits.
 #[test]
 fn test_restore_max_version_rejects_disallowed_feature_flags() {
     // Save a state that was negotiated at Copper with a feature flag set,
@@ -845,6 +887,8 @@ fn test_restore_max_version_rejects_disallowed_feature_flags() {
     );
 }
 
+// Test: Restore a pre-Copper snapshot within the destination's version limit.
+// Expected: Its closed channel can be reclaimed successfully.
 #[test]
 fn test_restore_max_version_pre_copper() {
     // Save a state that was negotiated at a pre-Copper protocol version,
@@ -864,6 +908,8 @@ fn test_restore_max_version_pre_copper() {
     env2.c().restore_channel(offer_id2, false).unwrap();
 }
 
+// Test: Restore Copper with a feature mask explicitly supported by the destination.
+// Expected: The compatible snapshot and channel restore successfully.
 #[test]
 fn test_restore_max_version_copper_with_feature_flags() {
     // Save a state that was negotiated at Copper with a feature flag set,
@@ -887,6 +933,8 @@ fn test_restore_max_version_copper_with_feature_flags() {
     env2.c().restore_channel(offer_id2, false).unwrap();
 }
 
+// Test: Inject Copper-only features into an older connection snapshot.
+// Expected: Restore rejects those impossible version-feature combinations.
 #[test]
 fn test_restore_pre_copper_with_feature_flags_rejected() {
     // Save a state at a pre-Copper protocol version, then manipulate the
@@ -928,6 +976,8 @@ fn test_restore_pre_copper_with_feature_flags_rejected() {
     );
 }
 
+// Test: Restore a disconnected reserved channel with permitted Copper features.
+// Expected: The reserved open device can be reclaimed after unload.
 #[test]
 fn test_restore_max_version_reserved_channel_success() {
     // Save a disconnected state that retains a reserved channel reserved
@@ -956,6 +1006,8 @@ fn test_restore_max_version_reserved_channel_success() {
     env2.c().restore_channel(offer_id1, true).unwrap();
 }
 
+// Test: Restore a reserved channel whose saved version exceeds the destination cap.
+// Expected: Restore reports an unsupported reserved-channel version.
 #[test]
 fn test_restore_max_version_reserved_channel_rejects_higher_version() {
     // Save a disconnected state that retains a reserved channel reserved
@@ -983,6 +1035,8 @@ fn test_restore_max_version_reserved_channel_rejects_higher_version() {
     );
 }
 
+// Test: Restore a reserved channel with features forbidden by the destination.
+// Expected: Restore reports unsupported reserved-channel feature bits.
 #[test]
 fn test_restore_max_version_reserved_channel_rejects_disallowed_feature_flags() {
     // Save a disconnected state that retains a reserved channel reserved
@@ -1018,6 +1072,8 @@ fn test_restore_max_version_reserved_channel_rejects_disallowed_feature_flags() 
     );
 }
 
+// Test: Inject Copper-only features into an older reserved-channel snapshot.
+// Expected: Restore rejects the inconsistent reserved-channel protocol data.
 #[test]
 fn test_restore_pre_copper_reserved_channel_with_feature_flags_rejected() {
     // Save a state with a reserved channel that was reserved while the
@@ -1075,6 +1131,8 @@ fn test_restore_pre_copper_reserved_channel_with_feature_flags_rejected() {
     );
 }
 
+// Test: Restore mixed open, opening, closing, revoked, and reoffered channels and GPADLs.
+// Expected: Device reconciliation retains monitor identities and reset remains usable.
 #[test]
 fn test_save_restore_with_connection() {
     let mut env = TestEnv::new();
@@ -1207,6 +1265,8 @@ fn test_save_restore_with_connection() {
     assert_eq!(env.notifier.target_message_vp, Some(0));
 }
 
+// Test: Save during initial connection negotiation and restore the pending work.
+// Expected: The same version, VP, and monitor pages are replayed and negotiation finishes.
 #[test]
 fn test_save_restore_connecting() {
     let mut env = TestEnv::new();
@@ -1266,6 +1326,8 @@ fn test_save_restore_connecting() {
     env.complete_connect();
 }
 
+// Test: Save while a monitor-page connection modification is pending.
+// Expected: Restore repeats the update and completion sends the correlated success reply.
 #[test]
 fn test_save_restore_modifying() {
     let mut env = TestEnv::new();
@@ -1328,6 +1390,8 @@ fn test_save_restore_modifying() {
         }));
 }
 
+// Test: Save a reserved channel and GPADL after connection unload.
+// Expected: Restore retains both resources while ordinary channels remain closed.
 #[test]
 fn test_save_restore_disconnected_reserved() {
     let mut env = TestEnv::new();
@@ -1362,6 +1426,8 @@ fn test_save_restore_disconnected_reserved() {
     assert!(env.server.gpadls.contains_key(&(GpadlId(1), offer_id1)));
 }
 
+// Test: Restore a connected server whose guest has not requested offers yet.
+// Expected: No premature messages appear and later enumeration returns every offer.
 #[test]
 fn test_save_restore_offers_not_sent() {
     let mut env = TestEnv::new();
@@ -1424,6 +1490,8 @@ fn test_save_restore_offers_not_sent() {
     ]);
 }
 
+// Test: Add a new device on the destination while restoring previously offered devices.
+// Expected: Reconciliation emits only the new offer after existing devices are reclaimed.
 #[test]
 fn test_save_restore_hot_add_during_restore() {
     let mut env = TestEnv::new();
@@ -1466,6 +1534,8 @@ fn test_save_restore_hot_add_during_restore() {
     assert!(env.notifier.messages.is_empty());
 }
 
+// Test: Checkpoint queued GPADL and open replies while a reserved reply is blocked.
+// Expected: Reserved replies are discarded; ordinary replies replay once in FIFO order.
 #[test]
 fn test_pending_messages() {
     let mut env = TestEnv::new();
@@ -1542,6 +1612,8 @@ fn test_pending_messages() {
     assert!(!env.server.has_pending_messages());
 }
 
+// Test: Modify monitor pages and have the backend reject the modification.
+// Expected: Requested addresses reach the backend and its failure reaches the guest.
 #[test]
 fn test_modify_connection() {
     let mut env = TestEnv::new();
@@ -1589,6 +1661,8 @@ fn test_modify_connection() {
         }));
 }
 
+// Test: Send ModifyConnection without negotiating that feature.
+// Expected: The protocol rejects the message type.
 #[test]
 fn test_modify_connection_unsupported() {
     let mut env = TestEnv::new();
@@ -1612,6 +1686,8 @@ fn test_modify_connection_unsupported() {
     ));
 }
 
+// Test: Keep reserved channels and duplicate per-channel GPADLs across unload and reconnect.
+// Expected: Reserved targets stay usable, ordinary close fails, and reset releases all resources.
 #[test]
 fn test_reserved_channels() {
     let mut env = TestEnv::new();
@@ -1708,6 +1784,8 @@ fn test_reserved_channels() {
 // Reserved channels are supposed to remain usable across unload. A close that
 // completes while the connection is disconnected must still deliver a
 // CloseReservedChannelResponse to the originally requested target.
+// Test: Close a reserved channel after connection unload has completed.
+// Expected: The close acknowledgement reaches its requested VP and SINT while disconnected.
 #[test]
 fn test_reserved_channel_close_response_after_unload() {
     let mut env = TestEnv::new();
@@ -1750,6 +1828,8 @@ fn test_reserved_channel_close_response_after_unload() {
     );
 }
 
+// Test: Reset a disconnected server retaining reserved channels and GPADLs.
+// Expected: Reserved resources are released and subsequent connections remain usable.
 #[test]
 fn test_disconnected_reset() {
     let mut env = TestEnv::new();
@@ -1798,6 +1878,8 @@ fn test_disconnected_reset() {
     assert!(env.notifier.is_reset());
 }
 
+// Test: Enumerate ordinary, server-managed, and relay-managed monitor channels.
+// Expected: Monitor IDs appear only when usable and relay IDs are not allocated locally.
 #[test]
 fn test_mnf_channel() {
     let mut env = TestEnv::new();
@@ -1880,6 +1962,8 @@ fn test_mnf_channel() {
         .check_messages(make_messages(&expected_channels));
 }
 
+// Test: Open a monitored channel with interrupts explicitly disabled.
+// Expected: Device open parameters contain neither a target VP nor monitor information.
 #[test]
 fn test_mnf_channel_open_with_interrupts_disabled() {
     // A channel with MNF enabled, opened by the guest with interrupts disabled (via
@@ -1915,6 +1999,8 @@ fn test_mnf_channel_open_with_interrupts_disabled() {
     assert_eq!(op.monitor_info, None);
 }
 
+// Test: Negotiate server-allocated monitor pages with and without guest addresses.
+// Expected: Version replies and channel offers describe the allocated pages and monitor ID.
 #[test]
 fn test_server_monitor_page() {
     // Guest pages provided, but overridden by server-allocated pages.
@@ -2031,6 +2117,8 @@ fn test_server_monitor_page_helper(provide_guest_pages: bool) {
     ]);
 }
 
+// Test: Enumerate offers with different interface IDs and per-interface order hints.
+// Expected: Wire channel IDs follow interface grouping and each group's requested order.
 #[test]
 fn test_channel_id_order() {
     let mut env = TestEnv::new();
@@ -2114,6 +2202,8 @@ fn test_channel_id_order() {
     ])
 }
 
+// Test: Restore two network offers after their order hints are swapped.
+// Expected: Saved channel identities remain stable instead of following the new order.
 #[test]
 fn test_save_restore_netvsp_channel_id_order() {
     let interface_id = guid::guid!("f8615163-df3e-46c5-913f-f2d2f965ed0e");
@@ -2184,6 +2274,8 @@ fn test_save_restore_netvsp_channel_id_order() {
     assert_eq!(secondary_channel_id, saved_secondary_channel_id);
 }
 
+// Test: Enumerate offers using absolute rather than per-interface order hints.
+// Expected: Explicit global order determines channel identities before unordered offers.
 #[test]
 fn test_channel_id_order_absolute() {
     let mut env = TestEnv::with_params(true, false);
@@ -2268,6 +2360,8 @@ fn test_channel_id_order_absolute() {
     ])
 }
 
+// Test: Enumerate confidential channels on a trusted negotiated connection.
+// Expected: Untrusted traffic is rejected and trusted offers retain confidentiality flags.
 #[test]
 fn test_confidential_connection() {
     let mut env = TestEnv::new();
@@ -2336,6 +2430,8 @@ fn test_confidential_connection() {
         .check_message(OutgoingMessage::new(&protocol::AllOffersDelivered {}));
 }
 
+// Test: Enumerate confidential-capable offers without negotiating confidentiality.
+// Expected: Confidential flags are suppressed while unrelated offer flags survive.
 #[test]
 fn test_confidential_channels_unsupported() {
     let mut env = TestEnv::new();
@@ -2384,6 +2480,8 @@ fn test_confidential_channels_unsupported() {
         .check_message(OutgoingMessage::new(&protocol::AllOffersDelivered {}));
 }
 
+// Test: Offer pinned-memory channels with and without negotiated GPA pinning.
+// Expected: Wire pinning requirements appear only when supported by the guest.
 #[test]
 fn test_offer_requires_pinning_only_when_negotiated() {
     for negotiate_gpa_pinning in [false, true] {
@@ -2411,6 +2509,8 @@ fn test_offer_requires_pinning_only_when_negotiated() {
     }
 }
 
+// Test: Request confidential channels through an untrusted connection.
+// Expected: Negotiation suppresses the confidential-channel capability.
 #[test]
 fn test_confidential_channels_untrusted() {
     let mut env = TestEnv::new();
@@ -2431,6 +2531,8 @@ fn test_confidential_channels_untrusted() {
     );
 }
 
+// Test: Unload a connected server with only closed channels.
+// Expected: Backend resources reset before the guest receives unload completion.
 #[test]
 fn test_disconnect() {
     let mut env = TestEnv::new();
@@ -2461,6 +2563,8 @@ fn test_disconnect() {
         .check_message(OutgoingMessage::new(&protocol::UnloadComplete {}));
 }
 
+// Test: Unload while multiple device channels remain open.
+// Expected: Backend disconnect waits for all device close completions.
 #[test]
 fn test_disconnect_open_channels() {
     let mut env = TestEnv::new();
@@ -2504,6 +2608,8 @@ fn test_disconnect_open_channels() {
         .check_message(OutgoingMessage::new(&protocol::UnloadComplete {}));
 }
 
+// Test: Send a new contact while an existing guest connection is active.
+// Expected: Old resources disconnect first, no unload reply is fabricated, and contact replays.
 #[test]
 fn test_reinitiate_contact() {
     let mut env = TestEnv::new();
@@ -2571,6 +2677,8 @@ fn test_reinitiate_contact() {
     env.complete_connect();
 }
 
+// Test: Create GPADLs for missing channels and invalid single or fragmented ranges.
+// Expected: Correlated failures occur only after complete input and the ID can be reused.
 #[test]
 fn test_gpadl_create_failure() {
     let mut env = TestEnv::new();
@@ -2674,6 +2782,8 @@ fn test_gpadl_create_failure() {
         }));
 }
 
+// Test: Reset with an incomplete GPADL then reuse its ID after reconnect.
+// Expected: Partial ranges are discarded and the new complete mapping reaches the device.
 #[test]
 fn test_gpadl_in_progress_reset() {
     let mut env = TestEnv::new();

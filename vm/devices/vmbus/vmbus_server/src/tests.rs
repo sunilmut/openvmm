@@ -47,9 +47,11 @@ struct MockSynic {
     spawner: DefaultDriver,
     allow_allocated_monitor_pages: bool,
     guest_interrupts: Arc<AtomicUsize>,
+    guest_interrupt_event: Event,
     message_targets: Arc<Mutex<Vec<(Vtl, u32, u8)>>>,
     guest_target_vps: Arc<Mutex<Vec<u32>>>,
     fail_next_event_retarget: Arc<AtomicBool>,
+    message_port_failure_event: Event,
 }
 
 impl MockSynic {
@@ -70,9 +72,11 @@ impl MockSynic {
             spawner,
             allow_allocated_monitor_pages,
             guest_interrupts: Arc::new(AtomicUsize::new(0)),
+            guest_interrupt_event: Event::new(),
             message_targets: Default::default(),
             guest_target_vps: Default::default(),
             fail_next_event_retarget: Default::default(),
+            message_port_failure_event: Event::new(),
         }
     }
 
@@ -213,6 +217,7 @@ impl SynicPortAccess for MockSynic {
         let mut inner = self.inner.lock();
         if inner.fail_message_port_target == Some((vp, sint)) {
             inner.fail_message_port_target = None;
+            self.message_port_failure_event.signal();
             return Err(vmcore::synic::HypervisorError(Box::new(
                 std::io::Error::other("injected message port failure"),
             )));
@@ -241,10 +246,12 @@ impl SynicPortAccess for MockSynic {
         _monitor_info: Option<MonitorInfo>,
     ) -> Result<Box<dyn GuestEventPort>, vmcore::synic::HypervisorError> {
         let count = self.guest_interrupts.clone();
+        let event = self.guest_interrupt_event.clone();
         self.guest_target_vps.lock().push(vp);
         Ok(Box::new(MockGuestPort {
             interrupt: Interrupt::from_fn(move || {
                 count.fetch_add(1, Ordering::SeqCst);
+                event.signal();
             }),
             target_vps: self.guest_target_vps.clone(),
             fail_next_retarget: self.fail_next_event_retarget.clone(),
@@ -292,7 +299,7 @@ struct TestChannel {
 
 impl TestChannel {
     async fn next_request(&mut self) -> ChannelRequest {
-        self.request_recv.next().await.unwrap()
+        control::bounded(self.request_recv.next()).await.unwrap()
     }
 
     async fn handle_gpadl(&mut self) {
@@ -505,13 +512,13 @@ impl TestEnv {
     }
 
     async fn expect_response(&mut self, expected: protocol::MessageType) {
-        let data = self.message_recv.next().await.unwrap();
+        let data = control::bounded(self.message_recv.next()).await.unwrap();
         let header = protocol::MessageHeader::read_from_prefix(&data).unwrap().0; // TODO: zerocopy: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
         assert_eq!(expected, header.message_type())
     }
 
     async fn get_response<T: VmbusMessage + FromBytes + Immutable + KnownLayout>(&mut self) -> T {
-        let data = self.message_recv.next().await.unwrap();
+        let data = control::bounded(self.message_recv.next()).await.unwrap();
         let (header, message) = protocol::MessageHeader::read_from_prefix(&data).unwrap(); // TODO: zerocopy: unwrap (https://github.com/microsoft/openvmm/issues/759)
         assert_eq!(T::MESSAGE_TYPE, header.message_type());
         T::read_from_prefix(message).unwrap().0 // TODO: zerocopy: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
@@ -566,13 +573,14 @@ impl TestEnv {
     }
 }
 
+// Test: Save a GPADL teardown awaiting its device response and restore it.
+// Expected: A fresh destination repeats teardown and returns its correlated acknowledgement.
 #[async_test]
 async fn test_save_restore(spawner: DefaultDriver) {
     // Most save/restore state is tested in mod channels::tests; this test specifically checks
     // that ServerTaskInner correctly handles some aspects of the save/restore.
     //
-    // If this test fails, it is more likely to hang than panic.
-    let mut env = TestEnv::new(spawner);
+    let mut env = TestEnv::new(spawner.clone());
     let mut channel = env.offer(1, false).await;
     env.vmbus.start();
     env.connect(1, protocol::FeatureFlags::new(), false).await;
@@ -605,6 +613,8 @@ async fn test_save_restore(spawner: DefaultDriver) {
     env.vmbus.reset().await;
     env.vmbus.stop().await;
 
+    let mut env = TestEnv::new(spawner);
+    let mut channel = env.offer(1, false).await;
     // When restoring with a gpadl in the TearingDown state, the teardown request for the device
     // will be repeated. This must not panic.
     env.vmbus.restore(saved_state).await.unwrap();
@@ -613,14 +623,16 @@ async fn test_save_restore(spawner: DefaultDriver) {
 
     // Handle the teardown after restore.
     channel.handle_gpadl_teardown().await;
-    env.expect_response(protocol::MessageType::GPADL_TORNDOWN)
-        .await;
+    let response: protocol::GpadlTorndown = env.get_response().await;
+    assert_eq!(response.gpadl_id, GpadlId(10));
 
     env.synic.send_message(protocol::RelIdReleased {
         channel_id: ChannelId(1),
     });
 }
 
+// Test: Stop and resume while a GPADL teardown request awaits device completion.
+// Expected: Resume does not repeat teardown and later mapping creation remains usable.
 #[async_test]
 async fn test_pause_resume(spawner: DefaultDriver) {
     let mut env = TestEnv::new(spawner);
@@ -652,9 +664,13 @@ async fn test_pause_resume(spawner: DefaultDriver) {
     assert!(matches!(poll!(channel.request_recv.next()), Poll::Pending));
 }
 
+// Test: Fail reserved reply-port creation, reset, and reconnect through the ordinary port.
+// Expected: No reserved reply or device request escapes; a later ordinary open succeeds.
 #[async_test]
 async fn test_failed_reserved_message_port_drops_open_result(spawner: DefaultDriver) {
-    let mut env = TestEnv::new(spawner.clone());
+    let mut env = TestEnvBuilder::new(spawner)
+        .without_message_delays()
+        .build();
     let mut channel = env.offer(1, false).await;
     env.vmbus.start();
     env.connect(1, protocol::FeatureFlags::new(), false).await;
@@ -668,14 +684,23 @@ async fn test_failed_reserved_message_port_drops_open_result(spawner: DefaultDri
         downstream_page_offset: 0,
     });
 
-    let mut timer = PolledTimer::new(&spawner);
-    timer.sleep(Duration::from_millis(20)).await;
-
+    let mut failure =
+        vmcore::notify::Notify::from_event(env.synic.message_port_failure_event.clone())
+            .pollable(&env.synic.spawner)
+            .unwrap();
+    control::bounded(failure.wait()).await;
+    control::bounded(env.vmbus.control().force_reset())
+        .await
+        .unwrap();
+    env.connect(1, protocol::FeatureFlags::new(), false).await;
+    env.open_channel(1, 42, &mut channel, |_| {}).await;
     assert_eq!(env.synic.inner.lock().fail_message_port_target, None);
     assert!(matches!(poll!(channel.request_recv.next()), Poll::Pending));
     assert!(matches!(poll!(env.message_recv.next()), Poll::Pending));
 }
 
+// Test: Create and tear down a mapping for a revoked but not guest-released channel.
+// Expected: The guest gets success without contacting the revoked device.
 #[async_test]
 async fn test_gpadl_on_revoked_channel(spawner: DefaultDriver) {
     // Verify that the guest can create and tear down a GPADL for a channel that has been revoked
@@ -854,6 +879,8 @@ impl VmbusDevice for TestDevice {
     }
 }
 
+// Test: Send opens and retargets to a stopped device, then resume and reset it.
+// Expected: Device work waits for resume, while teardown remains allowed for reset.
 #[async_test]
 async fn test_stopped_child(spawner: DefaultDriver) {
     // This is mostly testing vmbus_channel behavior when a channel is
@@ -957,6 +984,8 @@ async fn test_stopped_child(spawner: DefaultDriver) {
     env.vmbus.stop().await;
 }
 
+// Test: Open ordinary, confidential-external, and relay channels on a trusted connection.
+// Expected: Wire offers and device requests carry only each channel's supported confidentiality.
 #[async_test]
 async fn test_confidential_connection(spawner: DefaultDriver) {
     let mut env = TestEnv::new(spawner);
@@ -1049,6 +1078,8 @@ async fn test_confidential_connection(spawner: DefaultDriver) {
     .await;
 }
 
+// Test: Open confidential-capable channels without negotiating the feature.
+// Expected: Neither ring nor external-memory confidentiality is enabled.
 #[async_test]
 async fn test_confidential_channels_unsupported(spawner: DefaultDriver) {
     let mut env = TestEnv::new(spawner);
@@ -1073,6 +1104,8 @@ async fn test_confidential_channels_unsupported(spawner: DefaultDriver) {
     .await;
 }
 
+// Test: Request confidential channels over an untrusted guest connection.
+// Expected: Device opens never enable confidential memory despite guest feature claims.
 #[async_test]
 async fn test_confidential_channels_untrusted(spawner: DefaultDriver) {
     let mut env = TestEnv::new(spawner);
@@ -1104,6 +1137,8 @@ async fn test_confidential_channels_untrusted(spawner: DefaultDriver) {
     .await;
 }
 
+// Test: Negotiate monitor pages with optional host allocation and guest fallback.
+// Expected: Responses and SynIC mappings agree on allocation capability and selected addresses.
 #[async_test]
 async fn test_server_monitor_page(spawner: DefaultDriver) {
     // Guest pages supplied, but overridden by server pages.
@@ -1242,6 +1277,8 @@ impl VmbusDevice for SubchannelTestDevice {
 /// Verifies that when a device with subchannels is revoked, the guest receives
 /// the `RescindChannelOffer` messages for all of the subchannels before
 /// receiving the rescind for the primary channel.
+// Test: Revoke a primary device with several independently offered subchannels.
+// Expected: Every subchannel rescind arrives before the primary rescind.
 #[async_test]
 async fn test_revoke_subchannels_before_primary(spawner: DefaultDriver) {
     const NUM_SUBCHANNELS: u16 = 3;

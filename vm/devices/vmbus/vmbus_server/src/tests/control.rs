@@ -5,7 +5,7 @@ use super::*;
 use mesh::CancelContext;
 use test_with_tracing::test;
 
-async fn bounded<F: Future>(future: F) -> F::Output {
+pub(super) async fn bounded<F: Future>(future: F) -> F::Output {
     CancelContext::new()
         .with_timeout(Duration::from_secs(5))
         .until_cancelled(future)
@@ -51,13 +51,83 @@ fn pending_ring_notifications(gm: &GuestMemory) {
 }
 
 async fn wait_for_guest_interrupts(synic: &MockSynic, driver: &DefaultDriver, expected: usize) {
-    let mut timer = PolledTimer::new(driver);
+    let mut notify = vmcore::notify::Notify::from_event(synic.guest_interrupt_event.clone())
+        .pollable(driver)
+        .unwrap();
     while synic.guest_interrupts.load(Ordering::SeqCst) < expected {
-        timer.sleep(Duration::from_millis(1)).await;
+        notify.wait().await;
     }
     assert_eq!(synic.guest_interrupts.load(Ordering::SeqCst), expected);
 }
 
+// Test: Reject one device open while another channel opens, then retry the rejected channel.
+// Expected: Wire replies retain distinct channel/open IDs and status; the peer and retry succeed.
+#[async_test]
+async fn rejected_device_open_preserves_peer_and_retry_correlation(driver: DefaultDriver) {
+    bounded(async {
+        let mut env = TestEnvBuilder::new(driver)
+            .without_message_delays()
+            .build_with(GuestMemory::empty(), |builder| {
+                builder.channel_unstick_delay(None)
+            });
+        let mut first = env.offer(1, false).await;
+        let mut peer = env.offer(2, false).await;
+        env.vmbus.start();
+        env.connect(2, protocol::FeatureFlags::new(), false).await;
+        env.gpadl(1, 41, &mut first).await;
+        env.gpadl(2, 42, &mut peer).await;
+        for (channel_id, open_id, ring, target) in [(1, 17, 41, 3), (2, 23, 42, 7)] {
+            env.synic.send_message(protocol::OpenChannel {
+                channel_id: ChannelId(channel_id),
+                open_id,
+                ring_buffer_gpadl_id: GpadlId(ring),
+                target_vp: target,
+                downstream_ring_buffer_page_offset: 0,
+                user_data: [target as u8; 120].into(),
+            });
+        }
+        let ChannelRequest::Open(failed) = first.next_request().await else {
+            panic!("expected first open");
+        };
+        let ChannelRequest::Open(accepted) = peer.next_request().await else {
+            panic!("expected peer open");
+        };
+        assert_eq!(failed.input().open_data.target_vp, Some(3));
+        assert_eq!(accepted.input().open_data.target_vp, Some(7));
+        assert_eq!(accepted.input().open_data.user_data, [7; 120].into());
+        accepted.complete(true);
+        let response: protocol::OpenResult = env.get_response().await;
+        assert_eq!(
+            (response.channel_id, response.open_id, response.status),
+            (ChannelId(2), 23, protocol::STATUS_SUCCESS as u32)
+        );
+        failed.complete(false);
+        let response: protocol::OpenResult = env.get_response().await;
+        assert_eq!(
+            (response.channel_id, response.open_id, response.status),
+            (ChannelId(1), 17, protocol::STATUS_UNSUCCESSFUL as u32)
+        );
+        env.synic.send_message(protocol::OpenChannel {
+            channel_id: ChannelId(1),
+            open_id: 29,
+            ring_buffer_gpadl_id: GpadlId(41),
+            target_vp: 9,
+            downstream_ring_buffer_page_offset: 0,
+            user_data: Default::default(),
+        });
+        first
+            .handle_open(|request| assert_eq!(request.open_data.target_vp, Some(9)))
+            .await;
+        let response: protocol::OpenResult = env.get_response().await;
+        assert_eq!(
+            (response.channel_id, response.open_id, response.status),
+            (ChannelId(1), 29, protocol::STATUS_SUCCESS as u32)
+        );
+        assert!(matches!(poll!(peer.request_recv.next()), Poll::Pending));
+        assert!(matches!(poll!(env.message_recv.next()), Poll::Pending));
+    })
+    .await;
+}
 // Test: Open rings with pending notifications while the guest misses initial channel interrupts.
 // Expected: Delayed recovery wakes both guest ring endpoints without spuriously waking the host.
 #[async_test]

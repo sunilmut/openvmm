@@ -619,6 +619,7 @@ mod tests {
     use pal_async::task::Spawn;
     use pal_async::task::Task;
     use std::sync::Arc;
+    use test_with_tracing::test;
     use unix_socket::UnixListener;
     use unix_socket::UnixStream;
     use vmbus_async::pipe::BytePipe;
@@ -780,240 +781,281 @@ mod tests {
         (c, s, task)
     }
 
+    // Test: Relay bytes bidirectionally and continue writing after peer half-close.
+    // Expected: Payloads remain intact and the relay finishes after both sides close.
     #[async_test]
     async fn test_relay(driver: DefaultDriver) {
-        let (mut c, mut s, task) = setup_relay(&driver);
+        connections::bounded(async {
+            let (mut c, mut s, task) = setup_relay(&driver);
 
-        let d = b"abcd";
-        let mut v = [0; 4];
+            let d = b"abcd";
+            let mut v = [0; 4];
 
-        // c to s
-        c.write_all(d).await.unwrap();
-        s.read_exact(&mut v).await.unwrap();
-        assert_eq!(&v, d);
+            // c to s
+            c.write_all(d).await.unwrap();
+            s.read_exact(&mut v).await.unwrap();
+            assert_eq!(&v, d);
 
-        // s to c
-        s.write_all(d).await.unwrap();
-        c.read_exact(&mut v).await.unwrap();
-        assert_eq!(&v, d);
+            // s to c
+            s.write_all(d).await.unwrap();
+            c.read_exact(&mut v).await.unwrap();
+            assert_eq!(&v, d);
 
-        // s to c
-        s.write_all(d).await.unwrap();
-        s.close().await.unwrap();
-        c.read_exact(&mut v).await.unwrap();
-        assert_eq!(&v, d);
+            // s to c
+            s.write_all(d).await.unwrap();
+            s.close().await.unwrap();
+            c.read_exact(&mut v).await.unwrap();
+            assert_eq!(&v, d);
 
-        // c to s
-        c.write_all(d).await.unwrap();
-        s.read_exact(&mut v).await.unwrap();
-        assert_eq!(&v, d);
+            // c to s
+            c.write_all(d).await.unwrap();
+            s.read_exact(&mut v).await.unwrap();
+            assert_eq!(&v, d);
 
-        c.close().await.unwrap();
-        task.await.unwrap();
+            c.close().await.unwrap();
+            task.await.unwrap();
+        })
+        .await;
     }
 
-    #[cfg(unix)] // Windows does not deliver POLLHUP on Unix socket close.
+    #[cfg(unix)]
+    // Windows does not deliver POLLHUP on Unix socket close.
+    // Test: Drop the host socket while the guest waits for data.
+    // Expected: The guest receives EOF and the relay terminates.
     #[async_test]
     async fn test_relay_host_close(driver: DefaultDriver) {
-        let (mut c, _, task) = setup_relay(&driver);
+        connections::bounded(async {
+            let (mut c, _, task) = setup_relay(&driver);
 
-        let mut b = [0];
-        assert_eq!(c.read(&mut b).await.unwrap(), 0);
-        drop(c);
-        task.await.unwrap();
+            let mut b = [0];
+            assert_eq!(c.read(&mut b).await.unwrap(), 0);
+            drop(c);
+            task.await.unwrap();
+        })
+        .await;
     }
 
+    // Test: Drop the guest channel while the host waits for data.
+    // Expected: The host receives EOF and the relay terminates.
     #[async_test]
     async fn test_relay_guest_close(driver: DefaultDriver) {
-        let (_, mut s, task) = setup_relay(&driver);
+        connections::bounded(async {
+            let (_, mut s, task) = setup_relay(&driver);
 
-        let mut b = [0];
-        assert_eq!(s.read(&mut b).await.unwrap(), 0);
-        drop(s);
-        task.await.unwrap();
+            let mut b = [0];
+            assert_eq!(s.read(&mut b).await.unwrap(), 0);
+            drop(s);
+            task.await.unwrap();
+        })
+        .await;
     }
 
+    // Test: Half-close the host socket's outgoing stream.
+    // Expected: EOF reaches the guest without requiring a full socket drop.
     #[async_test]
     async fn test_relay_forward_socket_shutdown(driver: DefaultDriver) {
-        let (mut c, mut s, task) = setup_relay(&driver);
-        s.close().await.unwrap();
-        let mut v = [0; 1];
-        assert_eq!(c.read(&mut v).await.unwrap(), 0);
-        drop(c);
-        task.await.unwrap();
+        connections::bounded(async {
+            let (mut c, mut s, task) = setup_relay(&driver);
+            s.close().await.unwrap();
+            let mut v = [0; 1];
+            assert_eq!(c.read(&mut v).await.unwrap(), 0);
+            drop(c);
+            task.await.unwrap();
+        })
+        .await;
     }
 
+    // Test: Half-close the guest channel's outgoing stream.
+    // Expected: EOF reaches the host without requiring a full channel drop.
     #[async_test]
     async fn test_relay_forward_channel_shutdown(driver: DefaultDriver) {
-        let (mut c, mut s, task) = setup_relay(&driver);
+        connections::bounded(async {
+            let (mut c, mut s, task) = setup_relay(&driver);
 
-        c.close().await.unwrap();
-        let mut v = [0; 1];
-        assert_eq!(s.read(&mut v).await.unwrap(), 0);
-        drop(s);
-        task.await.unwrap();
+            c.close().await.unwrap();
+            let mut v = [0; 1];
+            assert_eq!(s.read(&mut v).await.unwrap(), 0);
+            drop(s);
+            task.await.unwrap();
+        })
+        .await;
     }
 
+    // Test: Register independent services, reject duplicates, remove and readd one.
+    // Expected: Offers retain service IDs and removing one listener preserves its peer.
     #[async_test]
     async fn test_service_listener(driver: DefaultDriver) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("service");
-        let (offer_send, mut offer_recv) = mesh::channel();
-        let channel = HvsockRelayChannel::new();
-        let _server_half = channel.server_half;
-        let mut relay = HvsockRelay::new(
-            driver.clone(),
-            Arc::new(OfferRecorder(offer_send)),
-            channel.relay_half,
-            None,
-            None,
-        )
-        .unwrap();
-
-        let service_id = Guid::new_random();
-        let other_service_id = Guid::new_random();
-        let other_path = dir.path().join("other");
-        relay
-            .add_service_listener(service_id, UnixListener::bind(&path).unwrap())
-            .unwrap();
-        relay
-            .add_service_listener(other_service_id, UnixListener::bind(&other_path).unwrap())
-            .unwrap();
-        relay
-            .add_service_listener(
-                service_id,
-                UnixListener::bind(dir.path().join("duplicate")).unwrap(),
-            )
-            .unwrap_err();
-
-        // The relay offers the service without waiting for a connect request.
-        let _client = UnixStream::connect(&path).unwrap();
-        let params = offer_recv.next().await.unwrap();
-        assert_eq!(params.interface_id, service_id);
-
-        relay.remove_service_listener(service_id).await.unwrap();
-        assert!(UnixStream::connect(&path).is_err());
-        let _other_client = UnixStream::connect(&other_path).unwrap();
-        assert_eq!(
-            offer_recv.next().await.unwrap().interface_id,
-            other_service_id
-        );
-        relay
-            .remove_service_listener(other_service_id)
-            .await
-            .unwrap();
-        relay.remove_service_listener(service_id).await.unwrap_err();
-        relay
-            .add_service_listener(
-                service_id,
-                UnixListener::bind(dir.path().join("readded")).unwrap(),
+        connections::bounded(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("service");
+            let (offer_send, mut offer_recv) = mesh::channel();
+            let channel = HvsockRelayChannel::new();
+            let _server_half = channel.server_half;
+            let mut relay = HvsockRelay::new(
+                driver.clone(),
+                Arc::new(OfferRecorder(offer_send)),
+                channel.relay_half,
+                None,
+                None,
             )
             .unwrap();
+
+            let service_id = Guid::new_random();
+            let other_service_id = Guid::new_random();
+            let other_path = dir.path().join("other");
+            relay
+                .add_service_listener(service_id, UnixListener::bind(&path).unwrap())
+                .unwrap();
+            relay
+                .add_service_listener(other_service_id, UnixListener::bind(&other_path).unwrap())
+                .unwrap();
+            relay
+                .add_service_listener(
+                    service_id,
+                    UnixListener::bind(dir.path().join("duplicate")).unwrap(),
+                )
+                .unwrap_err();
+
+            // The relay offers the service without waiting for a connect request.
+            let _client = UnixStream::connect(&path).unwrap();
+            let params = offer_recv.next().await.unwrap();
+            assert_eq!(params.interface_id, service_id);
+
+            relay.remove_service_listener(service_id).await.unwrap();
+            assert!(UnixStream::connect(&path).is_err());
+            let _other_client = UnixStream::connect(&other_path).unwrap();
+            assert_eq!(
+                offer_recv.next().await.unwrap().interface_id,
+                other_service_id
+            );
+            relay
+                .remove_service_listener(other_service_id)
+                .await
+                .unwrap();
+            relay.remove_service_listener(service_id).await.unwrap_err();
+            relay
+                .add_service_listener(
+                    service_id,
+                    UnixListener::bind(dir.path().join("readded")).unwrap(),
+                )
+                .unwrap();
+        })
+        .await;
     }
 
+    // Test: Exchange stream data before and after removing its service listener.
+    // Expected: Established traffic survives; new connections fail until explicit rebind.
     #[async_test]
     async fn test_service_listener_preserves_stream_and_established_connections(
         driver: DefaultDriver,
     ) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("service");
-        let memory = GuestMemory::allocate(4 * 4096);
-        let (offers, mut offer_recv) = mesh::channel();
-        let channel = HvsockRelayChannel::new();
-        let _server_half = channel.server_half;
-        let mut relay = HvsockRelay::new(
-            driver.clone(),
-            Arc::new(TestBus {
-                memory: memory.clone(),
-                offers,
-            }),
-            channel.relay_half,
-            None,
-            None,
-        )
-        .unwrap();
-        let service_id = Guid::new_random();
-        relay
-            .add_service_listener(service_id, UnixListener::bind(&path).unwrap())
+        connections::bounded(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("service");
+            let memory = GuestMemory::allocate(4 * 4096);
+            let (offers, mut offer_recv) = mesh::channel();
+            let channel = HvsockRelayChannel::new();
+            let _server_half = channel.server_half;
+            let mut relay = HvsockRelay::new(
+                driver.clone(),
+                Arc::new(TestBus {
+                    memory: memory.clone(),
+                    offers,
+                }),
+                channel.relay_half,
+                None,
+                None,
+            )
             .unwrap();
-        let mut client = PolledSocket::connect_unix(&driver, &path).await.unwrap();
-        let payload = b"application data\n";
-        client.write_all(payload).await.unwrap();
-        let offer = offer_recv.next().await.unwrap();
-        assert_eq!(offer.params.interface_id, service_id);
-        let mut guest = open_guest_pipe(&driver, &memory, &offer).await;
-        let mut received = [0; 17];
-        guest.read_exact(&mut received).await.unwrap();
-        assert_eq!(&received, payload);
-        guest.write_all(payload).await.unwrap();
-        client.read_exact(&mut received).await.unwrap();
-        assert_eq!(&received, payload);
+            let service_id = Guid::new_random();
+            relay
+                .add_service_listener(service_id, UnixListener::bind(&path).unwrap())
+                .unwrap();
+            let mut client = PolledSocket::connect_unix(&driver, &path).await.unwrap();
+            let payload = b"application data\n";
+            client.write_all(payload).await.unwrap();
+            let offer = offer_recv.next().await.unwrap();
+            assert_eq!(offer.params.interface_id, service_id);
+            let mut guest = open_guest_pipe(&driver, &memory, &offer).await;
+            let mut received = [0; 17];
+            guest.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, payload);
+            guest.write_all(payload).await.unwrap();
+            client.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, payload);
 
-        relay.remove_service_listener(service_id).await.unwrap();
-        assert!(UnixStream::connect(&path).is_err());
-        assert!(path.exists());
-        assert!(UnixListener::bind(&path).is_err());
-        client.write_all(payload).await.unwrap();
-        guest.read_exact(&mut received).await.unwrap();
-        assert_eq!(&received, payload);
-        guest.write_all(payload).await.unwrap();
-        client.read_exact(&mut received).await.unwrap();
-        assert_eq!(&received, payload);
+            relay.remove_service_listener(service_id).await.unwrap();
+            assert!(UnixStream::connect(&path).is_err());
+            assert!(path.exists());
+            assert!(UnixListener::bind(&path).is_err());
+            client.write_all(payload).await.unwrap();
+            guest.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, payload);
+            guest.write_all(payload).await.unwrap();
+            client.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, payload);
 
-        client.close().await.unwrap();
-        assert_eq!(guest.read(&mut received).await.unwrap(), 0);
-        guest.close().await.unwrap();
-        assert_eq!(client.read(&mut received).await.unwrap(), 0);
-        std::fs::remove_file(&path).unwrap();
-        relay
-            .add_service_listener(service_id, UnixListener::bind(&path).unwrap())
-            .unwrap();
-        relay.remove_service_listener(service_id).await.unwrap();
+            client.close().await.unwrap();
+            assert_eq!(guest.read(&mut received).await.unwrap(), 0);
+            guest.close().await.unwrap();
+            assert_eq!(client.read(&mut received).await.unwrap(), 0);
+            std::fs::remove_file(&path).unwrap();
+            relay
+                .add_service_listener(service_id, UnixListener::bind(&path).unwrap())
+                .unwrap();
+            relay.remove_service_listener(service_id).await.unwrap();
+        })
+        .await;
     }
 
+    // Test: Connect through the hybrid listener and exchange bidirectional payloads.
+    // Expected: CONNECT maps to the service, OK identifies the endpoint, and EOF propagates.
     #[async_test]
     async fn test_hybrid_listener_handshake(driver: DefaultDriver) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("hybrid");
-        let memory = GuestMemory::allocate(4 * 4096);
-        let (offers, mut offer_recv) = mesh::channel();
-        let channel = HvsockRelayChannel::new();
-        let _server_half = channel.server_half;
-        let _relay = HvsockRelay::new(
-            driver.clone(),
-            Arc::new(TestBus {
-                memory: memory.clone(),
-                offers,
-            }),
-            channel.relay_half,
-            None,
-            Some(UnixListener::bind(&path).unwrap()),
-        )
-        .unwrap();
-        let mut client = PolledSocket::connect_unix(&driver, &path).await.unwrap();
-        client.write_all(b"CONNECT 50001\n").await.unwrap();
-        let offer = offer_recv.next().await.unwrap();
-        assert_eq!(
-            offer.params.interface_id,
-            guid::guid!("0000c351-facb-11e6-bd58-64006a7986d3")
-        );
-        let mut guest = open_guest_pipe(&driver, &memory, &offer).await;
-        let expected = format!("OK {}\n", offer.params.instance_id.data1);
-        let mut response = vec![0; expected.len()];
-        client.read_exact(&mut response).await.unwrap();
-        assert_eq!(response, expected.as_bytes());
+        connections::bounded(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hybrid");
+            let memory = GuestMemory::allocate(4 * 4096);
+            let (offers, mut offer_recv) = mesh::channel();
+            let channel = HvsockRelayChannel::new();
+            let _server_half = channel.server_half;
+            let _relay = HvsockRelay::new(
+                driver.clone(),
+                Arc::new(TestBus {
+                    memory: memory.clone(),
+                    offers,
+                }),
+                channel.relay_half,
+                None,
+                Some(UnixListener::bind(&path).unwrap()),
+            )
+            .unwrap();
+            let mut client = PolledSocket::connect_unix(&driver, &path).await.unwrap();
+            client.write_all(b"CONNECT 50001\n").await.unwrap();
+            let offer = offer_recv.next().await.unwrap();
+            assert_eq!(
+                offer.params.interface_id,
+                guid::guid!("0000c351-facb-11e6-bd58-64006a7986d3")
+            );
+            let mut guest = open_guest_pipe(&driver, &memory, &offer).await;
+            let expected = format!("OK {}\n", offer.params.instance_id.data1);
+            let mut response = vec![0; expected.len()];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, expected.as_bytes());
 
-        client.write_all(b"ping").await.unwrap();
-        let mut payload = [0; 4];
-        guest.read_exact(&mut payload).await.unwrap();
-        assert_eq!(&payload, b"ping");
-        guest.write_all(b"pong").await.unwrap();
-        client.read_exact(&mut payload).await.unwrap();
-        assert_eq!(&payload, b"pong");
-        client.close().await.unwrap();
-        assert_eq!(guest.read(&mut payload).await.unwrap(), 0);
-        guest.close().await.unwrap();
-        assert_eq!(client.read(&mut payload).await.unwrap(), 0);
+            client.write_all(b"ping").await.unwrap();
+            let mut payload = [0; 4];
+            guest.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"ping");
+            guest.write_all(b"pong").await.unwrap();
+            client.read_exact(&mut payload).await.unwrap();
+            assert_eq!(&payload, b"pong");
+            client.close().await.unwrap();
+            assert_eq!(guest.read(&mut payload).await.unwrap(), 0);
+            guest.close().await.unwrap();
+            assert_eq!(client.read(&mut payload).await.unwrap(), 0);
+        })
+        .await;
     }
 
     mod connections;

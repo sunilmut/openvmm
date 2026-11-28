@@ -138,6 +138,8 @@ mod tests {
     use parking_lot::Mutex;
     use test_with_tracing::test;
 
+    // Test: Scan event flags spanning empty words and word boundaries.
+    // Expected: Each pending flag is reported once and is cleared for the next scan.
     #[test]
     fn scan_preserves_bit_order_and_clears_boundary_bits() {
         let bits = [
@@ -152,6 +154,8 @@ mod tests {
         bitmap.scan_and_clear(|_| panic!("bitmap was not cleared"));
     }
 
+    // Test: Set nonadjacent event flags and consume the resulting shared bitmap.
+    // Expected: Setting preserves other flags and scanning returns both exactly once.
     #[test]
     fn test_atomic_bitmap() {
         let bits: [AtomicU64; 128] = [0; 128].map(AtomicU64::new);

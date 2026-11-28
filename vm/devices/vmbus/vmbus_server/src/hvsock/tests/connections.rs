@@ -10,7 +10,7 @@ use test_with_tracing::test;
 use vmbus_channel::bus::ChannelType;
 use vmbus_core::HvsockConnectRequest;
 
-async fn bounded<F: Future>(future: F) -> F::Output {
+pub(super) async fn bounded<F: Future>(future: F) -> F::Output {
     CancelContext::new()
         .with_timeout(Duration::from_secs(5))
         .until_cancelled(future)
