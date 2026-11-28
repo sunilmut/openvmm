@@ -45,7 +45,6 @@ parking_lot.workspace = true
 test_with_tracing.workspace = true
 vmbus_core.workspace = true
 
-getrandom.workspace = true
 
 
 [lints]

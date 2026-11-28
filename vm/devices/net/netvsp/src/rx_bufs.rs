@@ -142,7 +142,10 @@ impl Drop for FreeIterator<'_> {
 #[cfg(test)]
 mod tests {
     use super::RxBuffers;
+    use test_with_tracing::test;
 
+    // Test: Allocate chains, reject an overlap and free only chain heads.
+    // Expected: Failed allocation rolls back and existing chains stay intact.
     #[test]
     fn test_rx_bufs() {
         let mut bufs = RxBuffers::new(20);
@@ -161,5 +164,50 @@ mod tests {
                 .map(Vec::from_iter)
                 .eq([[0, 1, 2], [3, 10, 12]])
         );
+    }
+
+    // Test: Reject an overlap at each position while two peer chains are live.
+    // Expected: Every tentative buffer is reusable and both peers are preserved.
+    #[test]
+    fn allocation_rollback_preserves_peers_at_each_overlap_position() {
+        for position in 0..3 {
+            let mut bufs = RxBuffers::new(12);
+            bufs.allocate([1, 7]).unwrap();
+            bufs.allocate([9, 4]).unwrap();
+            let mut attempt = [0, 2, 3];
+            attempt[position] = 7;
+            assert!(bufs.allocate(attempt).is_err());
+            assert_eq!(
+                bufs.allocated().map(Vec::from_iter).collect::<Vec<_>>(),
+                [vec![1, 7], vec![9, 4]]
+            );
+            bufs.allocate([0, 2, 3]).unwrap();
+            assert!(bufs.free(7).is_none());
+            assert!(bufs.free(u32::MAX).is_none());
+            assert_eq!(bufs.free(0).unwrap().collect::<Vec<_>>(), [0, 2, 3]);
+            assert_eq!(bufs.free(1).unwrap().collect::<Vec<_>>(), [1, 7]);
+            assert_eq!(bufs.free(9).unwrap().collect::<Vec<_>>(), [9, 4]);
+        }
+    }
+
+    // Test: Drop a partially consumed free iterator while a peer chain is live.
+    // Expected: The entire released chain can be reused without freeing its peer.
+    #[test]
+    fn partial_free_iterator_drop_releases_only_its_chain() {
+        let mut bufs = RxBuffers::new(10);
+        bufs.allocate([5, 2, 8]).unwrap();
+        bufs.allocate([1, 7]).unwrap();
+        {
+            let mut freeing = bufs.free(5).unwrap();
+            assert_eq!(freeing.next(), Some(5));
+        }
+        bufs.allocate([8, 5, 2]).unwrap();
+        assert_eq!(
+            bufs.allocated().map(Vec::from_iter).collect::<Vec<_>>(),
+            [vec![1, 7], vec![8, 5, 2]]
+        );
+        assert_eq!(bufs.free(8).unwrap().collect::<Vec<_>>(), [8, 5, 2]);
+        assert_eq!(bufs.free(1).unwrap().collect::<Vec<_>>(), [1, 7]);
+        assert!(bufs.allocated().next().is_none());
     }
 }

@@ -135,7 +135,9 @@ impl ParentBus for MockVmbus {
 }
 
 struct TestNicEndpointState {
-    pub poll_iterations_required: u32,
+    pub switch_gate: Option<mesh::OneshotReceiver<()>>,
+    pub switch_started: Arc<event_listener::Event>,
+    pub stopped: Arc<event_listener::Event>,
     // Used to check the last set operation
     pub use_vf: Option<bool>,
     // Used for any queries since use_vf is often reset after check.
@@ -150,6 +152,7 @@ struct TestNicEndpointState {
     pub sync_tx: bool,
     pub complete_async_tx: bool,
     pub tx_metadata: Vec<net_backend::TxMetadata>,
+    pub tx_packets: Vec<Vec<u8>>,
     /// Per-queue one-shot trigger: when `tx_restart_triggers[idx]` is true,
     /// the next `tx_poll` call on queue `idx` returns `TxError::TryRestart(_)`.
     pub tx_restart_triggers: Vec<bool>,
@@ -161,7 +164,9 @@ struct TestNicEndpointState {
 impl TestNicEndpointState {
     pub fn new() -> Arc<parking_lot::Mutex<Self>> {
         Arc::new(parking_lot::Mutex::new(Self {
-            poll_iterations_required: 1,
+            switch_gate: None,
+            switch_started: Arc::new(event_listener::Event::new()),
+            stopped: Arc::new(event_listener::Event::new()),
             use_vf: None,
             last_use_vf: None,
             vf_state: None,
@@ -171,6 +176,7 @@ impl TestNicEndpointState {
             sync_tx: true,
             complete_async_tx: false,
             tx_metadata: Vec::new(),
+            tx_packets: Vec::new(),
             tx_restart_triggers: Vec::new(),
             endpoint_action_updater: None,
         }))
@@ -205,6 +211,32 @@ impl TestNicEndpointState {
         );
         self.tx_restart_triggers[queue_idx] = true;
     }
+}
+
+fn pause_switch(
+    state: &Arc<parking_lot::Mutex<TestNicEndpointState>>,
+) -> (mesh::OneshotSender<()>, event_listener::EventListener) {
+    let (release, gate) = mesh::oneshot();
+    let mut state = state.lock();
+    assert!(state.switch_gate.replace(gate).is_none());
+    (release, state.switch_started.listen())
+}
+
+async fn resume_switch(
+    channel: &mut TestNicChannel<'_>,
+    release: mesh::OneshotSender<()>,
+    started: event_listener::EventListener,
+) {
+    mesh::CancelContext::new()
+        .with_timeout(Duration::from_millis(333))
+        .until_cancelled(started)
+        .await
+        .expect("endpoint must accept the switch");
+    assert!(
+        channel.read_with(|_| ()).now_or_never().is_none(),
+        "a pending backend switch must not be acknowledged"
+    );
+    release.send(());
 }
 
 struct TestNicEndpointInner {
@@ -311,6 +343,7 @@ impl net_backend::Endpoint for TestNicEndpoint {
         if let Some(endpoint_state) = &inner.endpoint_state {
             let mut locked_data = endpoint_state.lock();
             locked_data.stop_endpoint_counter += 1;
+            locked_data.stopped.notify(usize::MAX);
         }
     }
 
@@ -339,7 +372,7 @@ impl net_backend::Endpoint for TestNicEndpoint {
     async fn set_data_path_to_guest_vf(&self, use_vf: bool) -> anyhow::Result<()> {
         tracing::info!(use_vf, "set_data_path_to_guest_vf");
         let inner = self.inner.clone();
-        let mut iter = {
+        let gate = {
             let locked_inner = inner.lock().await;
             let endpoint_state = locked_inner.endpoint_state.as_ref().unwrap();
             let mut locked_data = endpoint_state.lock();
@@ -350,7 +383,9 @@ impl net_backend::Endpoint for TestNicEndpoint {
             {
                 locked_data.use_vf = Some(use_vf);
                 locked_data.last_use_vf = Some(use_vf);
-                locked_data.poll_iterations_required
+                let gate = locked_data.switch_gate.take();
+                locked_data.switch_started.notify(usize::MAX);
+                gate
             } else {
                 if use_vf {
                     anyhow::bail!("VF not ready");
@@ -360,16 +395,10 @@ impl net_backend::Endpoint for TestNicEndpoint {
                 }
             }
         };
-        std::future::poll_fn(move |cx| {
-            if iter <= 1 {
-                Poll::Ready(Ok(()))
-            } else {
-                iter -= 1;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        })
-        .await
+        if let Some(gate) = gate {
+            gate.await.unwrap();
+        }
+        Ok(())
     }
 
     async fn wait_for_endpoint_action(&mut self) -> EndpointAction {
@@ -487,7 +516,7 @@ impl NetQueue for TestNicQueue {
 
     fn tx_avail(
         &mut self,
-        _pool: &mut dyn BufferAccess,
+        pool: &mut dyn BufferAccess,
         packets: &[TxSegment],
     ) -> anyhow::Result<(bool, usize)> {
         if let Some(endpoint_state) = &self.endpoint_state {
@@ -501,6 +530,21 @@ impl NetQueue for TestNicQueue {
                         None
                     }
                 }));
+            let mut remaining = packets;
+            while !remaining.is_empty() {
+                let (metadata, segments, rest) = net_backend::next_packet(remaining);
+                let mut bytes = Vec::new();
+                for segment in segments {
+                    let start = bytes.len();
+                    bytes.resize(start + segment.len as usize, 0);
+                    pool.guest_memory()
+                        .read_at(segment.gpa, &mut bytes[start..])
+                        .unwrap();
+                }
+                assert_eq!(bytes.len(), metadata.len as usize);
+                endpoint_state.tx_packets.push(bytes);
+                remaining = rest;
+            }
         }
         if !self.sync_tx {
             self.pending_tx.extend(packets.iter().filter_map(|packet| {
@@ -792,7 +836,9 @@ impl TestNicDevice {
             panic!("Unexpected return value");
         };
 
-        let guest_to_host_interrupt = self.offer_input.event.clone();
+        let guest_to_host_interrupt = self.mock_vmbus.child_info.lock().await[idx as usize - 1]
+            .event
+            .clone();
         TestNicSubchannel::new(
             &self.mock_vmbus.memory,
             gpadl_map,
@@ -964,6 +1010,21 @@ struct NvspMessage<T> {
     header: protocol::MessageHeader,
     data: T,
     padding: &'static [u8],
+}
+
+fn assert_wire_message(
+    mut reader: impl MemoryRead,
+    message_type: u32,
+    payload: &[u8],
+    size: usize,
+) {
+    let mut expected = message_type.to_le_bytes().to_vec();
+    expected.extend_from_slice(payload);
+    expected.resize(size, 0);
+    assert_eq!(reader.len(), size);
+    let mut received = vec![0; size];
+    reader.read(&mut received).unwrap();
+    assert_eq!(received, expected);
 }
 
 impl<T: IntoBytes + Immutable + KnownLayout> NvspMessage<T> {
@@ -1205,13 +1266,21 @@ impl<'a> TestNicChannel<'a> {
         })
         .await;
         self.transaction_id += 1;
+        let transaction_id = self.transaction_id - 1;
         self.read_with(|packet| match packet {
             IncomingPacket::Completion(completion) => {
-                let mut reader = completion.reader();
-                let header: protocol::MessageHeader = reader.read_plain().unwrap();
-                assert_eq!(header.message_type, protocol::MESSAGE_TYPE_INIT_COMPLETE);
-                let completion_data: protocol::MessageInitComplete = reader.read_plain().unwrap();
-                assert_eq!(completion_data.status, protocol::Status::SUCCESS);
+                assert_eq!(completion.transaction_id(), transaction_id);
+                assert_wire_message(
+                    completion.reader(),
+                    protocol::MESSAGE_TYPE_INIT_COMPLETE,
+                    protocol::MessageInitComplete {
+                        deprecated: if version == Version::V1 { 2 } else { u32::MAX },
+                        maximum_mdl_chain_length: 34,
+                        status: protocol::Status::SUCCESS,
+                    }
+                    .as_bytes(),
+                    32,
+                );
             }
             _ => panic!("Unexpected packet"),
         })
@@ -1455,8 +1524,19 @@ impl<'a> TestNicChannel<'a> {
     ) {
         self.send_rndis_control_message_no_completion(message_type, message, extra)
             .await;
+        let transaction_id = self.transaction_id - 1;
         self.read_with(|packet| match packet {
-            IncomingPacket::Completion(_) => (),
+            IncomingPacket::Completion(completion) => {
+                assert_eq!(completion.transaction_id(), transaction_id);
+                let mut reader = completion.reader();
+                let header: protocol::MessageHeader = reader.read_plain().unwrap();
+                assert_eq!(
+                    header.message_type,
+                    protocol::MESSAGE1_TYPE_SEND_RNDIS_PACKET_COMPLETE
+                );
+                let reply: protocol::Message1SendRndisPacketComplete = reader.read_plain().unwrap();
+                assert_eq!(reply.status, protocol::Status::SUCCESS);
+            }
             IncomingPacket::Data(data) => {
                 let mut reader = data.reader();
                 let header: protocol::MessageHeader = reader.read_plain().unwrap();
@@ -2164,14 +2244,6 @@ impl VirtualFunction for TestVirtualFunction {
             return;
         }
         self.state.set_ready(true).await;
-        // Wait a random amount of time before completing the request.
-        let mut wait_ms: u64 = 0;
-        getrandom::fill(wait_ms.as_mut_bytes()).expect("rng failure");
-        wait_ms %= 50;
-        tracing::info!(id = self.state.id(), wait_ms, "Readying VF...");
-        let mut ctx = mesh::CancelContext::new().with_timeout(Duration::from_millis(wait_ms));
-        let _ = ctx.until_cancelled(pending::<()>()).await;
-        tracing::info!(id = self.state.id(), "VF ready");
     }
     async fn wait_for_state_change(&mut self) -> Rpc<(), ()> {
         match self.recv_update.select_next_some().await {
@@ -2237,6 +2309,8 @@ impl SignalVmbusChannel for EventWithDone {
     }
 }
 
+// Test: Build a NIC with a caller-supplied instance ID.
+// Expected: Its public offer identifies the network interface and that instance.
 #[async_test]
 async fn build_nic(driver: DefaultDriver) {
     let builder = Nic::builder();
@@ -2254,6 +2328,8 @@ async fn build_nic(driver: DefaultDriver) {
     assert_eq!(offer_params.offer_order, None);
 }
 
+// Test: Supply an explicit network offer order.
+// Expected: The public VMBus offer retains the caller's ordering hint.
 #[async_test]
 async fn build_nic_with_offer_order(driver: DefaultDriver) {
     let offer_order = 7;
@@ -2270,6 +2346,8 @@ async fn build_nic_with_offer_order(driver: DefaultDriver) {
     assert_eq!(offer_params.offer_order, Some(offer_order));
 }
 
+// Test: Offer a NIC through the public parent-bus interface.
+// Expected: The bus receives an offer with the original interface and instance.
 #[async_test]
 async fn connect_nic_vmbus(driver: DefaultDriver) {
     let builder = Nic::builder();
@@ -2285,8 +2363,14 @@ async fn connect_nic_vmbus(driver: DefaultDriver) {
     let _channel = offer_channel(&driver, &mock_vmbus, nic)
         .await
         .expect("successful init");
+    let offers = mock_vmbus.child_info.lock().await;
+    assert_eq!(offers.len(), 1);
+    assert_eq!(offers[0].params.interface_id, VMNIC_CHANNEL_TYPE_GUID);
+    assert_eq!(offers[0].params.instance_id, unique_id);
 }
 
+// Test: Send the first guest negotiation request on an opened channel.
+// Expected: A correlated, fully padded legacy INIT_COMPLETE is returned.
 #[async_test]
 async fn send_initial_handshake(driver: DefaultDriver) {
     let mut nic = TestNicDevice::new(&driver).await;
@@ -2374,16 +2458,22 @@ async fn reject_completion_during_initialization(
     }
 }
 
+// Test: Send a VF-association completion before and after version negotiation.
+// Expected: Both initialization states reject the out-of-order completion.
 #[async_test]
 async fn reject_vf_association_completion_during_initialization(driver: DefaultDriver) {
     reject_completion_during_initialization(driver, VF_ASSOCIATION_TRANSACTION_ID, &[]).await;
 }
 
+// Test: Send a data-path completion before and after version negotiation.
+// Expected: Both initialization states reject the out-of-order completion.
 #[async_test]
 async fn reject_switch_data_path_completion_during_initialization(driver: DefaultDriver) {
     reject_completion_during_initialization(driver, SWITCH_DATA_PATH_TRANSACTION_ID, &[]).await;
 }
 
+// Test: Send a framed RNDIS completion while negotiation is incomplete.
+// Expected: Both initial states return InvalidPacketData without waiting.
 #[async_test]
 async fn reject_rndis_completion_during_initialization(driver: DefaultDriver) {
     let message = NvspMessage {
@@ -2398,8 +2488,7 @@ async fn reject_rndis_completion_during_initialization(driver: DefaultDriver) {
     reject_completion_during_initialization(driver, 2, &message.payload()).await;
 }
 
-/// Starts up a VMBus channel, mimics negotiating a protocol version, then creates
-/// a subchannel.
+/// Check actual subchannel completion bytes, not a diagnostic packet-size field.
 async fn test_new_subchannel_packet_size(
     driver: DefaultDriver,
     version: Version,
@@ -2414,34 +2503,71 @@ async fn test_new_subchannel_packet_size(
     channel.allocate_subchannels(1).await;
     channel.connect_subchannel(1).await;
 
-    assert_eq!(
-        read_netvsp_counter(&channel.nic.channel, "queues/1/packet_size").await,
-        expected_packet_size as u64
-    );
+    let message = NvspMessage {
+        header: protocol::MessageHeader {
+            message_type: protocol::MESSAGE1_TYPE_SEND_RNDIS_PACKET,
+        },
+        data: protocol::Message1SendRndisPacket {
+            channel_type: protocol::DATA_CHANNEL_TYPE,
+            send_buffer_section_index: u32::MAX,
+            send_buffer_section_size: 0,
+        },
+        padding: &[],
+    };
+    channel
+        .write_subchannel(
+            1,
+            OutgoingPacket {
+                transaction_id: 0xabc,
+                packet_type: OutgoingPacketType::InBandWithCompletion,
+                payload: &message.payload(),
+            },
+        )
+        .await;
+    channel
+        .read_subchannel_with(1, |packet| {
+            let IncomingPacket::Completion(completion) = packet else {
+                panic!("expected malformed-packet completion")
+            };
+            assert_eq!(completion.transaction_id(), 0xabc);
+            assert_wire_message(
+                completion.reader(),
+                protocol::MESSAGE1_TYPE_SEND_RNDIS_PACKET_COMPLETE,
+                &protocol::Status::FAILURE.0.to_le_bytes(),
+                expected_packet_size,
+            );
+        })
+        .await
+        .unwrap();
 }
 
+// Test: Read the first response before any protocol version has taken effect.
+// Expected: INIT_COMPLETE uses the 32-byte aligned legacy wire layout.
 #[async_test]
 async fn new_worker_without_negotiated_version_uses_v1_packet_size(driver: DefaultDriver) {
     let mut nic = TestNicDevice::new(&driver).await;
     nic.start_vmbus_channel();
-    let channel = nic.connect_vmbus_channel().await;
-
-    assert_eq!(
-        read_netvsp_counter(&channel.nic.channel, "queues/0/packet_size").await,
-        protocol::PACKET_SIZE_V1 as u64
-    );
+    let mut channel = nic.connect_vmbus_channel().await;
+    // The first reply must use legacy framing before negotiation takes effect.
+    channel.send_initialize_message().await;
 }
 
+// Test: Negotiate version 5 and send an empty packet on a fresh subchannel.
+// Expected: Its correlated failure completion has legacy framing and zero padding.
 #[async_test]
 async fn new_worker_with_v5_uses_v1_packet_size(driver: DefaultDriver) {
-    test_new_subchannel_packet_size(driver, Version::V5, protocol::PACKET_SIZE_V1).await;
+    test_new_subchannel_packet_size(driver, Version::V5, 32).await;
 }
 
+// Test: Negotiate version 6.1 and send an empty packet on a fresh subchannel.
+// Expected: Its correlated failure completion has 40-byte framing and zero padding.
 #[async_test]
 async fn new_worker_with_v61_uses_v61_packet_size(driver: DefaultDriver) {
-    test_new_subchannel_packet_size(driver, Version::V61, protocol::PACKET_SIZE_V61).await;
+    test_new_subchannel_packet_size(driver, Version::V61, 40).await;
 }
 
+// Test: Negotiate the guest version, NDIS configuration and shared buffers.
+// Expected: All negotiation stages complete and the initialized adapter answers.
 #[async_test]
 async fn initialize_nic(driver: DefaultDriver) {
     let mut nic = TestNicDevice::new(&driver).await;
@@ -2450,8 +2576,11 @@ async fn initialize_nic(driver: DefaultDriver) {
     channel
         .initialize(0, protocol::NdisConfigCapabilities::new())
         .await;
+    initialize_rndis_control(&mut channel).await;
 }
 
+// Test: Initialize RNDIS without a VF.
+// Expected: The reply preserves request/version fields and no VF is advertised.
 #[async_test]
 async fn initialize_rndis(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -2504,6 +2633,8 @@ async fn initialize_rndis(driver: DefaultDriver) {
     assert_eq!(endpoint_state.lock().stop_endpoint_counter, 1);
 }
 
+// Test: Initialize RNDIS using GPA-direct data without registering a send buffer.
+// Expected: Initialization succeeds with the original request and version fields.
 #[async_test]
 async fn initialize_rndis_no_sendbuffer(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -2566,8 +2697,9 @@ async fn initialize_rndis_no_sendbuffer(driver: DefaultDriver) {
     assert_eq!(endpoint_state.lock().stop_endpoint_counter, 1);
 }
 
+// Test: Send GPA-direct RNDIS initialization without registering a receive buffer.
+// Expected: No successful completion is sent and the public stop operation works.
 #[async_test]
-#[should_panic]
 async fn initialize_rndis_no_sendbuffer_no_recvbuffer(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
     let endpoint = TestNicEndpoint::new(Some(endpoint_state.clone()));
@@ -2597,7 +2729,7 @@ async fn initialize_rndis_no_sendbuffer_no_recvbuffer(driver: DefaultDriver) {
     channel.gpadl_map.add(gpadl_handle, send_range);
     channel.send_buf_id = gpadl_handle;
     channel
-        .send_rndis_control_message(
+        .send_rndis_control_message_no_completion(
             rndisprot::MESSAGE_TYPE_INITIALIZE_MSG,
             rndisprot::InitializeRequest {
                 request_id: 123,
@@ -2608,13 +2740,22 @@ async fn initialize_rndis_no_sendbuffer_no_recvbuffer(driver: DefaultDriver) {
             &[],
         )
         .await;
+    assert!(
+        channel.read_with(|_| ()).await.is_err(),
+        "RNDIS cannot be accepted before a receive buffer is supplied"
+    );
+    channel.stop().await;
 }
 
+// Test: Advertise a VF, acknowledge it and switch both network data paths.
+// Expected: Backend calls match the paths and pending switches wake guest replies.
 #[async_test]
 async fn initialize_rndis_with_vf(driver: DefaultDriver) {
     test_initialize_rndis_with_vf_common(driver, true).await;
 }
 
+// Test: Omit the guest VF-association acknowledgement before switching paths.
+// Expected: The VF becomes ready and both pending path changes still complete.
 #[async_test]
 async fn initialize_rndis_with_vf_without_completion(driver: DefaultDriver) {
     test_initialize_rndis_with_vf_common(driver, false).await;
@@ -2729,8 +2870,8 @@ async fn test_initialize_rndis_with_vf_common(driver: DefaultDriver, with_vf_com
 
     assert_eq!(endpoint_state.lock().use_vf.take().unwrap(), true);
 
-    // send another switch data path, but require a few async iterations to actually switch the path.
-    endpoint_state.lock().poll_iterations_required = 20;
+    // Hold the backend operation pending until the guest reader is armed.
+    let (switch_release, switch_started) = pause_switch(&endpoint_state);
     let message = NvspMessage {
         header: protocol::MessageHeader {
             message_type: protocol::MESSAGE4_TYPE_SWITCH_DATA_PATH,
@@ -2747,6 +2888,7 @@ async fn test_initialize_rndis_with_vf_common(driver: DefaultDriver, with_vf_com
             payload: &message.payload(),
         })
         .await;
+    resume_switch(&mut channel, switch_release, switch_started).await;
     channel
         .read_with(|packet| match packet {
             IncomingPacket::Completion(_) => (),
@@ -2759,6 +2901,8 @@ async fn test_initialize_rndis_with_vf_common(driver: DefaultDriver, with_vf_com
     assert_eq!(endpoint_state.lock().stop_endpoint_counter, 1);
 }
 
+// Test: Advertise a VF with a Microsoft guest ID and a distinct adapter index.
+// Expected: The association uses the adapter index and switching reaches the VF.
 #[async_test]
 async fn initialize_rndis_with_vf_alternate_id(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -2872,6 +3016,8 @@ async fn initialize_rndis_with_vf_alternate_id(driver: DefaultDriver) {
     assert_eq!(endpoint_state.lock().use_vf.take().unwrap(), true);
 }
 
+// Test: Reopen the VMBus NIC after advertising a VF and switch both paths.
+// Expected: VF readiness survives reopening and delayed backend replies progress.
 #[async_test]
 async fn initialize_rndis_with_vf_multi_open(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -3023,8 +3169,8 @@ async fn initialize_rndis_with_vf_multi_open(driver: DefaultDriver) {
 
     assert_eq!(endpoint_state.lock().use_vf.take().unwrap(), true);
 
-    // send another switch data path, but require a few async iterations to actually switch the path.
-    endpoint_state.lock().poll_iterations_required = 20;
+    // Hold the backend operation pending until the guest reader is armed.
+    let (switch_release, switch_started) = pause_switch(&endpoint_state);
     let message = NvspMessage {
         header: protocol::MessageHeader {
             message_type: protocol::MESSAGE4_TYPE_SWITCH_DATA_PATH,
@@ -3041,6 +3187,7 @@ async fn initialize_rndis_with_vf_multi_open(driver: DefaultDriver) {
             payload: &message.payload(),
         })
         .await;
+    resume_switch(&mut channel, switch_release, switch_started).await;
     channel
         .read_with(|packet| match packet {
             IncomingPacket::Completion(_) => (),
@@ -3052,6 +3199,8 @@ async fn initialize_rndis_with_vf_multi_open(driver: DefaultDriver) {
     assert_eq!(endpoint_state.lock().use_vf.take().unwrap(), false);
 }
 
+// Test: Initialize while the backend already uses the VF path.
+// Expected: No redundant VF-ready notification occurs and synthetic switching works.
 #[async_test]
 async fn initialize_rndis_with_prev_vf_switch_data_path(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -3142,6 +3291,8 @@ async fn initialize_rndis_with_prev_vf_switch_data_path(driver: DefaultDriver) {
     assert_eq!(endpoint_state.lock().use_vf.take().unwrap(), false);
 }
 
+// Test: Submit successive RNDIS packets with inaccessible payload offsets.
+// Expected: Each fails explicitly without preventing subsequent control requests.
 #[async_test]
 async fn rndis_handle_packet_errors(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -3239,6 +3390,8 @@ async fn rndis_handle_packet_errors(driver: DefaultDriver) {
     assert_eq!(completion.status, protocol::Status::FAILURE);
 }
 
+// Test: Stop/start before and after a pending backend switch to the VF.
+// Expected: Readiness and the established data path survive without redundant calls.
 #[async_test]
 async fn stop_start_with_vf(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -3322,7 +3475,7 @@ async fn stop_start_with_vf(driver: DefaultDriver) {
     //
     // Test start/stop with VF and data path switched.
     //
-    endpoint_state.lock().poll_iterations_required = 5;
+    let (switch_release, switch_started) = pause_switch(&endpoint_state);
     let message = NvspMessage {
         header: protocol::MessageHeader {
             message_type: protocol::MESSAGE4_TYPE_SWITCH_DATA_PATH,
@@ -3339,6 +3492,7 @@ async fn stop_start_with_vf(driver: DefaultDriver) {
             payload: &message.payload(),
         })
         .await;
+    resume_switch(&mut channel, switch_release, switch_started).await;
     channel
         .read_with(|packet| match packet {
             IncomingPacket::Completion(_) => (),
@@ -3359,6 +3513,8 @@ async fn stop_start_with_vf(driver: DefaultDriver) {
     assert!(endpoint_state.lock().use_vf.is_none());
 }
 
+// Test: Restore VF association and switched-path states into fresh NICs.
+// Expected: Readiness is not spuriously revoked and the restored path is preserved.
 #[async_test]
 async fn save_restore_with_vf(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -3507,7 +3663,7 @@ async fn save_restore_with_vf(driver: DefaultDriver) {
             .is_ok()
     );
 
-    endpoint_state.lock().poll_iterations_required = 5;
+    let (switch_release, switch_started) = pause_switch(&endpoint_state);
     let message = NvspMessage {
         header: protocol::MessageHeader {
             message_type: protocol::MESSAGE4_TYPE_SWITCH_DATA_PATH,
@@ -3524,6 +3680,7 @@ async fn save_restore_with_vf(driver: DefaultDriver) {
             payload: &message.payload(),
         })
         .await;
+    resume_switch(&mut channel, switch_release, switch_started).await;
     channel
         .read_with(|packet| match packet {
             IncomingPacket::Completion(_) => (),
@@ -3556,6 +3713,8 @@ async fn save_restore_with_vf(driver: DefaultDriver) {
     assert!(endpoint_state.lock().use_vf.is_none());
 }
 
+// Test: Reopen and migrate a NIC repeatedly while a VF is advertised or active.
+// Expected: Each fresh adapter preserves the saved association and path state.
 #[async_test]
 async fn save_restore_with_vf_multi_open(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -3734,7 +3893,7 @@ async fn save_restore_with_vf_multi_open(driver: DefaultDriver) {
         })
         .await;
 
-    endpoint_state.lock().poll_iterations_required = 5;
+    let (switch_release, switch_started) = pause_switch(&endpoint_state);
     let message = NvspMessage {
         header: protocol::MessageHeader {
             message_type: protocol::MESSAGE4_TYPE_SWITCH_DATA_PATH,
@@ -3751,6 +3910,7 @@ async fn save_restore_with_vf_multi_open(driver: DefaultDriver) {
             payload: &message.payload(),
         })
         .await;
+    resume_switch(&mut channel, switch_release, switch_started).await;
     channel
         .read_with(|packet| match packet {
             IncomingPacket::Completion(_) => (),
@@ -3941,9 +4101,28 @@ async fn test_save_restore_with_rss_table(
     let mut nic = TestNicDevice::new_with_nic_and_vmbus(&driver, mock_vmbus.clone(), nic).await;
     let mut channel = channel.restore(&mut nic, restore_state).await?;
     channel.start();
+    // Restore must be useful, not merely accepted.
+    channel.recv_buf_id = GpadlId(2);
+    channel.send_buf_id = GpadlId(3);
+    let request_id = 0xa55a;
+    channel
+        .send_rndis_control_message(
+            rndisprot::MESSAGE_TYPE_KEEPALIVE_MSG,
+            rndisprot::KeepaliveRequest { request_id },
+            &[],
+        )
+        .await;
+    let reply: rndisprot::KeepaliveComplete = channel
+        .read_rndis_control_message(rndisprot::MESSAGE_TYPE_KEEPALIVE_CMPLT)
+        .await
+        .unwrap();
+    assert_eq!(reply.request_id, request_id);
+    assert_eq!(reply.status, rndisprot::STATUS_SUCCESS);
     Ok(())
 }
 
+// Test: Restore RSS state to a backend with a smaller indirection table.
+// Expected: Public restoration rejects incompatible saved state.
 #[async_test]
 async fn save_restore_reduced_rss_table_size(driver: DefaultDriver) {
     // Reduce the RSS table size from 128 to 16.
@@ -3956,6 +4135,8 @@ async fn save_restore_reduced_rss_table_size(driver: DefaultDriver) {
     }
 }
 
+// Test: Restore RSS state to a fresh backend with the same table capacity.
+// Expected: Restoration succeeds and guest control requests still work.
 #[async_test]
 async fn save_restore_same_rss_table_size(driver: DefaultDriver) {
     // Supply the same RSS table size of 128.
@@ -3963,6 +4144,8 @@ async fn save_restore_same_rss_table_size(driver: DefaultDriver) {
     assert!(result.is_ok());
 }
 
+// Test: Restore RSS state to a fresh backend with greater table capacity.
+// Expected: Restoration succeeds and guest control requests still work.
 #[async_test]
 async fn save_restore_increased_rss_table_size(driver: DefaultDriver) {
     // Increase the RSS table size from 128 to 256.
@@ -4381,9 +4564,6 @@ async fn test_dynamic_vf_support_common(
         .await
         .expect("completion message");
 
-    PolledTimer::new(&driver)
-        .sleep(Duration::from_millis(333))
-        .await;
     assert_eq!(endpoint_state.lock().use_vf.take().unwrap(), true);
 
     //
@@ -4405,6 +4585,8 @@ async fn test_dynamic_vf_support_common(
     assert!(endpoint_state.lock().use_vf.is_none());
 }
 
+// Test: Remove a VF after migrating an advertised association to a fresh NIC.
+// Expected: The disassociation reuses the original guest-visible serial number.
 #[async_test]
 async fn save_restore_vf_disassociate_reuses_association_serial(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -4536,6 +4718,8 @@ async fn save_restore_vf_disassociate_reuses_association_serial(driver: DefaultD
         .await;
 }
 
+// Test: Add, remove and reconnect VFs for two distinct backend identifiers.
+// Expected: Associations use VF identifiers and guest/backend paths remain aligned.
 #[async_test]
 async fn dynamic_vf_support(driver: DefaultDriver) {
     let mut initial_vf_id = 123;
@@ -4569,6 +4753,8 @@ fn windows_guest_os_id_provider() -> Box<dyn Fn() -> HvGuestOsId + Send + Sync> 
     })
 }
 
+// Test: Exercise dynamic VF changes with two synthetic Microsoft guest IDs.
+// Expected: Associations use adapter indices rather than backend VF identifiers.
 #[async_test]
 async fn dynamic_vf_support_windows_guest_os_id(driver: DefaultDriver) {
     let mut initial_vf_id = 123;
@@ -4593,6 +4779,8 @@ async fn dynamic_vf_support_windows_guest_os_id(driver: DefaultDriver) {
     .await;
 }
 
+// Test: Toggle link state, repeat states and exhaust control receive buffers.
+// Expected: Ordered indications respect the product delay and resume after release.
 #[async_test]
 async fn link_status_update(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -4798,6 +4986,8 @@ async fn link_status_update(driver: DefaultDriver) {
     assert_eq!(link_status_msg.status, rndisprot::STATUS_MEDIA_CONNECT);
 }
 
+// Test: Submit an unsupported RNDIS reset request.
+// Expected: The transport is acknowledged, no RNDIS reply is sent and stop works.
 #[async_test]
 async fn send_rndis_reset_message(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -4828,8 +5018,12 @@ async fn send_rndis_reset_message(driver: DefaultDriver) {
             &[],
         )
         .await;
+    assert!(channel.read_with(|_| ()).await.is_err());
+    channel.stop().await;
 }
 
+// Test: Submit an unsupported guest-originated RNDIS status indication.
+// Expected: The transport is acknowledged, no RNDIS reply is sent and stop works.
 #[async_test]
 async fn send_rndis_indicate_status_message(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -4863,8 +5057,12 @@ async fn send_rndis_indicate_status_message(driver: DefaultDriver) {
             &[],
         )
         .await;
+    assert!(channel.read_with(|_| ()).await.is_err());
+    channel.stop().await;
 }
 
+// Test: Disable and enable receive delivery across four network queues.
+// Expected: Disabled queues retain packets and reenabling delivers addressed data.
 #[async_test]
 async fn send_rndis_set_packet_filter(driver: DefaultDriver) {
     const TOTAL_QUEUES: u32 = 4;
@@ -5149,6 +5347,8 @@ async fn send_rndis_set_packet_filter(driver: DefaultDriver) {
     }
 }
 
+// Test: Submit an unsupported extended RNDIS SET request.
+// Expected: The transport is acknowledged, no RNDIS reply is sent and stop works.
 #[async_test]
 async fn send_rndis_set_ex_message(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -5184,8 +5384,12 @@ async fn send_rndis_set_ex_message(driver: DefaultDriver) {
             &[],
         )
         .await;
+    assert!(channel.read_with(|_| ()).await.is_err());
+    channel.stop().await;
 }
 
+// Test: Configure an RSS table selecting the primary queue.
+// Expected: The guest receives a successful SET completion with its request ID.
 #[async_test]
 async fn set_rss_parameter(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -5284,6 +5488,8 @@ async fn set_rss_parameter(driver: DefaultDriver) {
         .await;
 }
 
+// Test: Configure RSS selecting a valid but unopened subchannel.
+// Expected: The configuration is accepted without requiring that channel to open.
 #[async_test]
 async fn set_rss_parameter_no_valid_queues(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -5386,6 +5592,8 @@ async fn set_rss_parameter_no_valid_queues(driver: DefaultDriver) {
 // Don't include queue zero in the indirection table. Worker[0] is supposed to
 // own the reserved IDs, meaning it is always expected to have an operable
 // queue.
+// Test: Configure RSS without queue zero and then open the selected subchannel.
+// Expected: Primary control completion and the transmit indirection table survive.
 #[async_test]
 async fn set_rss_parameter_unused_first_queue(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -5583,6 +5791,8 @@ async fn set_rss_parameter_unused_first_queue(driver: DefaultDriver) {
         .await;
 }
 
+// Test: Send a complete Ethernet payload through GPA-direct RNDIS framing.
+// Expected: The backend receives all bytes and the guest receives success.
 #[async_test]
 async fn rndis_send_single_packet_message(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -5631,7 +5841,7 @@ async fn rndis_send_single_packet_message(driver: DefaultDriver) {
         .send_rndis_control_message_no_completion(
             rndisprot::MESSAGE_TYPE_PACKET_MSG,
             rndisprot::Packet {
-                data_offset: size_of::<rndisprot::MessageHeader>() as u32,
+                data_offset: size_of::<rndisprot::Packet>() as u32,
                 data_length: frame.len() as u32,
                 oob_data_offset: 0,
                 oob_data_length: 0,
@@ -5647,8 +5857,11 @@ async fn rndis_send_single_packet_message(driver: DefaultDriver) {
 
     let completion = channel.read_rndis_packet_complete_message().await.unwrap();
     assert_eq!(completion.status, protocol::Status::SUCCESS);
+    assert_eq!(endpoint_state.lock().tx_packets, [frame]);
 }
 
+// Test: Submit two concatenated RNDIS packets and then a zero-length second packet.
+// Expected: Valid payloads reach the backend; the malformed batch fails explicitly.
 #[async_test]
 async fn rndis_send_multiple_packet_message(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -5695,7 +5908,7 @@ async fn rndis_send_multiple_packet_message(driver: DefaultDriver) {
     let extras = vec![vec![0xAA; 20], vec![0xBB; 20]];
     let mut packets = vec![
         rndisprot::Packet {
-            data_offset: size_of::<rndisprot::MessageHeader>() as u32,
+            data_offset: size_of::<rndisprot::Packet>() as u32,
             data_length: extras[0].len() as u32,
             oob_data_offset: 0,
             oob_data_length: 0,
@@ -5706,7 +5919,7 @@ async fn rndis_send_multiple_packet_message(driver: DefaultDriver) {
             reserved: 0,
         },
         rndisprot::Packet {
-            data_offset: size_of::<rndisprot::MessageHeader>() as u32,
+            data_offset: size_of::<rndisprot::Packet>() as u32,
             data_length: extras[1].len() as u32,
             oob_data_offset: 0,
             oob_data_length: 0,
@@ -5723,6 +5936,7 @@ async fn rndis_send_multiple_packet_message(driver: DefaultDriver) {
 
     let completion = channel.read_rndis_packet_complete_message().await.unwrap();
     assert_eq!(completion.status, protocol::Status::SUCCESS);
+    assert_eq!(endpoint_state.lock().tx_packets, extras);
 
     // Assign the second RNDIS packet an invalid length
     packets[1].data_length = 0;
@@ -5732,6 +5946,7 @@ async fn rndis_send_multiple_packet_message(driver: DefaultDriver) {
         .await;
     let completion = channel.read_rndis_packet_complete_message().await.unwrap();
     assert_eq!(completion.status, protocol::Status::FAILURE);
+    assert_eq!(endpoint_state.lock().tx_packets.len(), 2);
 }
 
 // Start with six queues (primary plus five subchannels) each with one receive
@@ -5740,6 +5955,8 @@ async fn rndis_send_multiple_packet_message(driver: DefaultDriver) {
 // remaining queues. Complete the packets on the original queues they were
 // received to ensure that they are redirected appropriately to the new owning
 // queue.
+// Test: Reduce six receive queues to four with outstanding buffers on every queue.
+// Expected: Completions on old queues return capacity to each new owning queue.
 #[async_test]
 async fn set_rss_parameter_bufs_not_evenly_divisible(driver: DefaultDriver) {
     const TOTAL_QUEUES: u32 = 6;
@@ -6013,6 +6230,46 @@ async fn set_rss_parameter_bufs_not_evenly_divisible(driver: DefaultDriver) {
             )
             .await;
     }
+    for round in 0..2 {
+        for idx in 0..4 {
+            let expected = [0x40 + round * 4 + idx as u8; 60];
+            endpoint_state
+                .lock()
+                .send_rx(idx as usize, expected.to_vec());
+            let transaction_id = channel
+                .read_subchannel_with(idx, |packet| {
+                    let IncomingPacket::Data(data) = packet else {
+                        panic!("expected peer receive packet")
+                    };
+                    let (header, ranges) = rndis_parser.parse_data_message(data);
+                    assert_eq!(header.message_type, rndisprot::MESSAGE_TYPE_PACKET_MSG);
+                    let received: [u8; 60] = rndis_parser.get_data_packet_content(&ranges);
+                    assert_eq!(received, expected, "queue {idx}, round {round}");
+                    data.transaction_id().unwrap()
+                })
+                .await
+                .expect("old-queue completion must return new-owner capacity");
+            channel
+                .write_subchannel(
+                    idx,
+                    OutgoingPacket {
+                        transaction_id,
+                        packet_type: OutgoingPacketType::Completion,
+                        payload: &NvspMessage {
+                            header: protocol::MessageHeader {
+                                message_type: protocol::MESSAGE1_TYPE_SEND_RNDIS_PACKET_COMPLETE,
+                            },
+                            data: protocol::Message1SendRndisPacketComplete {
+                                status: protocol::Status::SUCCESS,
+                            },
+                            padding: &[],
+                        }
+                        .payload(),
+                    },
+                )
+                .await;
+        }
+    }
 }
 
 // The netvsp task coordinator can be interrupted for various reasons:
@@ -6024,6 +6281,8 @@ async fn set_rss_parameter_bufs_not_evenly_divisible(driver: DefaultDriver) {
 // coordinator processing to restart, while there may be oustanding work in
 // flight. Stress some of these restart mechanisms to make sure work is not
 // lost and state is maintained properly during these transitions.
+// Test: Interleave VF, link, retarget and guest requests across worker restarts.
+// Expected: Guest work continues and host-initiated switches select synthetic.
 #[async_test]
 async fn race_coordinator_and_worker_stop_events(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -6101,7 +6360,6 @@ async fn race_coordinator_and_worker_stop_events(driver: DefaultDriver) {
     };
 
     let rndis_parser = channel.rndis_message_parser();
-    endpoint_state.lock().poll_iterations_required = 1;
     for i in 0..25 {
         // Trigger a link update 2/3 of the time. This also will queue a timer,
         // which is another event, as true->true is considered a toggle.
@@ -6121,10 +6379,6 @@ async fn race_coordinator_and_worker_stop_events(driver: DefaultDriver) {
                 )
                 .await
                 .unwrap();
-
-            if is_add {
-                PolledTimer::new(&driver).sleep(VF_DEVICE_DELAY).await;
-            }
         }
 
         // send switch data path messages
@@ -6247,6 +6501,8 @@ async fn race_coordinator_and_worker_stop_events(driver: DefaultDriver) {
     }
 }
 
+// Test: Send a TCP packet requesting segmentation offload.
+// Expected: Full data and segmentation metadata reach the backend with success.
 #[async_test]
 async fn rndis_send_lso_packet(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -6290,7 +6546,7 @@ async fn rndis_send_lso_packet(driver: DefaultDriver) {
 
     assert_eq!(endpoint_state.lock().stop_endpoint_counter, 1);
 
-    let data = vec![0xCC; 60];
+    let data = build_ipv4_tcp_packet();
     let tcp_checksum = false;
     let udp_checksum = false;
     let lso = true;
@@ -6300,8 +6556,16 @@ async fn rndis_send_lso_packet(driver: DefaultDriver) {
 
     let completion = channel.read_rndis_packet_complete_message().await.unwrap();
     assert_eq!(completion.status, protocol::Status::SUCCESS);
+    let state = endpoint_state.lock();
+    assert_eq!(state.tx_packets, [data]);
+    assert_eq!(state.tx_metadata.len(), 1);
+    assert!(state.tx_metadata[0].flags.offload_tcp_segmentation());
+    assert_eq!(state.tx_metadata[0].l4_len, 20);
+    assert_eq!(state.tx_metadata[0].max_segment_size, 1460);
 }
 
+// Test: Request LSO with the TCP data-offset byte beyond the packet.
+// Expected: The guest receives FAILURE and no malformed payload reaches the backend.
 #[async_test]
 async fn rndis_send_lso_packet_invalid_tcp_header_offset(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -6346,7 +6610,7 @@ async fn rndis_send_lso_packet_invalid_tcp_header_offset(driver: DefaultDriver) 
     // Send an LSO packet with tcp_header_offset pointing beyond the packet
     // data so that the Data Offset byte (byte 12 of the TCP header) cannot
     // be read. This should be rejected with Status::FAILURE.
-    let data = vec![0xCC; 60];
+    let data = build_ipv4_tcp_packet();
     let mem = channel.nic.mock_vmbus.memory.clone();
     let gpadl_view = channel
         .gpadl_map
@@ -6442,8 +6706,12 @@ async fn rndis_send_lso_packet_invalid_tcp_header_offset(driver: DefaultDriver) 
 
     let completion = channel.read_rndis_packet_complete_message().await.unwrap();
     assert_eq!(completion.status, protocol::Status::FAILURE);
+    assert!(endpoint_state.lock().tx_packets.is_empty());
+    verify_keepalive_progress(&mut channel).await;
 }
 
+// Test: Send a TCP packet requesting checksum offload.
+// Expected: Full packet data and TCP-checksum metadata reach the backend.
 #[async_test]
 async fn rndis_send_tcp_checksum_packet(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -6487,7 +6755,7 @@ async fn rndis_send_tcp_checksum_packet(driver: DefaultDriver) {
 
     assert_eq!(endpoint_state.lock().stop_endpoint_counter, 1);
 
-    let data = vec![0xCC; 60];
+    let data = build_ipv4_tcp_packet();
     let tcp_checksum = true;
     let udp_checksum = false;
     let lso = false;
@@ -6497,6 +6765,11 @@ async fn rndis_send_tcp_checksum_packet(driver: DefaultDriver) {
 
     let completion = channel.read_rndis_packet_complete_message().await.unwrap();
     assert_eq!(completion.status, protocol::Status::SUCCESS);
+    let state = endpoint_state.lock();
+    assert_eq!(state.tx_packets, [data]);
+    assert_eq!(state.tx_metadata.len(), 1);
+    assert!(state.tx_metadata[0].flags.offload_tcp_checksum());
+    assert!(!state.tx_metadata[0].flags.offload_tcp_segmentation());
 }
 
 /// Send a TCP checksum offload packet with a specific `tcp_header_offset`
@@ -6524,7 +6797,19 @@ async fn send_checksum_packet_with_header_offset(
     let per_packet_info_offset = size_of::<rndisprot::Packet>() as u32;
     let per_packet_info_length = ppi_header.size;
 
-    let data = vec![0xCC; 60];
+    let data = if is_ipv4 {
+        build_ipv4_tcp_packet()
+    } else {
+        let mut data = vec![0; 80];
+        data[..12].copy_from_slice(&build_ipv4_tcp_packet()[..12]);
+        data[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+        data[14] = 0x60;
+        data[18..20].copy_from_slice(&26u16.to_be_bytes());
+        data[20] = 6;
+        data[21] = 64;
+        data[66] = 0x50;
+        data
+    };
     let message_length = size_of::<rndisprot::MessageHeader>()
         + size_of::<rndisprot::Packet>()
         + per_packet_info_length as usize
@@ -6600,6 +6885,7 @@ async fn send_checksum_packet_with_header_offset(
 
     let completion = channel.read_rndis_packet_complete_message().await.unwrap();
     assert_eq!(completion.status, protocol::Status::SUCCESS);
+    assert_eq!(endpoint_state.lock().tx_packets, [data]);
 
     endpoint_state
         .lock()
@@ -6612,6 +6898,8 @@ async fn send_checksum_packet_with_header_offset(
 /// Regression test: when a guest sends a TCP checksum offload packet with
 /// `tcp_header_offset` set to 0, the code must fall back to the minimum
 /// IPv4 header length instead of panicking or computing an invalid offset.
+// Test: Request IPv4 TCP checksum offload with a zero transport-header offset.
+// Expected: Backend metadata uses 14-byte Ethernet and 20-byte IPv4 fallback sizes.
 #[async_test]
 async fn rndis_send_tcp_checksum_packet_zero_transport_header_offset_ipv4(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -6667,6 +6955,8 @@ async fn rndis_send_tcp_checksum_packet_zero_transport_header_offset_ipv4(driver
 /// Regression test: same as the IPv4 variant but for IPv6 — when a guest
 /// sends a TCP checksum offload packet with `tcp_header_offset` set to 0,
 /// the code must fall back to the minimum IPv6 header length (40).
+// Test: Request IPv6 TCP checksum offload with a zero transport-header offset.
+// Expected: Backend metadata uses 14-byte Ethernet and 40-byte IPv6 fallback sizes.
 #[async_test]
 async fn rndis_send_tcp_checksum_packet_zero_transport_header_offset_ipv6(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -6737,6 +7027,8 @@ fn build_ipv4_tcp_packet() -> Vec<u8> {
     data
 }
 
+// Test: Send TCP checksum offload with out-of-band VLAN metadata.
+// Expected: Backend packet bytes retain standard Ethernet geometry and VLAN ID 37.
 #[async_test]
 async fn rndis_send_tcp_checksum_packet_with_vlan_ppi(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -6802,13 +7094,13 @@ async fn rndis_send_tcp_checksum_packet_with_vlan_ppi(driver: DefaultDriver) {
         metadata.l3_len, 20,
         "IPv4 packets must keep a 20-byte L3 header"
     );
-    assert_eq!(
-        read_netvsp_counter(&nic.channel, "queues/0/tx_vlan_packets").await,
-        1,
-        "netvsp should count 1 VLAN TX packet"
-    );
+    let state = endpoint_state.lock();
+    assert_eq!(state.tx_packets, [data]);
+    assert_eq!(state.tx_metadata[0].vlan.unwrap().vlan_id(), 37);
 }
 
+// Test: Send segmentation offload with out-of-band VLAN metadata.
+// Expected: Backend bytes and headers remain intact with MSS 1460 and VLAN ID 91.
 #[async_test]
 async fn rndis_send_lso_packet_with_vlan_ppi(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -6876,11 +7168,26 @@ async fn rndis_send_lso_packet_with_vlan_ppi(driver: DefaultDriver) {
         "IPv4 packets must keep a 20-byte L3 header"
     );
     assert_eq!(metadata.max_segment_size, 1460);
-    assert_eq!(
-        read_netvsp_counter(&nic.channel, "queues/0/tx_vlan_packets").await,
-        1,
-        "netvsp should count 1 VLAN TX packet"
-    );
+    let state = endpoint_state.lock();
+    assert_eq!(state.tx_packets, [data]);
+    assert_eq!(state.tx_metadata[0].vlan.unwrap().vlan_id(), 91);
+}
+
+async fn verify_keepalive_progress(channel: &mut TestNicChannel<'_>) {
+    let request_id = 0xa55a;
+    channel
+        .send_rndis_control_message(
+            rndisprot::MESSAGE_TYPE_KEEPALIVE_MSG,
+            rndisprot::KeepaliveRequest { request_id },
+            &[],
+        )
+        .await;
+    let reply: rndisprot::KeepaliveComplete = channel
+        .read_rndis_control_message(rndisprot::MESSAGE_TYPE_KEEPALIVE_CMPLT)
+        .await
+        .unwrap();
+    assert_eq!(reply.request_id, request_id);
+    assert_eq!(reply.status, rndisprot::STATUS_SUCCESS);
 }
 
 async fn initialize_rndis_control(channel: &mut TestNicChannel<'_>) {
@@ -6942,6 +7249,7 @@ async fn inject_and_parse_rx(
     data: Vec<u8>,
     metadata: RxMetadata,
 ) -> RxPpiInfo {
+    let expected_data = data.clone();
     {
         let locked_state = endpoint_state.lock();
         locked_state.send_rx_with_metadata(0, data, metadata);
@@ -6950,7 +7258,23 @@ async fn inject_and_parse_rx(
     let (ppi, txid) = channel
         .read_with(|packet| match packet {
             IncomingPacket::Data(data) => {
-                let (_, external_ranges) = parser.parse_data_message(data);
+                let (header, external_ranges) = parser.parse_data_message(data);
+                assert_eq!(header.message_type, rndisprot::MESSAGE_TYPE_PACKET_MSG);
+                let mut reader = PagedRanges::new(external_ranges.iter()).reader(&parser.mem);
+                reader.skip(size_of::<rndisprot::MessageHeader>()).unwrap();
+                let packet: rndisprot::Packet = reader.read_plain().unwrap();
+                assert_eq!(packet.data_offset, 248 + metadata.offset as u32);
+                assert_eq!(packet.data_length as usize, expected_data.len());
+                assert_eq!(packet.oob_data_offset, 0);
+                assert_eq!(packet.oob_data_length, 0);
+                assert_eq!(packet.num_oob_data_elements, 0);
+                assert_eq!(packet.vc_handle, 0);
+                assert_eq!(packet.reserved, 0);
+                let mut reader = PagedRanges::new(external_ranges.iter()).reader(&parser.mem);
+                reader.skip(8 + packet.data_offset as usize).unwrap();
+                let mut received = vec![0; expected_data.len()];
+                reader.read(&mut received).unwrap();
+                assert_eq!(received, expected_data);
                 let ppi = parser.parse_rx_ppi(&external_ranges);
                 let txid = data
                     .transaction_id()
@@ -6983,6 +7307,8 @@ async fn inject_and_parse_rx(
     ppi
 }
 
+// Test: Receive a packet with VLAN priority, DEI and ID metadata.
+// Expected: Guest bytes are intact and VLAN/checksum PPI describe the packet.
 #[async_test]
 async fn rndis_rx_vlan_packet(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -7027,13 +7353,10 @@ async fn rndis_rx_vlan_packet(driver: DefaultDriver) {
         ppi.checksum.is_some(),
         "checksum PPI should always be present"
     );
-    assert_eq!(
-        read_netvsp_counter(&nic_dev.channel, "queues/0/rx_vlan_packets").await,
-        1,
-        "netvsp should count 1 VLAN RX packet"
-    );
 }
 
+// Test: Receive a VLAN packet with validated IP and TCP checksums.
+// Expected: Guest payload, VLAN fields and checksum-success bits are preserved.
 #[async_test]
 async fn rndis_rx_vlan_packet_with_tcp_checksum(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -7083,13 +7406,10 @@ async fn rndis_rx_vlan_packet_with_tcp_checksum(driver: DefaultDriver) {
     assert!(csum.tcp_checksum_succeeded());
     assert!(csum.ip_checksum_succeeded());
     assert!(!csum.tcp_checksum_failed());
-    assert_eq!(
-        read_netvsp_counter(&nic.channel, "queues/0/rx_vlan_packets").await,
-        1,
-        "netvsp should count 1 VLAN RX packet"
-    );
 }
 
+// Test: Receive a plain packet without VLAN metadata.
+// Expected: The complete payload arrives with checksum PPI and no VLAN PPI.
 #[async_test]
 async fn rndis_rx_packet_no_vlan(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -7127,13 +7447,10 @@ async fn rndis_rx_packet_no_vlan(driver: DefaultDriver) {
         ppi.checksum.is_some(),
         "checksum PPI should always be present"
     );
-    assert_eq!(
-        read_netvsp_counter(&nic.channel, "queues/0/rx_vlan_packets").await,
-        0,
-        "netvsp should count 0 VLAN RX packets for untagged traffic"
-    );
 }
 
+// Test: Receive a packet carrying the maximum usable VLAN ID and priority.
+// Expected: All guest payload bytes survive and PPI retains the VLAN fields.
 #[async_test]
 async fn rndis_rx_vlan_preserves_packet_data(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -7190,13 +7507,6 @@ async fn rndis_rx_vlan_preserves_packet_data(driver: DefaultDriver) {
         })
         .await
         .expect("RX data packet");
-
-    // Verify netvsp's internal counters via inspect.
-    assert_eq!(
-        read_netvsp_counter(&nic_dev.channel, "queues/0/rx_vlan_packets").await,
-        1,
-        "netvsp should count 1 RX packet"
-    );
 }
 
 /// Helper: builds an RSS-enable parameter block that the set_rss_parameter
@@ -7330,6 +7640,8 @@ async fn send_rss_oid_and_complete(channel: &mut TestNicChannel<'_>, rss_bytes: 
 /// `pending_tx_packets` state. When `restart_queues()` stops the endpoint,
 /// `reset_tx_after_endpoint_stop()` should queue completions so the guest
 /// is unblocked.
+// Test: Restart RSS queues while an asynchronous guest transmit is outstanding.
+// Expected: The accepted transaction completes and released transmit capacity works.
 #[async_test]
 async fn tx_inflight_packets_completed_after_endpoint_restart(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -7374,11 +7686,12 @@ async fn tx_inflight_packets_completed_after_endpoint_restart(driver: DefaultDri
     // Send a data packet. Because `sync_tx` is false, `tx_avail` returns
     // `(false, N)`, the packet stays in-flight (pending_packet_count > 0).
     let frame = vec![0xBB; 60];
+    let transaction_id = channel.transaction_id;
     channel
         .send_rndis_control_message_no_completion(
             rndisprot::MESSAGE_TYPE_PACKET_MSG,
             rndisprot::Packet {
-                data_offset: size_of::<rndisprot::MessageHeader>() as u32,
+                data_offset: size_of::<rndisprot::Packet>() as u32,
                 data_length: frame.len() as u32,
                 oob_data_offset: 0,
                 oob_data_length: 0,
@@ -7399,6 +7712,7 @@ async fn tx_inflight_packets_completed_after_endpoint_restart(driver: DefaultDri
 
     // Trigger an RSS parameter change, which causes restart_queues() →
     // endpoint.stop() → reset_tx_after_endpoint_stop().
+    endpoint_state.lock().sync_tx = true;
     let rss_bytes = build_rss_enable_params();
     send_rss_oid_and_complete(&mut channel, &rss_bytes).await;
 
@@ -7411,14 +7725,28 @@ async fn tx_inflight_packets_completed_after_endpoint_restart(driver: DefaultDri
 
     // The in-flight TX packet should now have a completion queued by
     // reset_tx_after_endpoint_stop(). Read it.
-    let completion = channel
-        .read_rndis_packet_complete_message_with_timeout(Duration::from_secs(2))
+    channel
+        .read_with(|packet| {
+            let IncomingPacket::Completion(completion) = packet else {
+                panic!("expected the outstanding transmit completion")
+            };
+            assert_eq!(completion.transaction_id(), transaction_id);
+            assert_wire_message(
+                completion.reader(),
+                protocol::MESSAGE1_TYPE_SEND_RNDIS_PACKET_COMPLETE,
+                &protocol::Status::SUCCESS.0.to_le_bytes(),
+                32,
+            );
+        })
+        .await
+        .unwrap();
+    let retry = build_ipv4_tcp_packet();
+    channel
+        .send_rndis_packet_offload(&retry, true, false, false)
         .await;
-    assert!(
-        completion.is_some(),
-        "Expected TX completion for in-flight packet after endpoint restart"
-    );
-    assert_eq!(completion.unwrap().status, protocol::Status::SUCCESS);
+    let completion = channel.read_rndis_packet_complete_message().await.unwrap();
+    assert_eq!(completion.status, protocol::Status::SUCCESS);
+    assert_eq!(endpoint_state.lock().tx_packets, [frame, retry]);
 }
 
 /// Verifies that disabling RSS when RSS is already disabled does NOT trigger
@@ -7426,6 +7754,8 @@ async fn tx_inflight_packets_completed_after_endpoint_restart(driver: DefaultDri
 ///
 /// The PR optimizes `handle_oid_set` to skip `restart_endpoint = true` when
 /// `!had_rss && primary.rss_state.is_none()`.
+// Test: Disable RSS on an adapter that never enabled it.
+// Expected: The OID succeeds without another backend stop operation.
 #[async_test]
 async fn rss_disable_when_already_disabled_skips_endpoint_restart(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -7482,6 +7812,8 @@ async fn rss_disable_when_already_disabled_skips_endpoint_restart(driver: Defaul
 /// Verifies that disabling RSS when RSS was previously enabled DOES trigger
 /// an endpoint restart (the skip optimization only applies when both states
 /// are disabled).
+// Test: Enable RSS and subsequently disable it.
+// Expected: Each change is accepted and disabling stops the previous backend.
 #[async_test]
 async fn rss_enable_then_disable_triggers_endpoint_restart(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -7542,6 +7874,8 @@ async fn rss_enable_then_disable_triggers_endpoint_restart(driver: DefaultDriver
 /// Requesting num_sub_channels == max_queues should be rejected
 /// because the subchannels plus the primary channel must fit within max_queues
 /// (i.e. subchannels must be strictly less than max_queues) or we panic.
+// Test: Request as many subchannels as the total queue limit.
+// Expected: The request fails because the primary queue also consumes capacity.
 #[async_test]
 async fn subchannel_request_equal_to_max_queues_rejected(driver: DefaultDriver) {
     const MAX_QUEUES: u16 = 2;
@@ -7625,6 +7959,8 @@ async fn subchannel_request_equal_to_max_queues_rejected(driver: DefaultDriver) 
 
 /// Sending RSS parameters with `indirection_table_size == 0` should be rejected
 /// with `STATUS_INVALID_DATA`.
+// Test: Enable RSS with an empty indirection table.
+// Expected: A correlated INVALID_DATA reply is returned.
 #[async_test]
 async fn rss_set_with_zero_indirection_table_size_rejected(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -7720,6 +8056,8 @@ async fn rss_set_with_zero_indirection_table_size_rejected(driver: DefaultDriver
     );
 }
 
+// Test: Partition receive buffers among zero queues.
+// Expected: ZeroQueueCount is returned rather than dividing by zero.
 #[test]
 fn rx_buffer_ranges_zero_queue_count() {
     let result = RxBufferRanges::new(100, 0);
@@ -7730,6 +8068,8 @@ fn rx_buffer_ranges_zero_queue_count() {
     }
 }
 
+// Test: Partition fewer buffers than the control reservation requires.
+// Expected: InsufficientBuffers is returned without subtracting past zero.
 #[test]
 fn rx_buffer_ranges_buffer_count_below_reserved() {
     let result = RxBufferRanges::new(RX_RESERVED_CONTROL_BUFFERS - 1, 1);
@@ -7740,6 +8080,8 @@ fn rx_buffer_ranges_buffer_count_below_reserved() {
     }
 }
 
+// Test: Partition only the reserved buffers with no receive capacity.
+// Expected: ZeroBuffersPerQueue is returned.
 #[test]
 fn rx_buffer_ranges_zero_buffers_per_queue() {
     // buffer_count == RX_RESERVED_CONTROL_BUFFERS means 0 buffers available for queues
@@ -7751,33 +8093,32 @@ fn rx_buffer_ranges_zero_buffers_per_queue() {
     }
 }
 
+// Test: Partition four usable buffers between two queues.
+// Expected: Cross-queue releases reach the owning receiver and preserve peers.
 #[test]
 fn rx_buffer_ranges_valid() {
     let buffer_count = RX_RESERVED_CONTROL_BUFFERS + 4;
     let queue_count = 2;
-    let (ranges, recvs) = RxBufferRanges::new(buffer_count, queue_count).unwrap();
+    let (ranges, mut recvs) = RxBufferRanges::new(buffer_count, queue_count).unwrap();
     assert_eq!(ranges.buffers_per_queue, 2);
     assert_eq!(recvs.len(), queue_count as usize);
     assert_eq!(ranges.buffer_id_send.len(), queue_count as usize);
+    let ranges = Arc::new(ranges);
+    let first = RxBufferRange::new(ranges.clone(), 16..18, None);
+    let second = RxBufferRange::new(ranges, 18..20, None);
+    assert!(!first.send_if_remote(0));
+    assert!(!first.send_if_remote(16));
+    assert!(!second.send_if_remote(19));
+    assert!(first.send_if_remote(18));
+    assert!(second.send_if_remote(17));
+    assert_eq!(recvs[0].try_next().unwrap(), Some(17));
+    assert_eq!(recvs[1].try_next().unwrap(), Some(18));
+    assert!(recvs[0].try_next().is_err());
+    assert!(recvs[1].try_next().is_err());
 }
 
-/// Read a counter value from the running Nic via the inspect framework.
-/// The `path` is slash-separated following the Nic's inspect tree.
-async fn read_netvsp_counter(channel: &ChannelHandle<Nic>, path: &str) -> u64 {
-    let mut inspection = inspect::InspectionBuilder::new(path)
-        .depth(Some(usize::MAX))
-        .inspect(channel);
-    inspection.resolve().await;
-    match inspection.results() {
-        inspect::Node::Value(v) => match v.kind {
-            inspect::ValueKind::Unsigned(n) => n,
-            inspect::ValueKind::Signed(n) => n as u64,
-            other => panic!("unexpected value kind for counter at '{path}': {other:?}"),
-        },
-        other => panic!("unexpected inspect node for '{path}': {other:?}"),
-    }
-}
-
+// Test: Query MAC options using a correlated RNDIS request.
+// Expected: VLAN, priority and the established baseline capability bits are present.
 #[async_test]
 async fn oid_query_mac_options_reports_vlan_support(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -7866,6 +8207,8 @@ async fn oid_query_mac_options_reports_vlan_support(driver: DefaultDriver) {
     assert_ne!(options & rndisprot::MAC_OPTION_TRANSFERS_NOT_PEND, 0);
 }
 
+// Test: Set lookahead before enabling receive delivery.
+// Expected: The OID succeeds and a complete plain packet reaches guest memory.
 #[async_test]
 async fn oid_set_current_lookahead_allows_rx_initialization(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
@@ -7920,6 +8263,8 @@ async fn oid_set_current_lookahead_allows_rx_initialization(driver: DefaultDrive
     assert!(ppi.vlan.is_none());
 }
 
+// Test: Set lookahead using only three bytes.
+// Expected: The original request ID returns STATUS_FAILURE.
 #[async_test]
 async fn oid_set_current_lookahead_rejects_short_payload(driver: DefaultDriver) {
     let mut nic = TestNicDevice::new(&driver).await;
@@ -7953,8 +8298,10 @@ async fn oid_set_current_lookahead_rejects_short_payload(driver: DefaultDriver) 
     assert_eq!(set_complete.status, rndisprot::STATUS_FAILURE);
 }
 
+// Test: Transmit a VLAN-tagged packet followed by a plain packet.
+// Expected: Both full payloads arrive and VLAN metadata does not leak to the second.
 #[async_test]
-async fn vlan_tx_counter_increments(driver: DefaultDriver) {
+async fn mixed_vlan_transmits_preserve_payloads_and_metadata(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
     let endpoint = TestNicEndpoint::new(Some(endpoint_state.clone()));
     let nic = Nic::builder().build(
@@ -8004,21 +8351,17 @@ async fn vlan_tx_counter_increments(driver: DefaultDriver) {
     let completion = channel.read_rndis_packet_complete_message().await.unwrap();
     assert_eq!(completion.status, protocol::Status::SUCCESS);
 
-    // Verify netvsp's internal counters via inspect.
-    assert_eq!(
-        read_netvsp_counter(&nic_dev.channel, "queues/0/tx_packets").await,
-        2,
-        "netvsp should count 2 TX packets"
-    );
-    assert_eq!(
-        read_netvsp_counter(&nic_dev.channel, "queues/0/tx_vlan_packets").await,
-        1,
-        "netvsp should count 1 VLAN TX packet"
-    );
+    let state = endpoint_state.lock();
+    assert_eq!(state.tx_packets, [data.clone(), data]);
+    assert_eq!(state.tx_metadata.len(), 2);
+    assert_eq!(state.tx_metadata[0].vlan.unwrap().vlan_id(), 42);
+    assert!(state.tx_metadata[1].vlan.is_none());
 }
 
+// Test: Receive a VLAN-tagged packet followed by a plain packet.
+// Expected: Both full payloads arrive and the second has no stale VLAN PPI.
 #[async_test]
-async fn vlan_rx_counter_increments(driver: DefaultDriver) {
+async fn mixed_vlan_receives_clear_previous_metadata(driver: DefaultDriver) {
     let endpoint_state = TestNicEndpointState::new();
     let endpoint = TestNicEndpoint::new(Some(endpoint_state.clone()));
     let nic = Nic::builder().build(
@@ -8059,7 +8402,10 @@ async fn vlan_rx_counter_increments(driver: DefaultDriver) {
         vlan_metadata,
     )
     .await;
-    assert!(ppi.vlan.is_some(), "VLAN PPI should be present");
+    let vlan = ppi.vlan.expect("VLAN PPI should be present");
+    assert_eq!(vlan.vlan_id(), 42);
+    assert_eq!(vlan.priority(), 3);
+    assert!(!vlan.drop_eligible_indicator());
 
     // Inject a non-VLAN RX packet.
     let plain_data = vec![0xBB; 60];
@@ -8076,15 +8422,10 @@ async fn vlan_rx_counter_increments(driver: DefaultDriver) {
     )
     .await;
     assert!(ppi.vlan.is_none(), "VLAN PPI should not be present");
-
-    // Verify netvsp's internal RX VLAN counter via inspect.
-    assert_eq!(
-        read_netvsp_counter(&nic_dev.channel, "queues/0/rx_vlan_packets").await,
-        1,
-        "netvsp should count 1 VLAN RX packet"
-    );
 }
 
+// Test: Race subchannel restart requests, an endpoint restart and a filter update.
+// Expected: One backend stop coalesces the race and every peer queue delivers data.
 #[async_test]
 async fn subchannel_tx_restart(driver: DefaultDriver) {
     const TOTAL_QUEUES: u32 = 4;
@@ -8240,6 +8581,7 @@ async fn subchannel_tx_restart(driver: DefaultDriver) {
         .await;
 
     let stop_before = endpoint_state.lock().stop_endpoint_counter;
+    let restart_complete = endpoint_state.lock().stopped.listen();
 
     {
         // Arm a one-shot TryRestart on every sub-channel queue and wake each
@@ -8283,51 +8625,17 @@ async fn subchannel_tx_restart(driver: DefaultDriver) {
             .expect("packet from primary channel during racing phase");
     }
 
-    // Wait for the coordinator to observe at least one Restart-trigger and
-    // run restart_queues (which calls endpoint.stop()).
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if endpoint_state.lock().stop_endpoint_counter > stop_before {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!(
-                "restart_queues did not run within timeout (stop_before={}, current={})",
-                stop_before,
-                endpoint_state.lock().stop_endpoint_counter
-            );
-        }
-        // Yield to let the workers and coordinator make progress.
-        let mut ctx = mesh::CancelContext::new().with_timeout(Duration::from_millis(50));
-        let _ = ctx.until_cancelled(pending::<()>()).await;
-    }
+    // Observe the real Endpoint::stop call without repeatedly polling diagnostics.
+    mesh::CancelContext::new()
+        .with_timeout(Duration::from_secs(5))
+        .until_cancelled(restart_complete)
+        .await
+        .expect("racing restarts must stop the endpoint");
 
     // The coordinator must coalesce restarts into one cycle.
     let stop_after = endpoint_state.lock().stop_endpoint_counter;
     let cycles = stop_after - stop_before;
     assert_eq!(cycles, 1, "expected exactly 1 restart cycle, got {cycles}");
-
-    // Poll the packet-filter counter on every sub-channel until it
-    // converges to NEW_FILTER.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let mut all_match = true;
-        for idx in 1..TOTAL_QUEUES as usize {
-            let current =
-                read_netvsp_counter(&channel.nic.channel, &format!("queues/{idx}/packet_filter"))
-                    .await as u32;
-            if current != NEW_FILTER {
-                all_match = false;
-                break;
-            }
-        }
-        if all_match {
-            break;
-        }
-        if std::time::Instant::now() >= deadline {
-            panic!("packet filter did not update on all sub-channels");
-        }
-    }
 
     // Deliver another RX packet on every sub-channel and verify each worker
     // is alive and functional after the restart cycle.
@@ -8338,13 +8646,56 @@ async fn subchannel_tx_restart(driver: DefaultDriver) {
         }
     }
     for idx in 1..TOTAL_QUEUES {
-        channel
-            .read_subchannel_with(idx, |packet| match packet {
-                IncomingPacket::Data(_) => (),
-                _ => panic!("Unexpected packet on sub-channel {idx}"),
-            })
-            .await
-            .unwrap_or_else(|_| panic!("sub-channel {idx} RX packet after restart cycle"));
+        let mut received_retry = false;
+        for _ in 0..2 {
+            let (transaction_id, is_retry) = channel
+                .read_subchannel_with(idx, |packet| match packet {
+                    IncomingPacket::Data(data) => {
+                        let (header, ranges) = parser.parse_data_message(data);
+                        assert_eq!(header.message_type, rndisprot::MESSAGE_TYPE_PACKET_MSG);
+                        let received: [u8; 60] = parser.get_data_packet_content(&ranges);
+                        assert!(
+                            received == [0xAA + idx as u8; 60]
+                                || received == [0xBB + idx as u8; 60],
+                            "the addressed queue must preserve a complete submitted packet"
+                        );
+                        (
+                            data.transaction_id().unwrap(),
+                            received == [0xBB + idx as u8; 60],
+                        )
+                    }
+                    _ => panic!("Unexpected packet on sub-channel {idx}"),
+                })
+                .await
+                .unwrap_or_else(|_| panic!("sub-channel {idx} RX packet after restart cycle"));
+            channel
+                .write_subchannel(
+                    idx,
+                    OutgoingPacket {
+                        transaction_id,
+                        packet_type: OutgoingPacketType::Completion,
+                        payload: &NvspMessage {
+                            header: protocol::MessageHeader {
+                                message_type: protocol::MESSAGE1_TYPE_SEND_RNDIS_PACKET_COMPLETE,
+                            },
+                            data: protocol::Message1SendRndisPacketComplete {
+                                status: protocol::Status::SUCCESS,
+                            },
+                            padding: &[],
+                        }
+                        .payload(),
+                    },
+                )
+                .await;
+            if is_retry {
+                received_retry = true;
+                break;
+            }
+        }
+        assert!(
+            received_retry,
+            "queue {idx} must deliver its post-restart packet"
+        );
     }
 }
 

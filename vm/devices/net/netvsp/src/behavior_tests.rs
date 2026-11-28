@@ -31,6 +31,7 @@ async fn control<T: IntoBytes + Immutable + KnownLayout>(
 ) -> Vec<u8> {
     // Reuse the send buffer only after the previous request was acknowledged.
     channel.send_offset = 0;
+    let request_transaction = channel.transaction_id;
     channel
         .send_rndis_control_message_no_completion(message_type, request, extra)
         .await;
@@ -41,6 +42,7 @@ async fn control<T: IntoBytes + Immutable + KnownLayout>(
         let received = channel
             .read_with(|packet| match packet {
                 IncomingPacket::Completion(completion) => {
+                    assert_eq!(completion.transaction_id(), request_transaction);
                     let mut reader = completion.reader();
                     let header: protocol::MessageHeader = reader.read_plain().unwrap();
                     assert_eq!(

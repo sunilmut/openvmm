@@ -310,14 +310,15 @@ mod tests {
     use crate::buffers::sub_allocation_size_for_mtu;
     use guestmem::GuestMemory;
     use net_backend::RxBufferSegment;
+    use test_with_tracing::test;
     use vmbus_channel::gpadl::GpadlMap;
     use vmbus_core::protocol::GpadlId;
     use vmbus_ring::gparange::GpaRange;
     use vmbus_ring::gparange::MultiPagedRangeBuf;
     use zerocopy::IntoBytes;
 
-    /// Verify that inconsistent sub_allocation_size and MTU from saved state
-    /// returns an error instead of panicking.
+    // Test: Restore a receive allocation too small for a jumbo MTU.
+    // Expected: Configuration is rejected before accessing guest memory.
     #[test]
     fn sub_allocation_too_small_for_mtu() {
         let default_mtu = 1514;
@@ -353,8 +354,8 @@ mod tests {
         }
     }
 
-    /// Verify that an MTU near u32::MAX returns InvalidMtu instead of
-    /// wrapping the sub_allocation_size calculation.
+    // Test: Validate an MTU whose receive allocation would overflow.
+    // Expected: InvalidMtu is returned instead of wrapping the required size.
     #[test]
     fn overflowing_mtu_returns_error() {
         let num_pages = 16;
@@ -380,8 +381,8 @@ mod tests {
         }
     }
 
-    /// Verify that a GPADL with zero ranges returns EmptyGpadl instead of
-    /// panicking.
+    // Test: Construct receive buffers from a GPADL containing no ranges.
+    // Expected: EmptyGpadl is returned without accessing guest memory.
     #[test]
     fn empty_gpadl_returns_error() {
         let multipaged_ranged_buf = MultiPagedRangeBuf::from_range_buffer(0, vec![]).unwrap();
@@ -400,6 +401,8 @@ mod tests {
         }
     }
 
+    // Test: Map partial pages across adjacent and nonadjacent guest pages.
+    // Expected: Contiguous addresses coalesce without losing bytes or gaps.
     #[test]
     fn test_buffer_segments() {
         fn check(addrs: &[RxBufferSegment], check: &[(u64, u32)]) {
