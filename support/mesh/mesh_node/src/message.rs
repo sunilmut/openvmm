@@ -538,6 +538,8 @@ mod tests {
     use mesh_protobuf::encoding::ImpossibleField;
     use test_with_tracing::test;
 
+    // Test: Recover a concrete payload whose encoding cannot serialize it.
+    // Expected: Local delivery extracts the value without invoking serialization.
     #[test]
     fn roundtrip_without_serialize() {
         #[derive(Debug, Default)]

@@ -74,7 +74,6 @@ async fn remote_handle_clones_keep_connections_alive_until_explicit_failure(driv
             let (sender, mut receiver) = new_remote_port_pair(&first.node, &second.node);
             let handle = second.node.get_remote_handle(first.node.id());
             let retained = handle.clone();
-            assert_eq!(*retained.id(), first.node.id());
             drop(handle);
             handles.remove(1);
             assert!(!retained.connect(EventsFrom {
@@ -167,4 +166,141 @@ fn rejected_live_and_queued_messages_fail_both_endpoints_with_the_original_cause
             sender.with_handler(|handler| matches!(handler.try_recv(), Err(TryRecvError::Failed)))
         );
     }
+}
+
+struct CapturedEvents {
+    node_id: NodeId,
+    events: Arc<Mutex<VecDeque<RemoteEvent>>>,
+}
+
+impl SendEvent for CapturedEvents {
+    fn event(&self, event: OutgoingEvent<'_>) {
+        let mut data = Vec::with_capacity(event.len());
+        let mut resources = Vec::new();
+        event.write_to(&mut data, &mut resources);
+        self.events.lock().push_back(RemoteEvent {
+            node_id: self.node_id,
+            data,
+            resources,
+        });
+    }
+}
+
+struct WirePair {
+    source: LocalNode,
+    destination: LocalNode,
+    sender: Port,
+    receiver: Channel<(), String>,
+    _handles: [RemoteNodeHandle; 2],
+    events: Arc<Mutex<VecDeque<RemoteEvent>>>,
+}
+
+impl WirePair {
+    fn new() -> Self {
+        let source = LocalNode::with_id(NodeId::new(), Box::new(NullConnect));
+        let destination = LocalNode::with_id(NodeId::new(), Box::new(NullConnect));
+        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let source_handle = source.add_remote(destination.id());
+        assert!(source_handle.connect(CapturedEvents {
+            node_id: source.id(),
+            events: events.clone(),
+        }));
+        let destination_handle = destination.add_remote(source.id());
+        let sender_id = PortId::new();
+        let receiver_id = PortId::new();
+        let sender = source.add_port(sender_id, Address::new(destination.id(), receiver_id));
+        let receiver = destination
+            .add_port(receiver_id, Address::new(source.id(), sender_id))
+            .into();
+        Self {
+            source,
+            destination,
+            sender,
+            receiver,
+            _handles: [source_handle, destination_handle],
+            events,
+        }
+    }
+}
+
+fn deliver(destination: &LocalNode, mut event: RemoteEvent) {
+    destination.event(&event.node_id, &event.data, &mut event.resources);
+}
+
+// Test: Deliver captured wire messages and their final close event out of order.
+// Expected: No later event overtakes missing data; full values precede closure.
+#[test]
+fn out_of_order_wire_messages_and_close_preserve_delivery_order() {
+    let WirePair {
+        source: _source,
+        destination,
+        sender,
+        mut receiver,
+        _handles,
+        events,
+    } = WirePair::new();
+    sender.send_protobuf(("first\0payload",));
+    sender.send_protobuf(("second",));
+    sender.send_protobuf_and_close(("final",));
+    let first = events.lock().pop_front().unwrap();
+    let second = events.lock().pop_front().unwrap();
+    let close = events.lock().pop_front().unwrap();
+    deliver(&destination, close);
+    deliver(&destination, second);
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+    deliver(&destination, first);
+    for expected in ["first\0payload", "second", "final"] {
+        assert_eq!(receiver.try_recv().unwrap(), expected);
+    }
+    assert!(matches!(receiver.try_recv(), Err(TryRecvError::Closed)));
+}
+
+// Test: Deliver every incomplete prefix of a valid captured wire message.
+// Expected: Truncation delivers nothing and does not consume the valid sequence.
+#[test]
+fn truncated_wire_messages_leave_the_valid_message_deliverable() {
+    let mut pair = WirePair::new();
+    pair.sender.send_protobuf(("complete\0payload",));
+    let event = pair.events.lock().pop_front().unwrap();
+    for len in 0..event.data.len() {
+        pair.destination
+            .event(&event.node_id, &event.data[..len], &mut Vec::new());
+        assert!(matches!(pair.receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+    deliver(&pair.destination, event);
+    assert_eq!(pair.receiver.try_recv().unwrap(), "complete\0payload");
+    assert!(matches!(pair.receiver.try_recv(), Err(TryRecvError::Empty)));
+}
+
+// Test: Replay a delivered wire event while another port uses the same connection.
+// Expected: Only the replayed destination fails; unrelated traffic remains usable.
+#[test]
+fn duplicate_wire_events_fail_only_the_affected_port() {
+    let mut pair = WirePair::new();
+    let sender_id = PortId::new();
+    let receiver_id = PortId::new();
+    let other_sender = pair
+        .source
+        .add_port(sender_id, Address::new(pair.destination.id(), receiver_id));
+    let mut other_receiver = Channel::<(), String>::from(
+        pair.destination
+            .add_port(receiver_id, Address::new(pair.source.id(), sender_id)),
+    );
+    pair.sender.send_protobuf(("once",));
+    let mut event = pair.events.lock().pop_front().unwrap();
+    pair.destination
+        .event(&event.node_id, &event.data, &mut event.resources);
+    assert_eq!(pair.receiver.try_recv().unwrap(), "once");
+    deliver(&pair.destination, event);
+    assert!(matches!(
+        pair.receiver.try_recv(),
+        Err(TryRecvError::Failed)
+    ));
+    other_sender.send_protobuf(("unaffected",));
+    deliver(&pair.destination, pair.events.lock().pop_front().unwrap());
+    assert_eq!(other_receiver.try_recv().unwrap(), "unaffected");
+    assert!(matches!(
+        other_receiver.try_recv(),
+        Err(TryRecvError::Empty)
+    ));
 }

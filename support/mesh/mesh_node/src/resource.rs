@@ -143,6 +143,7 @@ mod tests {
             Port::try_from(Resource::from(OwnedFd::from(socket))),
             Err(ResourceError::BadResourceType)
         ));
+        assert_eq!(peer.read(&mut bytes).unwrap(), 0);
         let (port, peer) = Port::new_pair();
         let port = Port::try_from(Resource::from(port)).unwrap();
         assert!(!peer.is_closed().unwrap());

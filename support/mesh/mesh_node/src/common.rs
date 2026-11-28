@@ -163,11 +163,6 @@ mod tests {
     use super::Uuid;
     use test_with_tracing::test;
 
-    #[test]
-    fn test_uuid() {
-        Uuid::new();
-    }
-
     // Test: Parse hexadecimal IDs, including zero, mixed case, and the u128 limit.
     // Expected: Valid IDs round-trip; signs, empty input, and overflow are rejected.
     #[test]

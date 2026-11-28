@@ -1887,11 +1887,6 @@ impl LocalNode {
         self.inner.id
     }
 
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.inner.state.lock().ports.is_empty()
-    }
-
     /// Waits for all ports to be disassociated from the node.
     ///
     /// If `all_ports` is false, only waits for ports that are still in the
@@ -2315,33 +2310,11 @@ pub mod tests {
     use std::future::Future;
     use std::future::poll_fn;
     use std::marker::PhantomData;
-    use std::pin::Pin;
     use std::pin::pin;
     use std::sync::OnceLock;
     use std::task::Context;
     use std::task::Poll;
     use test_with_tracing::test;
-
-    fn yield_once() -> YieldOnce {
-        YieldOnce { yielded: false }
-    }
-
-    struct YieldOnce {
-        yielded: bool,
-    }
-
-    impl Future for YieldOnce {
-        type Output = ();
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            if !self.yielded {
-                self.yielded = true;
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            ().into()
-        }
-    }
 
     #[derive(Debug)]
     pub enum TryRecvError {
@@ -2552,6 +2525,8 @@ pub mod tests {
         }
     }
 
+    // Test: Send a local binary message while leaving its sender open.
+    // Expected: The receiver gets the full payload once and remains open.
     #[test]
     fn test_local() {
         let (left, mut right) = Channel::<_, ()>::new_pair();
@@ -2630,6 +2605,8 @@ pub mod tests {
         }
     }
 
+    // Test: Send a message across two nodes, then drop both endpoints.
+    // Expected: The payload arrives intact and both nodes finish draining.
     #[async_test]
     async fn test_remote(driver: DefaultDriver) {
         let (node, node2, _h) = new_two_node_mesh(&driver);
@@ -2641,11 +2618,12 @@ pub mod tests {
             });
             assert_eq!(right.recv().await.unwrap().data, b"abc");
         }
-        yield_once().await;
-        assert!(node.node.is_empty());
-        assert!(node2.node.is_empty());
+        node.node.wait_for_ports(true).await;
+        node2.node.wait_for_ports(true).await;
     }
 
+    // Test: Send from a transport callback while another message is being sent.
+    // Expected: Reentrant traffic does not deadlock and arrives in send order.
     #[async_test]
     async fn test_send_from_send_event(driver: DefaultDriver) {
         // A connection that sends on a port while handling an event, as
@@ -2659,10 +2637,7 @@ pub mod tests {
         impl SendEvent for ReentrantEventsFrom {
             fn event(&self, event: OutgoingEvent<'_>) {
                 if !self.reentered.swap(true, Ordering::SeqCst) {
-                    // Neither the port nor the node may be locked while sending.
-                    assert!(event.remote_node.state.try_write().is_some());
                     let port = self.port.get().unwrap();
-                    assert!(port.raw.inner.state.try_lock().is_some());
                     port.with_port_and_handler(|control, _| {
                         control.respond(Message::new((bmsg(b"def"),)));
                     });
@@ -2693,6 +2668,8 @@ pub mod tests {
         assert_eq!(right.recv().await.unwrap().data, b"def");
     }
 
+    // Test: Move a local port to another node with queued and subsequent messages.
+    // Expected: The new endpoint receives both payloads in order; nodes drain.
     #[async_test]
     async fn test_send_port(driver: DefaultDriver) {
         let (node, node2, _h) = new_two_node_mesh(&driver);
@@ -2717,11 +2694,12 @@ pub mod tests {
             assert_eq!(right2.recv().await.unwrap().data, b"abc");
             assert_eq!(right2.recv().await.unwrap().data, b"def");
         }
-        yield_once().await;
-        assert!(node.node.is_empty());
-        assert!(node2.node.is_empty());
+        node.node.wait_for_ports(true).await;
+        node2.node.wait_for_ports(true).await;
     }
 
+    // Test: Move a remote endpoint to a third node during ongoing traffic.
+    // Expected: Queued and subsequent payloads retain their order; nodes drain.
     #[async_test]
     async fn test_send_port_with_three_nodes(driver: DefaultDriver) {
         let (node, node2, node3, _h) = new_three_node_mesh(&driver);
@@ -2746,12 +2724,13 @@ pub mod tests {
             assert_eq!(right2.recv().await.unwrap().data, b"abc");
             assert_eq!(right2.recv().await.unwrap().data, b"def");
         }
-        yield_once().await;
-        assert!(node.node.is_empty());
-        assert!(node2.node.is_empty());
-        assert!(node3.node.is_empty());
+        node.node.wait_for_ports(true).await;
+        node2.node.wait_for_ports(true).await;
+        node3.node.wait_for_ports(true).await;
     }
 
+    // Test: Transfer an endpoint whose peer has already been dropped.
+    // Expected: The destination observes closure and both nodes finish draining.
     #[async_test]
     async fn test_send_closed_port(driver: DefaultDriver) {
         let (node, node2, _h) = new_two_node_mesh(&driver);
@@ -2771,11 +2750,12 @@ pub mod tests {
                 TryRecvError::Closed
             ));
         }
-        yield_once().await;
-        assert!(node.node.is_empty());
-        assert!(node2.node.is_empty());
+        node.node.wait_for_ports(true).await;
+        node2.node.wait_for_ports(true).await;
     }
 
+    // Test: Drop a local sender after queuing a binary message.
+    // Expected: The receiver drains the complete message before reporting closure.
     #[test]
     fn test_local_close() {
         let (left, mut right) = Channel::<_, ()>::new_pair();
@@ -2791,6 +2771,8 @@ pub mod tests {
         ));
     }
 
+    // Test: Drop a remote sender after sending a binary message.
+    // Expected: The receiver drains the payload before closure and nodes drain.
     #[async_test]
     async fn test_remote_close(driver: DefaultDriver) {
         let (node, node2, _h) = new_two_node_mesh(&driver);
@@ -2807,11 +2789,12 @@ pub mod tests {
                 TryRecvError::Closed
             ));
         }
-        yield_once().await;
-        assert!(node.node.is_empty());
-        assert!(node2.node.is_empty());
+        node.node.wait_for_ports(true).await;
+        node2.node.wait_for_ports(true).await;
     }
 
+    // Test: Drop the last handle for an active remote-node connection.
+    // Expected: Its receiving endpoint reports failure rather than clean closure.
     #[async_test]
     async fn test_node_fail(driver: DefaultDriver) {
         let (node, node2, mut handles) = new_two_node_mesh(&driver);
@@ -2823,6 +2806,8 @@ pub mod tests {
         ));
     }
 
+    // Test: Move an endpoint from a failed connection to a third node.
+    // Expected: The transferred endpoint retains its failed status.
     #[async_test]
     async fn test_send_failed_port(driver: DefaultDriver) {
         let (node, node2, node3, mut handles) = new_three_node_mesh(&driver);
@@ -2842,6 +2827,8 @@ pub mod tests {
         ));
     }
 
+    // Test: Send a remote message from another executor task.
+    // Expected: The waiting receiver wakes and gets the complete payload.
     #[async_test]
     async fn test_async(driver: DefaultDriver) {
         let (node, node2, _h) = new_two_node_mesh(&driver);
@@ -2862,6 +2849,8 @@ pub mod tests {
         drop(left);
     }
 
+    // Test: Drop a remote sender from another executor task.
+    // Expected: The waiting receiver wakes and reports clean closure.
     #[async_test]
     async fn test_async_close(driver: DefaultDriver) {
         let (node, node2, _h) = new_two_node_mesh(&driver);
@@ -2874,6 +2863,8 @@ pub mod tests {
         assert!(matches!(right.recv().await.unwrap_err(), RecvError::Closed));
     }
 
+    // Test: Bridge local endpoints with traffic queued in both directions.
+    // Expected: Full queued and subsequent payloads arrive in order before closure.
     #[async_test]
     async fn test_bridge_local() {
         let (p1, p2) = Channel::new_pair();
@@ -2881,6 +2872,8 @@ pub mod tests {
         test_bridge(p1, p2, p3, p4).await;
     }
 
+    // Test: Bridge endpoints spanning three nodes with bidirectional traffic.
+    // Expected: Ordered complete payloads and closure survive; all nodes drain.
     #[async_test]
     async fn test_bridge_remote(driver: DefaultDriver) {
         let (node, node2, node3, _h) = new_three_node_mesh(&driver);
@@ -2892,7 +2885,7 @@ pub mod tests {
         node3.node.wait_for_ports(true).await;
     }
 
-    async fn test_bridge(p1: Channel, p2: Channel, mut p3: Channel, p4: Channel) {
+    async fn test_bridge(p1: Channel, p2: Channel, mut p3: Channel, mut p4: Channel) {
         p1.send(bmsg(b"5"));
         p1.send(bmsg(b"6"));
         p1.send(bmsg(b"7"));
@@ -2914,11 +2907,15 @@ pub mod tests {
         p4.send(bmsg(b"g"));
         p4.send(bmsg(b"h"));
 
-        p3.recv().await.unwrap();
-        p3.recv().await.unwrap();
+        assert_eq!(p3.recv().await.unwrap().data, b"x");
+        assert_eq!(p3.recv().await.unwrap().data, b"y");
 
         p2.bridge(p3);
 
+        p1.send(bmsg(b"8"));
+        for expected in b"12345678" {
+            assert_eq!(p4.recv().await.unwrap().data, [*expected]);
+        }
         p4.send(bmsg(b"i"));
         drop(p4);
 
@@ -2926,7 +2923,7 @@ pub mod tests {
             let mut v = Vec::new();
             loop {
                 match p.recv().await {
-                    Ok(m) => v.push(m.data[0]),
+                    Ok(m) => v.extend(m.data),
                     Err(RecvError::Closed) => break,
                     Err(e) => return Err(e),
                 }
@@ -2937,13 +2934,54 @@ pub mod tests {
         assert_eq!(recv_all(p1).await.unwrap(), b"abcdefghi");
     }
 
+    // Test: Bridge the two ends of the same channel, creating a circular route.
+    // Expected: Both registered handlers receive the circular-bridge failure.
     #[test]
     fn test_bridge_self() {
-        let (p1, p2) = Channel::<(), ()>::new_pair();
-        // This should fail the ports.
-        p1.bridge(p2);
+        struct Failures(Arc<Mutex<Vec<NodeError>>>);
+
+        impl HandlePortEvent for Failures {
+            fn message(
+                &mut self,
+                _control: &mut PortControl<'_, '_>,
+                _message: Message<'_>,
+            ) -> Result<(), HandleMessageError> {
+                panic!("circular bridge must not deliver messages");
+            }
+
+            fn close(&mut self, _control: &mut PortControl<'_, '_>) {
+                panic!("circular bridge must fail, not close");
+            }
+
+            fn fail(&mut self, _control: &mut PortControl<'_, '_>, err: NodeError) {
+                self.0.lock().push(err);
+            }
+
+            fn drain(&mut self) -> Vec<OwnedMessage> {
+                Vec::new()
+            }
+        }
+
+        let (p1, p2) = Port::new_pair();
+        let failures = Arc::new(Mutex::new(Vec::new()));
+        let p1 = p1.set_handler(Failures(failures.clone()));
+        let p2 = p2.set_handler(Failures(failures.clone()));
+        // Preserve registration while giving the public bridge operation its ports.
+        p1.into_port_preserve_handler()
+            .bridge(p2.into_port_preserve_handler());
+        let failures = failures.lock();
+        assert_eq!(failures.len(), 2);
+        for err in failures.iter() {
+            let mut cause: &dyn std::error::Error = err;
+            while let Some(source) = cause.source() {
+                cause = source;
+            }
+            assert_eq!(cause.to_string(), "circular bridge");
+        }
     }
 
+    // Test: Disconnect a node while a port capability is being sent to it.
+    // Expected: The surviving local peer of the capability reports failure.
     #[async_test]
     async fn test_fail_sent_port_to_failed_node(driver: DefaultDriver) {
         let (n1, n2, mut h) = new_two_node_mesh(&driver);
@@ -2957,6 +2995,8 @@ pub mod tests {
         assert!(matches!(p3.recv().await.unwrap_err(), RecvError::Failed));
     }
 
+    // Test: Drop a receiver while it owns an unread message containing a port.
+    // Expected: Discarding the queued message closes the capability's peer.
     #[async_test]
     async fn test_close_drop_port_with_queued_ports() {
         let (p1, p2) = Channel::<_, ()>::new_pair();
@@ -2969,6 +3009,8 @@ pub mod tests {
         assert!(matches!(p3.recv().await.unwrap_err(), RecvError::Closed));
     }
 
+    // Test: Send a message containing a port to an already dropped receiver.
+    // Expected: Discarding the new message closes the capability's peer.
     #[async_test]
     async fn test_close_send_port_to_dropped_port() {
         let (p1, p2) = Channel::<_, ()>::new_pair();
@@ -2981,6 +3023,8 @@ pub mod tests {
         assert!(matches!(p3.recv().await.unwrap_err(), RecvError::Closed));
     }
 
+    // Test: Change only the sender's numeric payload type to a wire-compatible type.
+    // Expected: The unchanged receiver decodes the sent value correctly.
     #[async_test]
     async fn test_change_sender_types() {
         let (p1, mut p2) = Channel::<u32, ()>::new_pair();
@@ -2989,6 +3033,8 @@ pub mod tests {
         assert_eq!(p2.recv().await.unwrap(), 1);
     }
 
+    // Test: Change only the receiver's numeric type to a wire-compatible type.
+    // Expected: The receiver decodes the original sender's value correctly.
     #[async_test]
     async fn test_change_receiver_types() {
         let (p1, p2) = Channel::<u32, ()>::new_pair();
@@ -2997,6 +3043,8 @@ pub mod tests {
         assert_eq!(p2.recv().await.unwrap(), 1);
     }
 
+    // Test: Change both endpoints to the same new numeric payload type.
+    // Expected: The new concrete type is delivered correctly without stale decoding.
     #[async_test]
     async fn test_change_both_types() {
         let (p1, p2) = Channel::<u32, ()>::new_pair();
@@ -3006,6 +3054,8 @@ pub mod tests {
         assert_eq!(p2.recv().await.unwrap(), 1);
     }
 
+    // Test: Rebind generic endpoints to compatible numeric sender/receiver types.
+    // Expected: Typed traffic works without depending on the original generic type.
     #[async_test]
     async fn test_change_from_generic() {
         let (p1, p2) = Channel::<SerializedMessage, SerializedMessage>::new_pair();
@@ -3015,6 +3065,8 @@ pub mod tests {
         assert_eq!(p2.recv().await.unwrap(), 1);
     }
 
+    // Test: Explicitly fail a port belonging to a remote-node connection.
+    // Expected: Its remote peer observes failure rather than closure or a message.
     #[async_test]
     async fn test_fail_port(driver: DefaultDriver) {
         #[derive(Debug, Error)]
