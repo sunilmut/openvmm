@@ -567,6 +567,8 @@ mod tests {
         }
     }
 
+    // Test: Generate a schema for derived messages with maps, nesting and oneofs.
+    // Expected: The complete schema preserves field types, numbers and imports.
     #[test]
     fn test() {
         let writer = BorrowedWriter(RefCell::new(Vec::<u8>::new()));

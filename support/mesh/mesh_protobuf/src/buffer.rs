@@ -188,6 +188,8 @@ mod tests {
     use alloc::vec;
     use test_with_tracing::test;
 
+    // Test: Append more bytes than the buffer's unwritten capacity.
+    // Expected: The bounded writer rejects the overflow with a panic.
     #[test]
     #[should_panic]
     fn test_append_vec_panic() {
@@ -197,6 +199,8 @@ mod tests {
         });
     }
 
+    // Test: Append empty and nonempty data after an existing vector prefix.
+    // Expected: Writes extend the prefix in order without committing empty data.
     #[test]
     fn test_append_vec() {
         let mut v = vec![1, 2, 3, 4];
@@ -213,6 +217,8 @@ mod tests {
         assert_eq!(&v, &[1, 2, 3, 4, 5, 6, 7]);
     }
 
+    // Test: Write to a slice-backed cursor in two successive calls.
+    // Expected: The second write starts at the updated position without overwrite.
     #[test]
     #[cfg(feature = "std")]
     fn test_cursor_multiple_writes() {
@@ -236,6 +242,8 @@ mod tests {
         assert_eq!(backing, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
+    // Test: Request an empty write from a cursor positioned beyond its slice.
+    // Expected: No data or cursor position changes, and no indexing panic occurs.
     #[test]
     #[cfg(feature = "std")]
     fn test_cursor_position_beyond_slice() {

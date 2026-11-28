@@ -995,6 +995,8 @@ mod tests {
         );
     }
 
+    // Test: Map signed integer boundaries through protobuf zigzag encoding.
+    // Expected: Encoded values and inverse decoding match the specified pairs.
     #[test]
     fn test_zigzag() {
         let cases: &[(i64, u64)] = &[
@@ -1013,6 +1015,8 @@ mod tests {
         }
     }
 
+    // Test: Encode and decode canonical varints, including the largest u64.
+    // Expected: Exact bytes, encoded lengths and complete input consumption agree.
     #[test]
     fn test_varint() {
         let cases: &[(u64, &[u8])] = &[
@@ -1035,6 +1039,9 @@ mod tests {
         }
     }
 
+    // Test: Size and decode varints around every bit boundary.
+    // Expected: Seven-bit wire groups give independent expected lengths and
+    //       decoding preserves the complete value without leftover bytes.
     #[test]
     fn varint_size_bit_boundaries() {
         assert_eq!(varint_size(0), 1);
@@ -1043,11 +1050,20 @@ mod tests {
             for value in [value - 1, value, value.saturating_add(1), u64::MAX] {
                 let mut encoded = Vec::with_capacity(10);
                 buffer::write_with(&mut encoded, |mut buf| write_varint(&mut buf, value));
-                assert_eq!(varint_size(value), encoded.len(), "{value:#x}");
+                let expected = (1..=9)
+                    .find(|bytes| u128::from(value) < (1u128 << (bytes * 7)))
+                    .unwrap_or(10);
+                assert_eq!(varint_size(value), expected, "{value:#x}");
+                assert_eq!(encoded.len(), expected, "{value:#x}");
+                let mut remaining = encoded.as_slice();
+                assert_eq!(read_varint(&mut remaining).unwrap(), value);
+                assert!(remaining.is_empty());
             }
         }
     }
 
+    // Test: Decode overlong zero, truncated varints and overflowing tenth bytes.
+    // Expected: Supported overlong zero consumes fully; invalid inputs fail precisely.
     #[test]
     fn test_varint_bounds() {
         let mut overlong_zero = &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00][..];
@@ -1068,6 +1084,8 @@ mod tests {
         }
     }
 
+    // Test: Read truncated primitive fields and an unknown wire-type tag.
+    // Expected: Each input produces the appropriate typed boundary error.
     #[test]
     fn test_truncated_fields() {
         let cases: &[(&[u8], DecodeError)] = &[
@@ -1087,6 +1105,8 @@ mod tests {
         }
     }
 
+    // Test: Decode nested resource counts exceeding the supplied resources.
+    // Expected: Invalid ranges fail without consuming either original resource.
     #[test]
     fn test_resource_count_bounds() {
         for count in [3, 1u64 << 32, (1u64 << 32) + 1] {
@@ -1110,6 +1130,8 @@ mod tests {
         }
     }
 
+    // Test: Consume nested resources and then read a parent resource.
+    // Expected: Child exhaustion cannot consume the parent's resource or reuse one.
     #[test]
     fn test_nested_resource_isolation() {
         let mut resources = [Some(10u32), Some(20u32)];
@@ -1129,6 +1151,8 @@ mod tests {
         assert_decode_error(state.resource(1), &DecodeError::MissingResource);
     }
 
+    // Test: Read complete and truncated packed fixed-width and signed-varint values.
+    // Expected: Complete values retain byte order; truncated elements fail.
     #[test]
     fn test_packed_field_boundaries() {
         let mut packed = PackedReader {
@@ -1157,6 +1181,8 @@ mod tests {
         assert_decode_error(packed.svarint(), &DecodeError::EofVarInt);
     }
 
+    // Test: Encode and consume distinct resources across parent and nested fields.
+    // Expected: Wire tags, resource order and one-time consumption remain exact.
     #[test]
     fn test_resource() {
         let mut state = SizeState::new();
@@ -1169,39 +1195,34 @@ mod tests {
             sizer.field(1).resource();
         });
         let size = state.message_sizes.remove(0);
-        assert_eq!(size.num_resources, 5);
 
         let mut data = Vec::with_capacity(size.len);
         let mut resources = Vec::with_capacity(size.num_resources as usize);
         buffer::write_with(&mut data, |buf| {
             let mut state = EncodeState::new(buf, &state.message_sizes, &mut resources);
             let mut writer = MessageWriter { state: &mut state };
-            writer.field(1).resource(());
-            writer.field(2).resource(());
+            writer.field(1).resource(11u32);
+            writer.field(2).resource(22);
             writer.field(3).message(|mut writer| {
-                writer.field(1).resource(());
-                writer.field(1).resource(());
-                writer.field(1).resource(());
+                writer.field(1).resource(33);
+                writer.field(1).resource(44);
+                writer.field(1).resource(55);
             });
         });
+        assert_eq!(data, [0x0f, 0x17, 0x1e, 3, 3, 0x0f, 0x0f, 0x0f]);
+        assert_eq!(resources, [11, 22, 33, 44, 55]);
 
         let mut resources: Vec<_> = resources.into_iter().map(Some).collect();
-        let state = DecodeState(RefCell::new(DecodeInner {
-            resources: &mut resources,
-        }));
-        let reader = MessageReader {
-            data: &data,
-            state: &state,
-            resources: 0..5,
-        };
+        let state = DecodeState::new(&mut resources);
+        let reader = MessageReader::new(&data, &state);
 
         let mut it = reader.into_iter();
         let (n, r) = it.next().unwrap().unwrap();
         assert_eq!(n, 1);
-        r.resource().unwrap();
+        assert_eq!(r.resource().unwrap(), 11);
         let (n, r) = it.next().unwrap().unwrap();
         assert_eq!(n, 2);
-        r.resource().unwrap();
+        assert_eq!(r.resource().unwrap(), 22);
         let (n, r) = it.next().unwrap().unwrap();
         assert_eq!(n, 3);
         let message = r.message().unwrap();
@@ -1210,13 +1231,16 @@ mod tests {
         let mut it = message.into_iter();
         let (n, r) = it.next().unwrap().unwrap();
         assert_eq!(n, 1);
-        r.resource().unwrap();
+        assert_eq!(r.resource().unwrap(), 33);
         let (n, r) = it.next().unwrap().unwrap();
         assert_eq!(n, 1);
-        r.resource().unwrap();
+        assert_eq!(r.resource().unwrap(), 44);
         let (n, r) = it.next().unwrap().unwrap();
         assert_eq!(n, 1);
-        r.resource().unwrap();
+        assert_eq!(r.resource().unwrap(), 55);
         assert!(it.next().is_none());
+        for index in 0..5 {
+            assert_decode_error(state.resource(index), &DecodeError::MissingResource);
+        }
     }
 }

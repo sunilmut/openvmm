@@ -158,10 +158,14 @@ mod tests {
     use crate::message::ProtobufAny;
     use crate::message::ProtobufMessage;
     use crate::tests::as_expect_str;
+    use alloc::string::String;
+    use alloc::string::ToString;
+    use core::error::Error as _;
     use expect_test::expect;
-    use std::println;
     use test_with_tracing::test;
 
+    // Test: Encode and parse an opaque message containing one scalar.
+    // Expected: Opaque wrapping preserves its value and exact wire format.
     #[test]
     fn test_message() {
         let message = (5u32,);
@@ -182,6 +186,9 @@ mod tests {
         assert_eq!(actual, encode(message));
     }
 
+    // Test: Wrap a named message in Any and request matching and unrelated types.
+    // Expected: Public wire output carries the canonical URL and original payload;
+    //       mismatched parsing reports both type names.
     #[test]
     fn test_any() {
         #[derive(Protobuf, PartialEq, Eq, Copy, Clone, Debug)]
@@ -201,11 +208,18 @@ mod tests {
         let msg = Message { x: 5 };
         let any = ProtobufAny::new(msg);
 
-        assert_eq!(any.type_url, "type.googleapis.com/test.Message");
+        let (url, payload): (String, ProtobufMessage) =
+            crate::decode(&encode(any.clone())).unwrap();
+        assert_eq!(url, "type.googleapis.com/test.Message");
+        assert_eq!(payload.parse::<Message>().unwrap(), msg);
         assert!(any.is_message::<Message>());
         assert!(!any.is_message::<Other>());
         assert_eq!(any.parse::<Message>().unwrap(), msg);
-        println!("{:?}", any.parse::<Other>().unwrap_err());
+        let error = any.parse::<Other>().unwrap_err();
+        assert_eq!(
+            error.source().unwrap().to_string(),
+            "protobuf type mismatch, expected type.googleapis.com/test.Other, got type.googleapis.com/test.Message"
+        );
     }
 
     // Test: Merge an opaque message and decode it as its wire-compatible schema.
@@ -213,13 +227,10 @@ mod tests {
     #[test]
     fn opaque_messages_retain_fields_when_merged() {
         let original = ProtobufMessage::new((7u32,));
-        let additional = encode(ProtobufMessage::new((
-            0u32,
-            alloc::string::String::from("label"),
-        )));
+        let additional = encode(ProtobufMessage::new((0u32, String::from("label"))));
         let merged = crate::merge(original, &additional).unwrap();
         assert_eq!(
-            merged.parse::<(u32, alloc::string::String)>().unwrap(),
+            merged.parse::<(u32, String)>().unwrap(),
             (7, "label".into())
         );
     }

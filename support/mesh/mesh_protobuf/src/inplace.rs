@@ -266,6 +266,8 @@ mod tests {
     use alloc::sync::Arc;
     use test_with_tracing::test;
 
+    // Test: Take a value constructed by the initialized in-place macro.
+    // Expected: Ownership transfers once and leaves the slot empty.
     #[test]
     fn test_inplace_some() {
         let v = "test".to_string();
@@ -275,6 +277,8 @@ mod tests {
         assert!(v.take().is_none());
     }
 
+    // Test: Initialize storage constructed by the typed empty in-place macro.
+    // Expected: The supplied value can be taken intact.
     #[test]
     fn test_inplace_none() {
         inplace_none!(v: String);
@@ -282,6 +286,8 @@ mod tests {
         assert_eq!(&v.take().unwrap(), "test");
     }
 
+    // Test: Construct in-place storage from an existing Some value.
+    // Expected: The macro preserves the owned value for its first take.
     #[test]
     fn test_inplace() {
         let v = Some("test".to_string());
@@ -289,14 +295,24 @@ mod tests {
         assert_eq!(&v.take().unwrap(), "test");
     }
 
+    // Test: Replace an owned value in initialized storage and then take it.
+    // Expected: Replacement releases the old ownership and transfers the new one.
     #[test]
     fn test_inplace_replace() {
-        let v = "old".to_string();
+        let old = Arc::new("old".to_string());
+        let new = Arc::new("new".to_string());
+        let v = old.clone();
         inplace_some!(v);
-        v.set("new".to_string());
-        assert_eq!(&v.take().unwrap(), "new");
+        v.set(new.clone());
+        assert_eq!(Arc::strong_count(&old), 1);
+        let taken = v.take().unwrap();
+        assert!(Arc::ptr_eq(&taken, &new));
+        drop(taken);
+        assert_eq!(Arc::strong_count(&new), 1);
     }
 
+    // Test: Update a uniquely owned Arc containing a Box in place.
+    // Expected: The new content retains both existing allocation identities.
     #[test]
     fn test_updates() {
         let v = Arc::new(Box::new(1234));
@@ -314,6 +330,8 @@ mod tests {
         assert_eq!(core::ptr::from_ref(&**v), box_ptr);
     }
 
+    // Test: Take shared ownership once and drop the emptied slot.
+    // Expected: No second take or slot destruction releases the transferred value.
     #[test]
     fn test_take_transfers_ownership_once() {
         let value = Arc::new(1234);
@@ -327,6 +345,8 @@ mod tests {
         assert_eq!(Arc::strong_count(&value), 1);
     }
 
+    // Test: Update boxed and reference-counted storage that starts uninitialized.
+    // Expected: Both callbacks receive empty storage and construct their values.
     #[test]
     fn test_updates_uninitialized() {
         inplace_none!(boxed: Box<u32>);
@@ -344,6 +364,8 @@ mod tests {
         assert_eq!(*arced.take().unwrap(), 5678);
     }
 
+    // Test: Clear initialized values from boxed and reference-counted updates.
+    // Expected: Both slots become empty and release the inner ownership.
     #[test]
     fn test_updates_clear_values() {
         let value = Arc::new(1234);
@@ -360,6 +382,8 @@ mod tests {
         assert_eq!(Arc::strong_count(&value), 1);
     }
 
+    // Test: Update a reference-counted value while an original alias stays live.
+    // Expected: Copy-on-write preserves the alias and separates the updated value.
     #[test]
     fn test_update_arc_preserves_shared_value() {
         let original = Arc::new(1234);

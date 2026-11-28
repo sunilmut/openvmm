@@ -69,6 +69,7 @@ mod tests {
     use crate::tests::as_expect_str;
     use core::mem::offset_of;
     use expect_test::expect;
+    use test_with_tracing::test;
 
     #[derive(PartialEq, Eq, Debug)]
     struct Foo<'a> {
@@ -103,6 +104,8 @@ mod tests {
         type Encoding = TableEncoder;
     }
 
+    // Test: Encode and decode a message using explicit field metadata tables.
+    // Expected: Field codecs preserve complete wire bytes and borrowed content.
     #[test]
     fn test_derived_macro() {
         let data = crate::encode(Foo {

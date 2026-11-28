@@ -138,6 +138,8 @@ impl<R> MessageDecode<'_, Duration, R> for DurationEncoding {
 mod tests {
     use test_with_tracing::test;
 
+    // Test: Convert system times before and after the epoch to timestamps and back.
+    // Expected: Conversion preserves the instant and normalizes negative fractions.
     #[cfg(feature = "std")]
     #[test]
     fn test_timestamp_system_time() {

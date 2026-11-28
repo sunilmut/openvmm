@@ -715,6 +715,8 @@ mod tests {
         assert_roundtrips((t,), expect);
     }
 
+    // Test: Encode and decode scalar, optional, sequence, map and address fields.
+    // Expected: Values round-trip with the specified wire bytes and defaults.
     #[test]
     fn test_field() {
         assert_field_roundtrips(
@@ -854,6 +856,8 @@ mod tests {
         );
     }
 
+    // Test: Encode nonzero fields and decode an explicitly encoded zero.
+    // Expected: Valid fields retain primitive wire compatibility; zero is rejected.
     #[test]
     fn test_nonzero() {
         assert_field_roundtrips(
@@ -873,6 +877,8 @@ mod tests {
         )
     }
 
+    // Test: Serialize a derived struct containing scalar and optional fields.
+    // Expected: Field numbers, values and omission match the expected wire bytes.
     #[test]
     fn test_derive_struct() {
         #[derive(Protobuf, Debug, Clone, PartialEq, Eq)]
@@ -899,6 +905,8 @@ mod tests {
         );
     }
 
+    // Test: Serialize a derived struct with a present nested optional message.
+    // Expected: Both message levels preserve their field values and wire bytes.
     #[test]
     fn test_nested_derive_struct() {
         #[derive(Protobuf, Debug, Clone, PartialEq, Eq)]
@@ -932,6 +940,8 @@ mod tests {
         );
     }
 
+    // Test: Serialize empty, tuple and named variants of a derived enum.
+    // Expected: Variant tags and payloads distinguish every case on the wire.
     #[test]
     fn test_derive_enum() {
         #[derive(Protobuf, Debug, Clone, PartialEq, Eq)]
@@ -967,6 +977,8 @@ mod tests {
         );
     }
 
+    // Test: Round-trip packed, unpacked, byte and nested vector fields.
+    // Expected: Values and nesting match the complete expected wire representation.
     #[test]
     fn test_vec() {
         #[derive(Protobuf, Debug, Clone, PartialEq, Eq)]
@@ -1007,6 +1019,8 @@ mod tests {
         );
     }
 
+    // Test: Round-trip vectors of zero-sized elements at several lengths.
+    // Expected: Empty element payloads still preserve the number of elements.
     #[test]
     fn test_vec_zero_sized_elements() {
         for len in [0, 1, 5] {
@@ -1016,6 +1030,8 @@ mod tests {
         }
     }
 
+    // Test: Decode interleaved packed/unpacked repetitions and unknown fields.
+    // Expected: Sequences append in order, the last scalar wins, and unknowns skip.
     #[test]
     fn test_mixed_repeated_fields_and_unknown_fields() {
         #[derive(Protobuf, Debug, PartialEq, Eq)]
@@ -1036,6 +1052,8 @@ mod tests {
         );
     }
 
+    // Test: Round-trip floating-point bit patterns and signed fixed-width values.
+    // Expected: NaNs, signed zero and boundaries retain bits with canonical bytes.
     #[test]
     fn test_fixed_numeric_encodings_preserve_bits() {
         #[derive(Protobuf, Clone)]
@@ -1110,6 +1128,8 @@ mod tests {
         );
     }
 
+    // Test: Decode arrays and fixed-size scalar fields with missing or wrong sizes.
+    // Expected: Each invalid size reports the appropriate typed decode error.
     #[test]
     fn test_fixed_size_field_validation() {
         for values in [vec![1u32], vec![1u32, 2, 3]] {
@@ -1158,6 +1178,8 @@ mod tests {
         }
     }
 
+    // Test: Decode Unicode scalars and narrow integers at their domain boundaries.
+    // Expected: Valid characters survive, invalid scalars fail, and narrowing wraps.
     #[test]
     fn test_character_and_integer_width_boundaries() {
         let chars = vec!['\0', 'a', '\u{1f600}', char::MAX];
@@ -1181,6 +1203,8 @@ mod tests {
         );
     }
 
+    // Test: Encode a domain value through its wire adapter and merge an update.
+    // Expected: Adaptation preserves wire compatibility and absent merged fields.
     #[test]
     fn test_custom_encoding_round_trip_and_merge() {
         #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1219,6 +1243,8 @@ mod tests {
         );
     }
 
+    // Test: Decode zero-copy fields from unaligned, empty and wrongly sized data.
+    // Expected: Bytes survive alignment differences, defaults zero, and bad sizes fail.
     #[test]
     fn test_zero_copy_encoding_size_and_alignment() {
         #[repr(C)]
@@ -1269,6 +1295,8 @@ mod tests {
         }
     }
 
+    // Test: Merge a shared message and round-trip shared and boxed fields.
+    // Expected: Updates append fields without changing the live original alias.
     #[test]
     fn test_shared_message_encoding_and_merge() {
         #[derive(Protobuf, Clone, Debug, PartialEq, Eq)]
@@ -1345,6 +1373,8 @@ mod tests {
         }
     }
 
+    // Test: Decode unpacked vectors and nested vectors with packing-capable codecs.
+    // Expected: Compatible encodings preserve element values and nesting.
     #[test]
     fn test_vec_alt() {
         {
@@ -1388,6 +1418,8 @@ mod tests {
         }
     }
 
+    // Test: Merge scalar, optional, repeated and same-variant message fields.
+    // Expected: Scalars replace, sequences append, and absent optionals are retained.
     #[test]
     fn test_merge() {
         #[derive(Protobuf, Debug, Clone, PartialEq, Eq)]
@@ -1490,6 +1522,8 @@ mod tests {
         assert_eq!(foo, foo3);
     }
 
+    // Test: Encode negative integers with signed and ordinary varint codecs.
+    // Expected: Zigzag and sign-extended forms have distinct canonical wire bytes.
     #[test]
     fn test_alternate_encoding() {
         #[derive(Protobuf, Debug, Clone, PartialEq, Eq)]
@@ -1517,6 +1551,8 @@ mod tests {
         );
     }
 
+    // Test: Round-trip fixed-size arrays of scalars and nested collections.
+    // Expected: Array elements and boundaries match the specified wire bytes.
     #[test]
     fn test_array() {
         assert_field_roundtrips(
@@ -1563,6 +1599,8 @@ mod tests {
         );
     }
 
+    // Test: Carry a nested derived message through an opaque serialized value.
+    // Expected: Opaque forwarding preserves both outer and inner field values.
     #[test]
     fn test_nested() {
         #[derive(Protobuf, Debug, Clone, PartialEq, Eq)]
@@ -1595,6 +1633,8 @@ mod tests {
         assert_eq!(t, t3);
     }
 
+    // Test: Decode a derived message with a borrowed string lifetime.
+    // Expected: The borrowed field retains the encoded string content.
     #[test]
     fn test_lifetime() {
         #[derive(Protobuf)]
@@ -1606,6 +1646,8 @@ mod tests {
         assert_eq!(foo.0, &s);
     }
 
+    // Test: Decode a generic derived message instantiated with a borrowed string.
+    // Expected: Generic lifetime handling preserves the encoded string.
     #[test]
     fn test_generic_lifetime() {
         #[derive(Protobuf)]
@@ -1617,6 +1659,8 @@ mod tests {
         assert_eq!(foo.0, &s);
     }
 
+    // Test: Attempt to decode the uninhabited Infallible type.
+    // Expected: Decoding reports Unexpected rather than constructing a value.
     #[test]
     fn test_infallible() {
         assert!(matches!(
@@ -1629,6 +1673,8 @@ mod tests {
         ));
     }
 
+    // Test: Encode and decode several nested default-valued messages.
+    // Expected: Empty encoding reconstructs the full nested default value.
     #[test]
     fn test_empty_message() {
         #[derive(Protobuf)]
@@ -1637,9 +1683,12 @@ mod tests {
         let v = encode(((Message(0),),));
         assert_eq!(&v, b"");
 
-        let _message: ((Message,),) = decode(&[]).unwrap();
+        let ((Message(value),),): ((Message,),) = decode(&[]).unwrap();
+        assert_eq!(value, 0);
     }
 
+    // Test: Encode a nondefault field alongside a default nested message.
+    // Expected: Default nesting is omitted without losing the nondefault value.
     #[test]
     fn test_nested_empty_message() {
         #[derive(Debug, Clone, PartialEq, Eq, Protobuf)]
@@ -1659,6 +1708,8 @@ mod tests {
         );
     }
 
+    // Test: Encode transparent tuple, named and generic message wrappers.
+    // Expected: Each wrapper retains its inner message's exact wire format.
     #[test]
     fn test_transparent_message() {
         #[derive(Protobuf, Copy, Clone, PartialEq, Eq, Debug)]
@@ -1689,6 +1740,8 @@ mod tests {
         assert_eq!(encode(GenericStruct(Inner(5))), encode(Inner(5)));
     }
 
+    // Test: Use a transparent scalar wrapper as a field of an outer message.
+    // Expected: The outer field has the unwrapped scalar's wire representation.
     #[test]
     fn test_transparent_field() {
         #[derive(Protobuf, Copy, Clone, PartialEq, Eq, Debug)]
@@ -1707,6 +1760,8 @@ mod tests {
         assert_eq!(encode(Outer(Inner(5))), encode(Outer(5u32)));
     }
 
+    // Test: Encode transparent scalar, optional and sequence enum variants.
+    // Expected: Variant tags remain present even for zero, absent and empty values.
     #[test]
     fn test_transparent_enum() {
         #[derive(Protobuf, Clone, PartialEq, Eq, Debug)]
@@ -1760,6 +1815,8 @@ mod tests {
         );
     }
 
+    // Test: Decode repeated strings and bytes through owning and borrowing codecs.
+    // Expected: Strings replace, bytes append, and ownership follows codec contracts.
     #[test]
     fn test_cow() {
         #[derive(Protobuf)]
@@ -1817,6 +1874,8 @@ mod tests {
         }
     }
 
+    // Test: Encode duration boundaries and reject a negative second count.
+    // Expected: Valid durations have canonical bytes and negative duration fails.
     #[test]
     fn test_duration() {
         assert_roundtrips(
@@ -1851,16 +1910,17 @@ mod tests {
         );
     }
 
+    // Test: Decode a message whose second field has the wrong wire type.
+    // Expected: Decoding fails after the first field with the byte-array error.
     #[test]
     fn test_failure_recovery() {
         let m = encode(("foo", 2, 3));
-        decode::<(String, String, String)>(&m).unwrap_err();
+        let error = decode::<(String, String, String)>(&m).unwrap_err();
+        assert_eq!(error.source().unwrap().to_string(), "expected a byte array");
     }
 
-    /// Test that decoding a transparent enum where the wire data contains two
-    /// different variant fields (protobuf "last one wins") does not corrupt
-    /// memory. The second variant decode must properly drop the first variant
-    /// before overwriting its storage.
+    // Test: Decode a number followed by a string in a transparent oneof.
+    // Expected: The last variant wins while the old variant is safely released.
     #[test]
     fn test_transparent_enum_variant_switch() {
         #[derive(Protobuf, Clone, PartialEq, Eq, Debug)]

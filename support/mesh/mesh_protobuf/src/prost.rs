@@ -46,6 +46,7 @@ impl<T: prost::Message + Default, R> MessageDecode<'_, T, R> for ProstMessage {
 mod tests {
     use crate::SerializedMessage;
     use alloc::string::ToString;
+    use test_with_tracing::test;
 
     #[expect(clippy::allow_attributes)]
     mod items {
@@ -57,6 +58,8 @@ mod tests {
         include!(concat!(env!("OUT_DIR"), "/foo.rs"));
     }
 
+    // Test: Transfer a generated Prost message through Mesh serialization.
+    // Expected: Text, defaults and the selected oneof payload survive conversion.
     #[test]
     fn prost() {
         let foo = items::Foo {
