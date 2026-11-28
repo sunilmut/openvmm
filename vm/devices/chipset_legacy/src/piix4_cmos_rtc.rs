@@ -203,6 +203,7 @@ mod save_restore {
 mod tests {
     use super::*;
     use local_clock::MockLocalClock;
+    use test_with_tracing::test;
 
     fn new_test_rtc() -> (
         pal_async::DefaultPool,
@@ -296,11 +297,13 @@ mod tests {
             .unwrap();
     }
 
+    // Test: Write ordinary CMOS RAM through each alias, then fill every offset.
+    // Expected: Both aliases share bytes without aliasing distinct RAM offsets;
+    //       the RTC century register is excluded from the RAM contract.
     #[test]
     fn test_writeable() {
-        let (_, _, mut rtc) = new_test_rtc();
+        let (_pool, _time, mut rtc) = new_test_rtc();
 
-        //Rigisters 0x0f..0x7f should be writable, skip 0x32 which is century field of RTC
         for i in 0x0F..=0x7F {
             if i == 0x32 {
                 continue;
@@ -319,13 +322,22 @@ mod tests {
             assert_eq!(get_cmos_data(&mut rtc, i), 0);
             assert_eq!(get_cmos_data_shadow(&mut rtc, i), 0);
         }
+        for i in (0x0f..=0x7f).filter(|i| *i != 0x32) {
+            set_cmos_data_shadow(&mut rtc, i, i ^ 0xa5);
+        }
+        for i in (0x0f..=0x7f).filter(|i| *i != 0x32) {
+            assert_eq!(get_cmos_data(&mut rtc, i), i ^ 0xa5);
+            assert_eq!(get_cmos_data_shadow(&mut rtc, i), i ^ 0xa5);
+        }
     }
 
+    // Test: Write extended CMOS through each alias, then fill every bank offset.
+    // Expected: Both aliases share writable bytes, and distinct extended RAM
+    //       offsets retain independent values after all writes complete.
     #[test]
     fn test_writeable_ext() {
-        let (_, _, mut rtc) = new_test_rtc();
+        let (_pool, _time, mut rtc) = new_test_rtc();
 
-        //Rigisters 0x80..0xff should be writable through extended gate 0x72/0x73
         for i in 0..=0x7F {
             set_ext_cmos_data(&mut rtc, i, 0xFF);
             assert_eq!(get_ext_cmos_data(&mut rtc, i), 0xFF);
@@ -339,6 +351,13 @@ mod tests {
             set_ext_cmos_data_shadow(&mut rtc, i, 0);
             assert_eq!(get_ext_cmos_data(&mut rtc, i), 0);
             assert_eq!(get_ext_cmos_data_shadow(&mut rtc, i), 0);
+        }
+        for i in 0..=0x7f {
+            set_ext_cmos_data_shadow(&mut rtc, i, i ^ 0x5a);
+        }
+        for i in 0..=0x7f {
+            assert_eq!(get_ext_cmos_data(&mut rtc, i), i ^ 0x5a);
+            assert_eq!(get_ext_cmos_data_shadow(&mut rtc, i), i ^ 0x5a);
         }
     }
 

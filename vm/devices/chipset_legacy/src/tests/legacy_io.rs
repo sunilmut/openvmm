@@ -42,9 +42,22 @@ fn pci_reset_port_does_not_intercept_wide_pci_address_accesses() {
     pal_async::local::block_on(device.reset());
     device.io_read(0xcf8, &mut value).unwrap();
     assert_eq!(value, [0; 4]);
+    let restored_resets = Arc::new(AtomicUsize::new(0));
+    let recorded = restored_resets.clone();
+    let mut restored_ports = PioRegistrar::default();
+    let mut device = Piix4PciBus::new(
+        &mut restored_ports,
+        Box::new(move || {
+            recorded.fetch_add(1, Ordering::SeqCst);
+        }),
+    );
     device.restore(saved).unwrap();
     device.io_read(0xcf8, &mut value).unwrap();
     assert_eq!(value, address);
+    assert_eq!(restored_resets.load(Ordering::SeqCst), 0);
+    write8(&mut device, 0xcf9, 6);
+    assert_eq!(restored_resets.load(Ordering::SeqCst), 1);
+    assert_eq!(resets.load(Ordering::SeqCst), 3);
 }
 
 // Test: Probe and try to program the deliberately hidden UHCI stub.
@@ -69,6 +82,7 @@ fn usb_stub_remains_hidden_after_configuration_writes_and_restore() {
     }
     let saved = device.save().unwrap();
     pal_async::local::block_on(device.reset());
+    let mut device = Piix4UsbUhciStub::new();
     device.restore(saved).unwrap();
     for (offset, expected) in registers {
         assert_eq!(pci_read(&mut device, offset), expected);

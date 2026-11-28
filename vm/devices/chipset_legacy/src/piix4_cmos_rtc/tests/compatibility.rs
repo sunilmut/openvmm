@@ -25,6 +25,7 @@ fn extended_cmos_restore_preserves_address_latch_and_mirrored_data() {
     write8(&mut rtc, 0x73, 0x5a);
     write8(&mut rtc, 0x76, 3);
     pool.run_until(rtc.reset());
+    let (_restored_pool, _restored_time, mut rtc) = new_test_rtc();
     rtc.restore(saved).unwrap();
     assert_eq!(read8(&mut rtc, 0x76), 0x67);
     assert_eq!(read8(&mut rtc, 0x77), 0xa5);

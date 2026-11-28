@@ -730,6 +730,7 @@ mod tests {
 
         original.update_config_state(0xaa);
         original.update_config_state(0x87);
+        let mut restored = SioController::default();
         restored.restore(original.save().unwrap()).unwrap();
         restored.update_config_state(0x87);
         assert_eq!(read(&mut restored, 0x61), 0x55);

@@ -73,8 +73,10 @@ fn host_pam_registers_apply_each_regions_memory_protection() {
     assert!(mappings.0.lock().is_empty());
 }
 
-// Test: Modify host scratch, DRAM, and locked SMRAM registers, then save and restore.
-// Expected: Byte enables and SMRAM restrictions hold; restore reapplies VGA/PAM mappings.
+// Test: Modify host scratch, DRAM, PAM, and locked SMRAM registers, then reset
+//       the source and restore its checkpoint into a fresh destination.
+// Expected: Byte enables and SMRAM restrictions hold; restore reapplies every
+//       VGA/PAM mapping and saved register to the destination's mapping peer.
 #[test]
 fn host_register_masks_locking_and_restored_mappings_preserve_guest_state() {
     let mappings = Mappings::default();
@@ -104,18 +106,39 @@ fn host_register_masks_locking_and_restored_mappings_preserve_guest_state() {
         pci_write(&mut device, offset, u32::MAX);
         assert_eq!(pci_read(&mut device, offset), 0);
     }
+    pci_write(&mut device, 0x58, 0x11111003);
+    pci_write(&mut device, 0x5c, 0x11111111);
     let saved = device.save().unwrap();
     pal_async::local::block_on(device.reset());
     assert_eq!(pci_read(&mut device, 0xd0), 0);
     assert_eq!(pci_read(&mut device, 0x70), 0x38020000);
-    mappings.0.lock().clear();
+    let original_mappings = mappings.clone();
+    let source_events = original_mappings.0.lock().clone();
+    let mappings = Mappings::default();
+    let mut device = HostPciBridge::new(Box::new(mappings.clone()), true);
+    assert!(mappings.0.lock().is_empty());
     device.restore(saved).unwrap();
-    assert_eq!(pci_read(&mut device, 0xd0), 0xaa11ccdd);
+    for offset in [0x60, 0x64, 0xd0, 0xd4] {
+        assert_eq!(pci_read(&mut device, offset), 0xaa11ccdd);
+    }
+    assert_eq!(pci_read(&mut device, 0x58), 0x11111003);
+    assert_eq!(pci_read(&mut device, 0x5c), 0x11111111);
     assert_eq!(pci_read(&mut device, 0x70), 0x383a0000);
-    assert_eq!(
-        mappings.0.lock()[0],
-        (MemoryRange::new(0xa0000..0xc0000), GpaState::Mmio)
-    );
+    let expected: Vec<_> = std::iter::once((MemoryRange::new(0xa0000..0xc0000), GpaState::Mmio))
+        .chain(std::iter::once((
+            MemoryRange::new(0xf0000..0x100000),
+            GpaState::WriteProtected,
+        )))
+        .chain((0..12).map(|index| {
+            let start = 0xc0000 + index * 0x4000;
+            (
+                MemoryRange::new(start..start + 0x4000),
+                GpaState::WriteProtected,
+            )
+        }))
+        .collect();
+    assert_eq!(*mappings.0.lock(), expected);
+    assert_eq!(*original_mappings.0.lock(), source_events);
     let mut value = 0;
     assert!(matches!(
         device.pci_cfg_read(
@@ -217,9 +240,17 @@ fn isa_configuration_masks_and_restore_preserve_external_a20_state() {
     let saved = device.save().unwrap();
     pal_async::local::block_on(device.reset());
     assert_eq!(read8(&mut device, 0x92), 0);
+    let original_a20 = a20.clone();
+    let a20 = Arc::new(Mutex::new(Vec::new()));
+    let recorded = a20.clone();
+    let mut device = PciIsaBridge::new(
+        Box::new(|| panic!("unexpected reset")),
+        Box::new(move |enabled| recorded.lock().push(enabled)),
+    );
     device.restore(saved).unwrap();
     assert_eq!(read8(&mut device, 0x92), 2);
-    assert_eq!(a20.lock().last(), Some(&false));
+    assert_eq!(*a20.lock(), [false]);
+    assert_eq!(*original_a20.lock(), [false]);
     assert_eq!(pci_read(&mut device, 0xa0), 0x00ff001f);
     let mut value = 0;
     assert!(matches!(

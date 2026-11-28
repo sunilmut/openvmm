@@ -4,11 +4,8 @@
 use super::*;
 use crate::winbond83977_sio::MaybeStubFloppyDiskController;
 use crate::winbond83977_sio::Winbond83977FloppySioDevice;
-use chipset_device::poll_device::PollDevice;
 use floppy::DriveRibbon;
 use guestmem::GuestMemory;
-use std::task::Context;
-use std::task::Waker;
 use test_with_tracing::test;
 use vmcore::isa_dma_channel::FloatingDmaChannel;
 use vmcore::line_interrupt::LineInterrupt;
@@ -124,6 +121,9 @@ fn sio_logical_device_configuration_and_floppy_state_survive_restore() {
     enter(&mut device);
     config_write(&mut device, 0x07, 2);
     assert_eq!(config_read(&mut device, 0x60), 3);
+    assert_eq!(read8(&mut device, 0x3f2), 0);
+    assert_eq!(read8(&mut device, 0x372), 0);
+    let mut device = new_sio::<floppy_pcat_stub::StubFloppyDiskController>();
     device.restore(saved).unwrap();
     assert_eq!(read8(&mut device, 0x3f1), 0xa5);
     for (register, expected) in registers {
@@ -131,7 +131,6 @@ fn sio_logical_device_configuration_and_floppy_state_survive_restore() {
     }
     assert_eq!(read8(&mut device, 0x3f2), 0x1c);
     assert_eq!(read8(&mut device, 0x372), 0x2c);
-    device.poll_device(&mut Context::from_waker(Waker::noop()));
 }
 
 // Test: Resume a half-complete unlock sequence and address unsupported logical devices.
@@ -142,6 +141,7 @@ fn sio_restores_handshake_and_ignores_unsupported_device_configuration() {
     write8(&mut device, 0x3f0, 0x87);
     let saved = device.save().unwrap();
     pal_async::local::block_on(device.reset());
+    let mut device = new_sio::<floppy_pcat_stub::StubFloppyDiskController>();
     device.restore(saved).unwrap();
     write8(&mut device, 0x3f0, 0x87);
     assert_eq!(config_read(&mut device, 0x20), 0x97);
@@ -162,19 +162,28 @@ fn sio_restores_handshake_and_ignores_unsupported_device_configuration() {
     assert_eq!(config_read(&mut device, 0x30), 1);
     write8(&mut device, 0x3f0, 0xaa);
     let idle = device.save().unwrap();
+    let mut device = new_sio::<floppy_pcat_stub::StubFloppyDiskController>();
     enter(&mut device);
     device.restore(idle).unwrap();
     assert_eq!(read8(&mut device, 0x3f1), 0xfc);
 }
 
-// Test: Issue VERSION to each full floppy controller through the combined device.
-// Expected: Both controllers independently return the enhanced-controller version.
+// Test: Leave VERSION replies pending on both full floppy controllers, then
+//       consume the primary reply before the secondary reply.
+// Expected: Both return the enhanced-controller version, and consuming one
+//       controller's reply does not drain or change the other's ready reply.
 #[test]
 fn sio_forwards_commands_to_both_full_floppy_controllers() {
     let mut device = new_sio::<floppy::FloppyDiskController>();
     for base in [0x3f0, 0x370] {
         write8(&mut device, base + 2, 4);
         write8(&mut device, base + 5, 0x10);
-        assert_eq!(read8(&mut device, base + 5), 0x90);
     }
+    assert_eq!(read8(&mut device, 0x3f4) & 0xc0, 0xc0);
+    assert_eq!(read8(&mut device, 0x374) & 0xc0, 0xc0);
+    assert_eq!(read8(&mut device, 0x3f5), 0x90);
+    assert_eq!(read8(&mut device, 0x3f4) & 0xc0, 0x80);
+    assert_eq!(read8(&mut device, 0x374) & 0xc0, 0xc0);
+    assert_eq!(read8(&mut device, 0x375), 0x90);
+    assert_eq!(read8(&mut device, 0x374) & 0xc0, 0x80);
 }
