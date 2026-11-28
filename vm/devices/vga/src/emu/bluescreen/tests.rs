@@ -18,7 +18,6 @@ fn controller_reset_preserves_shared_bits_and_unmaps_the_framebuffer() {
     for (misc, crt) in [(0, 0x3b4), (1, 0x3d4)] {
         let mut f = Fixture::new();
         f.out(0x3c2, misc);
-        assert_eq!(f.device.emu.get_crt_port(), crt);
         for (reg, value) in [
             (0x38, 0x48),
             (0x31, 0xb0),
@@ -45,7 +44,7 @@ fn controller_reset_preserves_shared_bits_and_unmaps_the_framebuffer() {
         ] {
             assert_eq!(indexed(&mut f, crt, reg), expected, "register {reg:#x}");
         }
-        assert!(f.mappings.lock().contains(&Mapping::Unmap));
+        assert_eq!(*f.mappings.lock(), [Mapping::Unmap]);
         assert_eq!(f.input(0x4ae8) & 1, 0);
     }
 }

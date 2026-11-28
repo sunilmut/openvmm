@@ -137,20 +137,24 @@ fn text_rendering_uses_programmed_font_and_palette() {
 }
 
 // Test: Start, render, and stop the real worker, then restart with a changed image.
-// Expected: Each run publishes its new frame and cancellation completes cleanly.
+// Expected: Each run publishes new RGB565 pixels and resolution, and stop joins it.
 #[test]
 fn renderer_start_stop_is_restartable() {
     let mut f = Fixture::new();
     graphics(&mut f);
     f.out(0x4ae8, 1);
-    f.indexed(0x3d4, 0x67, 0xd0);
+    f.indexed(0x3d4, 0x67, 0x50);
     let mut timer = PolledTimer::new(&f.pool.driver());
-    for height in [2, 3] {
+    for (height, source, expected) in [(2, 0xf800u16, 0xff0000), (3, 0x07e0, 0x00ff00)] {
+        f.vram.write_plain(0, &[source; 4]).unwrap();
+        f.vram.write_plain(32, &[0x001fu16; 4]).unwrap();
         f.indexed(0x3d4, 0x12, height - 1);
         f.device.start();
+        // The public view has no update future. Stop joins the worker before
+        // reading pixels, since format publication can precede the blit.
         f.pool.run_until(async {
             for _ in 0..100 {
-                if f.view.resolution() == (16, u16::from(height)) {
+                if f.view.resolution() == (8, u16::from(height)) {
                     return;
                 }
                 timer.sleep(Duration::from_millis(5)).await;
@@ -158,8 +162,10 @@ fn renderer_start_stop_is_restartable() {
             panic!("renderer did not publish the new frame");
         });
         f.pool.run_until(f.device.stop());
+        assert_eq!(pixels(&mut f, 0), [expected; 4]);
+        assert_eq!(pixels(&mut f, 1), [0x0000ff; 4]);
     }
-    assert_eq!(f.view.resolution(), (16, 3));
+    assert_eq!(f.view.resolution(), (8, 3));
 }
 
 // Test: Change display overflow, blanking, pixel doubling, and interlace controls.

@@ -193,10 +193,7 @@ fn pci_enumeration_masks_writes_and_rejects_absent_registers() {
     assert!(f.device.supports_pio().is_some());
     assert!(f.device.supports_mmio().is_some());
     assert!(f.device.supports_pci().is_some());
-    assert_eq!(
-        f.pci_read(0),
-        u32::from(spec::PCI_VENDOR_ID) | u32::from(spec::PCI_DEVICE_ID) << 16
-    );
+    assert_eq!(f.pci_read(0), 0x53531414);
     assert_eq!(f.pci_read(8), 0x03000000);
     assert_eq!(f.pci_read(0xc), 0);
     assert_eq!(f.pci_read(0x2c), 0);
@@ -276,12 +273,7 @@ fn crt_locking_and_read_only_identity_are_enforced() {
     f.indexed(0x3d4, 0x11, 0);
     f.indexed(0x3d4, 0, 0x54);
     assert_eq!(f.read_indexed(0x3d4, 0), 0x54);
-    for (reg, expected) in [
-        (0x2d, (spec::PCI_DEVICE_ID >> 8) as u8),
-        (0x2e, spec::PCI_DEVICE_ID as u8),
-        (0x2f, spec::PCI_REVISION),
-        (0x30, spec::S3_TRIO_CHIPSET_REV_NUMBER),
-    ] {
+    for (reg, expected) in [(0x2d, 0x53), (0x2e, 0x53), (0x2f, 0), (0x30, 0)] {
         f.indexed(0x3d4, reg, expected ^ 0xff);
         assert_eq!(f.read_indexed(0x3d4, reg), expected);
     }
@@ -425,6 +417,8 @@ fn aperture_selection_and_out_of_range_banks_are_isolated() {
     f.indexed(0x3d4, 0x38, 0x48);
     f.indexed(0x3d4, 0x35, 0x0f);
     f.indexed(0x3d4, 0x51, 0x0c);
+    let mut before = vec![0; FRAMEBUFFER_SIZE];
+    f.vram.read_at(0, &mut before).unwrap();
     for mode in 0..4 {
         f.indexed(0x3ce, 5, mode);
         f.device.mmio_write(0xb8000, &[0x99]).unwrap();
@@ -432,6 +426,17 @@ fn aperture_selection_and_out_of_range_banks_are_isolated() {
     }
     f.indexed(0x3ce, 5, 8);
     assert_eq!(f.read_memory(0xb8000, 1), [0xff]);
+    let mut after = vec![0; FRAMEBUFFER_SIZE];
+    f.vram.read_at(0, &mut after).unwrap();
+    let changed = before
+        .iter()
+        .zip(&after)
+        .enumerate()
+        .find(|(_, (before, after))| before != after);
+    assert_eq!(
+        changed, None,
+        "out-of-range writes changed framebuffer data"
+    );
     f.indexed(0x3d4, 0x35, 0);
     f.indexed(0x3d4, 0x51, 0);
     f.indexed(0x3ce, 5, 0);
@@ -444,30 +449,43 @@ fn aperture_selection_and_out_of_range_banks_are_isolated() {
 fn linear_framebuffer_mapping_obeys_size_alignment_and_reset() {
     let mut f = Fixture::new();
     f.pci_write(0x10, 0xe0000000);
+    let mut expected = Vec::new();
     for (code, len) in [(0, 0x10000), (1, 0x100000), (2, 0x200000), (3, 0x400000)] {
         f.indexed(0x3d4, 0x58, code | 0x10);
-        assert_eq!(
-            f.mappings.lock().last(),
-            Some(&Mapping::Map {
-                gpa: 0xe0000000,
-                len
-            })
-        );
+        if code != 0 {
+            expected.push(Mapping::Unmap);
+        }
+        expected.push(Mapping::Map {
+            gpa: 0xe0000000,
+            len,
+        });
+        assert_eq!(*f.mappings.lock(), expected);
     }
     f.indexed(0x3d4, 0x59, 0xd1);
     f.indexed(0x3d4, 0x5a, 0x23);
-    assert_eq!(
-        f.mappings.lock().last(),
-        Some(&Mapping::Map {
-            gpa: 0xd1000000,
-            len: 0x400000
-        })
-    );
+    for _ in 0..2 {
+        expected.extend([
+            Mapping::Unmap,
+            Mapping::Map {
+                gpa: 0xd1000000,
+                len: 0x400000,
+            },
+        ]);
+    }
+    assert_eq!(*f.mappings.lock(), expected);
     f.indexed(0x3d4, 0x58, 0);
-    assert_eq!(f.mappings.lock().last(), Some(&Mapping::Unmap));
+    expected.push(Mapping::Unmap);
+    assert_eq!(*f.mappings.lock(), expected);
     f.indexed(0x3d4, 0x58, 0x10);
     f.pool.run_until(f.device.reset());
-    assert_eq!(f.mappings.lock().last(), Some(&Mapping::Unmap));
+    expected.extend([
+        Mapping::Map {
+            gpa: 0xd1230000,
+            len: 0x10000,
+        },
+        Mapping::Unmap,
+    ]);
+    assert_eq!(*f.mappings.lock(), expected);
     assert_eq!(f.pci_read(4), 0);
     assert_eq!(f.read_indexed(0x3d4, 0x58), 0);
 }
