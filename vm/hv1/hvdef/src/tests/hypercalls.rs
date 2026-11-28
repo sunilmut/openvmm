@@ -5,8 +5,9 @@ use super::*;
 use hypercall::*;
 use test_with_tracing::test;
 
-// Test: Set and replace target VTLs on x64 and ARM address-translation controls.
-// Expected: The target occupies only the top byte and independent permission flags survive.
+// Test: Set, replace, and clear target VTLs on x64 and ARM translation controls.
+// Expected: Explicit replacements occupy only the top byte and independent
+//       permission flags survive each update.
 #[test]
 fn translation_target_vtl_encoding_preserves_other_control_bits() {
     for (target, byte) in [
@@ -27,6 +28,18 @@ fn translation_target_vtl_encoding_preserves_other_control_bits() {
         assert_eq!(u64::from(arm), expected);
         assert_eq!(x64.input_vtl().target_vtl(), Ok(target));
         assert_eq!(arm.input_vtl().target_vtl(), Ok(target));
+        let (replacement, byte): (_, u8) = if target == Some(Vtl::Vtl2) {
+            (Vtl::Vtl1, 0x11)
+        } else {
+            (Vtl::Vtl2, 0x12)
+        };
+        x64.set_input_vtl(replacement.into());
+        arm.set_input_vtl(replacement.into());
+        let expected = 0x11 | (u64::from(byte) << 56);
+        assert_eq!(u64::from(x64), expected);
+        assert_eq!(u64::from(arm), expected);
+        assert_eq!(x64.input_vtl().target_vtl(), Ok(Some(replacement)));
+        assert_eq!(arm.input_vtl().target_vtl(), Ok(Some(replacement)));
         x64.set_input_vtl(HvInputVtl::CURRENT_VTL);
         arm.set_input_vtl(HvInputVtl::CURRENT_VTL);
         assert_eq!(u64::from(x64), 0x11);

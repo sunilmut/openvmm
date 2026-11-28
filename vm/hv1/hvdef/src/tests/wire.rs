@@ -40,7 +40,8 @@ fn cpuid_feature_and_enlightenment_updates_preserve_other_bits() {
 }
 
 // Test: Carry string/REP port I/O intercepts through the fixed-size SynIC message buffer.
-// Expected: The byte-level ABI, packed CR8/length, typed views, and unused tail stay correct.
+// Expected: The complete transport header, packed CR8/length, typed views, and
+//       unused payload tail retain their independent wire encodings.
 #[test]
 fn synic_io_intercept_message_round_trips_typed_payload_and_wire_header() {
     for (size, string, rep, encoded) in [
@@ -61,10 +62,11 @@ fn synic_io_intercept_message_round_trips_typed_payload_and_wire_header() {
             0x1122334455667788,
             payload.as_bytes(),
         );
-        assert_eq!(&message.as_bytes()[..4], &[0, 0, 1, 0x80]);
         assert_eq!(
-            &message.as_bytes()[8..16],
-            &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
+            &message.as_bytes()[..16],
+            &[
+                0, 0, 1, 0x80, 0x80, 0, 0, 0, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+            ]
         );
         assert_eq!(&message.payload()[..8], &[7, 0, 0, 0, 0xa3, 1, 0, 0]);
         assert_eq!(&message.payload()[40..44], &[0xf8, 3, encoded, 0]);

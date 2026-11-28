@@ -4557,5 +4557,6 @@ mod tests {
 
     mod hypercalls;
     mod registers;
+    mod save_restore;
     mod wire;
 }
