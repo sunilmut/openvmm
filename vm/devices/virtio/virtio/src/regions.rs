@@ -147,6 +147,7 @@ mod tests {
     use super::*;
     use crate::queue::VirtioQueuePayload;
     use guestmem::ranges::PagedRange;
+    use test_with_tracing::test;
 
     fn payload(writeable: bool, address: u64, length: u32) -> VirtioQueuePayload {
         VirtioQueuePayload {
@@ -158,6 +159,8 @@ mod tests {
 
     // ---- data_regions tests ----
 
+    // Test: Extract read data from a writable descriptor containing a status byte.
+    // Expected: The data region excludes the trailing status byte.
     #[test]
     fn data_regions_read_single_descriptor() {
         // Read: writable descriptors carry data, skip=0, exclude 1 byte for status.
@@ -168,6 +171,8 @@ mod tests {
         assert_eq!(regions[0].len, 4096);
     }
 
+    // Test: Extract write data after a separate readable header descriptor.
+    // Expected: Only the data descriptor's address and length are returned.
     #[test]
     fn data_regions_write_skips_header() {
         // Write: readable descriptors carry data, skip header (16 bytes).
@@ -181,6 +186,8 @@ mod tests {
         assert_eq!(regions[0].len, 512);
     }
 
+    // Test: Skip a readable header split across two descriptors.
+    // Expected: The returned data begins after the header within the second buffer.
     #[test]
     fn data_regions_write_header_spans_descriptors() {
         // Header split across two descriptors.
@@ -194,6 +201,8 @@ mod tests {
         assert_eq!(regions[0].len, 512);
     }
 
+    // Test: Extract writable data from mixed readable/writable descriptors.
+    // Expected: Readable headers are excluded and data length omits status.
     #[test]
     fn data_regions_filters_by_direction() {
         // Readable and writable descriptors interleaved.
@@ -208,6 +217,8 @@ mod tests {
         assert_eq!(regions[0].len, 4096);
     }
 
+    // Test: Request data regions from an empty descriptor list.
+    // Expected: No guest addresses or data regions are invented.
     #[test]
     fn data_regions_empty_payload() {
         let payloads: Vec<VirtioQueuePayload> = vec![];
@@ -217,6 +228,8 @@ mod tests {
 
     // ---- try_build_gpn_list tests ----
 
+    // Test: Map a single page-aligned data region.
+    // Expected: The GPN, zero offset and full page length are preserved.
     #[test]
     fn gpn_list_single_page_aligned_region() {
         let regions = vec![DataRegion {
@@ -229,6 +242,8 @@ mod tests {
         assert_eq!(len, 4096);
     }
 
+    // Test: Map a sub-page region with a nonzero initial offset.
+    // Expected: The page number, byte offset and exact length survive conversion.
     #[test]
     fn gpn_list_single_region_with_offset() {
         let regions = vec![DataRegion {
@@ -241,6 +256,8 @@ mod tests {
         assert_eq!(len, 512);
     }
 
+    // Test: Map one contiguous region spanning two full pages.
+    // Expected: Both page numbers appear in order with the complete length.
     #[test]
     fn gpn_list_single_region_spanning_pages() {
         // 8192 bytes starting at page boundary → 2 pages.
@@ -254,6 +271,8 @@ mod tests {
         assert_eq!(len, 8192);
     }
 
+    // Test: Map two discontiguous regions whose interior boundaries are page-aligned.
+    // Expected: Page numbers retain the guest's order without filling the physical gap.
     #[test]
     fn gpn_list_two_page_aligned_non_contiguous_regions() {
         // Two regions on different pages, both page-aligned boundaries.
@@ -273,6 +292,8 @@ mod tests {
         assert_eq!(len, 8192);
     }
 
+    // Test: Map two consecutive full-page guest regions.
+    // Expected: Both pages appear exactly once and total length is retained.
     #[test]
     fn gpn_list_two_gpa_contiguous_regions() {
         // Two regions that are GPA-contiguous (end of first == start of second).
@@ -292,6 +313,8 @@ mod tests {
         assert_eq!(len, 8192);
     }
 
+    // Test: Join contiguous regions that share an interior page.
+    // Expected: The shared page is not duplicated and the combined byte length survives.
     #[test]
     fn gpn_list_contiguous_mid_page_boundary() {
         // Two GPA-contiguous regions sharing a page in the middle.
@@ -311,6 +334,8 @@ mod tests {
         assert_eq!(len, 8192);
     }
 
+    // Test: Map discontiguous regions with unaligned interior boundaries.
+    // Expected: Conversion rejects the layout rather than inventing contiguous bytes.
     #[test]
     fn gpn_list_non_contiguous_non_aligned_fails() {
         // Two non-contiguous regions where the boundary isn't page-aligned.
@@ -327,6 +352,8 @@ mod tests {
         assert!(try_build_gpn_list(&regions).is_none());
     }
 
+    // Test: Follow a page-aligned region with a discontiguous mid-page start.
+    // Expected: The unrepresentable second boundary is rejected.
     #[test]
     fn gpn_list_non_contiguous_first_aligned_second_not() {
         // First ends page-aligned, but second starts mid-page.
@@ -343,6 +370,8 @@ mod tests {
         assert!(try_build_gpn_list(&regions).is_none());
     }
 
+    // Test: Follow a mid-page end with a discontiguous page-aligned region.
+    // Expected: The unrepresentable first boundary is rejected.
     #[test]
     fn gpn_list_non_contiguous_first_not_aligned_second_aligned() {
         // First ends mid-page, second starts page-aligned.
@@ -359,6 +388,8 @@ mod tests {
         assert!(try_build_gpn_list(&regions).is_none());
     }
 
+    // Test: Convert an empty set of data regions.
+    // Expected: The result has no page numbers, offset or length.
     #[test]
     fn gpn_list_empty_regions() {
         let regions: Vec<DataRegion> = vec![];
@@ -368,6 +399,8 @@ mod tests {
         assert_eq!(len, 0);
     }
 
+    // Test: Convert a region whose address plus length overflows u64.
+    // Expected: Conversion fails instead of wrapping to low guest pages.
     #[test]
     fn gpn_list_region_wrapping_64_bits_is_rejected() {
         let regions = vec![DataRegion {
@@ -377,6 +410,8 @@ mod tests {
         assert!(try_build_gpn_list(&regions).is_none());
     }
 
+    // Test: Follow an overflowing region with a valid low-address region.
+    // Expected: The full conversion still fails; later addresses cannot mask overflow.
     #[test]
     fn gpn_list_chain_after_wrapping_region_is_rejected() {
         let regions = vec![
@@ -392,6 +427,8 @@ mod tests {
         assert!(try_build_gpn_list(&regions).is_none());
     }
 
+    // Test: Convert three separated page-aligned regions.
+    // Expected: All three guest page numbers remain in order with the full data length.
     #[test]
     fn gpn_list_three_page_aligned_regions() {
         // Three separate page-aligned regions.
@@ -415,6 +452,8 @@ mod tests {
         assert_eq!(len, 12288);
     }
 
+    // Test: Map a partial initial page followed by a separated full page.
+    // Expected: Conversion retains the first byte offset and both physical pages.
     #[test]
     fn gpn_list_first_region_with_offset_second_page_aligned() {
         // First region starts mid-page but ends at page boundary,
@@ -435,6 +474,8 @@ mod tests {
         assert_eq!(len, 6144);
     }
 
+    // Test: Construct a public PagedRange from a multi-region conversion.
+    // Expected: The resulting range is valid and retains the entire requested length.
     #[test]
     fn gpn_list_validates_paged_range_construction() {
         // Verify that the returned values actually produce a valid PagedRange.

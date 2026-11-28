@@ -38,7 +38,6 @@ use guestmem::GuestMemoryBackingError;
 use inspect::InspectMut;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
-use pal_async::timer::PolledTimer;
 use pal_async::wait::PolledWait;
 use pal_event::Event;
 use parking_lot::Mutex;
@@ -51,7 +50,6 @@ use std::future::poll_fn;
 use std::io;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use task_control::AsyncRun;
@@ -94,44 +92,47 @@ async fn must_recv_in_timeout<T: 'static + Send>(
         .unwrap()
 }
 
-/// Yield execution to the async executor, allowing spawned tasks to run.
-async fn yield_now() {
-    let mut yielded = false;
-    poll_fn(|cx| {
-        if !yielded {
-            cx.waker().wake_by_ref();
-            yielded = true;
-            std::task::Poll::Pending
-        } else {
-            std::task::Poll::Ready(())
-        }
-    })
-    .await
+async fn finish_io<F: Future>(device: &mut impl PollDevice, future: F) -> F::Output {
+    let mut future = std::pin::pin!(future);
+    mesh::CancelContext::new()
+        .with_timeout(Duration::from_secs(5))
+        .until_cancelled(poll_fn(|cx| {
+            device.poll_device(cx);
+            future.as_mut().poll(cx)
+        }))
+        .await
+        .expect("transport did not complete deferred guest IO")
 }
 
-/// Yield to the executor then poll the device, allowing a spawned device
-/// task to process commands and the transport to observe the result.
-async fn yield_and_poll_device(dev: &mut impl PollDevice) {
-    yield_now().await;
-    let waker = std::task::Waker::noop();
-    let mut cx = std::task::Context::from_waker(waker);
-    dev.poll_device(&mut cx);
+async fn settle_transport(device: &mut (impl PollDevice + MmioIntercept), address: u64) {
+    let mut bytes = [0; 4];
+    match device.mmio_read(address, &mut bytes) {
+        IoResult::Ok => {}
+        IoResult::Defer(token) => {
+            // A failed enable or reset cancels stalled reads. Its completion
+            // still establishes the barrier; verify a fresh read works below.
+            let result = finish_io(device, token.read_future(&mut bytes)).await;
+            assert!(matches!(result, Ok(()) | Err(IoError::NoResponse)));
+        }
+        other => panic!("status read failed: {other:?}"),
+    }
+    device.mmio_read(address, &mut bytes).unwrap();
 }
 
 #[derive(Default)]
 struct VirtioTestMemoryAccess {
     memory_map: Mutex<MemoryMap>,
     failed_write_range: Mutex<Option<std::ops::Range<u64>>>,
-    doorbell_count: AtomicUsize,
     /// The doorbells that are currently INSTALLED, i.e. whose registration
     /// object is still alive.
     ///
-    /// Kept alongside `doorbell_count` because a count of registration calls
-    /// cannot answer the question a restore poses: it says a registration
-    /// happened, not that a doorbell exists NOW at the address the guest kicks.
-    /// Behind an `Arc` so each handed-out registration can remove its own entry
-    /// when it is dropped.
-    live_doorbells: Arc<Mutex<Vec<DoorbellSpec>>>,
+    /// Each registration owns its event and removes only its own entry on drop.
+    live_doorbells: Arc<Mutex<Vec<Arc<RegisteredDoorbell>>>>,
+}
+
+struct RegisteredDoorbell {
+    spec: DoorbellSpec,
+    event: Event,
 }
 
 /// A doorbell registration as the transport asked for it.
@@ -208,9 +209,17 @@ impl VirtioTestMemoryAccess {
 
     /// The doorbells installed right now, in a stable order for comparison.
     fn installed_doorbells(&self) -> Vec<DoorbellSpec> {
-        let mut specs = self.live_doorbells.lock().clone();
+        let mut specs: Vec<_> = self.live_doorbells.lock().iter().map(|d| d.spec).collect();
         specs.sort_unstable();
         specs
+    }
+
+    fn ring_doorbell(&self, spec: DoorbellSpec) {
+        let doorbells = self.live_doorbells.lock();
+        let mut matches = doorbells.iter().filter(|d| d.spec == spec);
+        let doorbell = matches.next().expect("guest doorbell must be installed");
+        assert!(matches.next().is_none(), "doorbell must have one owner");
+        doorbell.event.signal();
     }
 
     fn modify_memory_map(&self, address: u64, data: &[u8], writeable: bool) {
@@ -313,14 +322,14 @@ unsafe impl GuestMemoryAccess for VirtioTestMemoryAccess {
 /// The handle a doorbell registration hands back. Dropping it is what
 /// UNINSTALLS the doorbell, so it de-registers itself from `live_doorbells`.
 struct DoorbellEntry {
-    live: Arc<Mutex<Vec<DoorbellSpec>>>,
-    spec: DoorbellSpec,
+    live: Arc<Mutex<Vec<Arc<RegisteredDoorbell>>>>,
+    registration: Arc<RegisteredDoorbell>,
 }
 
 impl Drop for DoorbellEntry {
     fn drop(&mut self) {
         let mut live = self.live.lock();
-        if let Some(i) = live.iter().position(|s| *s == self.spec) {
+        if let Some(i) = live.iter().position(|d| Arc::ptr_eq(d, &self.registration)) {
             live.remove(i);
         }
     }
@@ -332,18 +341,21 @@ impl DoorbellRegistration for VirtioTestMemoryAccess {
         address: u64,
         value: Option<u64>,
         length: Option<u32>,
-        _: &Event,
+        event: &Event,
     ) -> io::Result<Box<dyn Send + Sync>> {
-        self.doorbell_count.fetch_add(1, Ordering::Relaxed);
         let spec = DoorbellSpec {
             address,
             value,
             length,
         };
-        self.live_doorbells.lock().push(spec);
+        let registration = Arc::new(RegisteredDoorbell {
+            spec,
+            event: event.clone(),
+        });
+        self.live_doorbells.lock().push(registration.clone());
         Ok(Box::new(DoorbellEntry {
             live: self.live_doorbells.clone(),
-            spec,
+            registration,
         }))
     }
 }
@@ -571,7 +583,7 @@ impl VirtioTestGuest {
             dev.write_u32(68, 1);
         }
         dev.write_u32(112, VIRTIO_DRIVER_OK);
-        yield_and_poll_device(dev).await;
+        settle_transport(dev, 112).await;
         assert_eq!(dev.read_u32(0xfc), 1);
         assert_eq!(
             dev.read_u32(96) & 0x2,
@@ -704,7 +716,7 @@ impl VirtioTestGuest {
         let current = dev.pci_device.read_u32(20);
         dev.pci_device
             .write_u32(20, (current & !0xff) | VIRTIO_DRIVER_OK);
-        yield_and_poll_device(&mut dev.pci_device).await;
+        settle_transport(&mut dev.pci_device, bar_address1 + 20).await;
         let config_generation = (dev.pci_device.read_u32(20) >> 8) & 0xff;
         assert_eq!(config_generation, 1);
         assert_eq!(
@@ -1542,6 +1554,8 @@ impl VirtioPciTestDevice {
     }
 }
 
+// Test: Enumerate MMIO identity, feature banks and valid/invalid queue registers.
+// Expected: Negotiation masks unsupported bits and invalid queues cannot change.
 #[async_test]
 async fn verify_chipset_config(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -1713,6 +1727,8 @@ async fn verify_chipset_config(driver: DefaultDriver) {
     assert_eq!(dev.read_u32(164), 0);
 }
 
+// Test: Walk all PCI virtio capabilities and read their complete headers.
+// Expected: Types, lengths, offsets and linkage match the advertised BAR layout.
 #[async_test]
 async fn verify_pci_config(driver: DefaultDriver) {
     let mut pci_test_device =
@@ -2022,6 +2038,8 @@ fn pci_notification_address(dev: &mut VirtioPciTestDevice, queue: u16) -> u64 {
 /// bar/offset/length fields via config space, then read/write BAR regions
 /// through the window and confirm the accesses reach the same registers as
 /// direct MMIO.
+// Test: Route PCI config-window accesses to BAR0 and submit invalid sizes/alignment.
+// Expected: Valid writes are visible through MMIO; malformed accesses fail explicitly.
 #[async_test]
 async fn verify_pci_cfg_access_window(driver: DefaultDriver) {
     let mut pci_test_device =
@@ -2128,6 +2146,8 @@ async fn verify_pci_cfg_access_window(driver: DefaultDriver) {
 /// A `pci_cfg_data` access whose `cap.offset`/`cap.length` falls outside the
 /// selected BAR must be rejected as `InvalidRegister`, rather than truncating
 /// the offset to `u16` or routing past the end of the BAR.
+// Test: Select offsets beyond BAR0 and a BAR the config window cannot address.
+// Expected: Reads and writes return InvalidRegister rather than aliasing low offsets.
 #[async_test]
 async fn verify_pci_cfg_access_window_bounds(driver: DefaultDriver) {
     let mut pci_test_device =
@@ -2187,6 +2207,8 @@ async fn verify_pci_cfg_access_window_bounds(driver: DefaultDriver) {
 /// aligned within its containing DWORD. So a 2-byte access at a BAR offset
 /// whose low bits are `2` must still land in the low two bytes of
 /// `pci_cfg_data` — not bytes 2..4.
+// Test: Read and write a halfword at a nonzero dword lane through pci_cfg_data.
+// Expected: Data occupies the window's low bytes and preserves the other BAR bytes.
 #[async_test]
 async fn verify_pci_cfg_access_window_subdword(driver: DefaultDriver) {
     let mut pci_test_device =
@@ -2231,8 +2253,8 @@ async fn verify_pci_cfg_access_window_subdword(driver: DefaultDriver) {
     )
     .unwrap();
     assert_eq!(
-        dev.read_u32(0) >> 16,
-        0xcccc,
+        dev.read_u32(0),
+        0xcccc_aaaa,
         "written data must be taken from the first cap.length bytes of pci_cfg_data",
     );
 }
@@ -2246,6 +2268,8 @@ async fn verify_pci_cfg_access_window_subdword(driver: DefaultDriver) {
 /// `cap.length` bytes left-aligned into the low bytes of `pci_cfg_data`.
 ///
 /// The test device reports byte `N` at device-config offset `N`.
+// Test: Read aligned and sub-dword device config through the deferred PCI window.
+// Expected: Complete dword replies contain the requested bytes left-aligned and padded.
 #[async_test]
 async fn verify_pci_cfg_access_window_deferred(driver: DefaultDriver) {
     let mut pci_test_device =
@@ -2302,13 +2326,11 @@ async fn verify_pci_cfg_access_window_deferred(driver: DefaultDriver) {
         IoResult::Defer(token) => token.read_future(&mut buf).await.unwrap(),
         other => panic!("expected a deferred read, got {other:?}"),
     }
-    assert_eq!(
-        u32::from_le_bytes(buf) & 0xffff,
-        0x0302,
-        "deferred device-config bytes must be left-aligned in pci_cfg_data",
-    );
+    assert_eq!(buf, [2, 3, 0, 0]);
 }
 
+// Test: Enumerate a PCI endpoint without device-specific configuration registers.
+// Expected: The capability list contains no zero-length DEVICE_CFG capability.
 #[async_test]
 async fn verify_pci_config_no_device_cfg(driver: DefaultDriver) {
     // A virtio device with no device-specific config (device_register_length == 0)
@@ -2355,6 +2377,8 @@ async fn verify_pci_config_no_device_cfg(driver: DefaultDriver) {
     }
 }
 
+// Test: Negotiate PCI feature banks and program valid and invalid queue selections.
+// Expected: Supported bits and register widths are preserved without queue aliasing.
 #[async_test]
 async fn verify_pci_registers(driver: DefaultDriver) {
     let mut pci_test_device =
@@ -2579,11 +2603,15 @@ async fn verify_queue_simple_inner(mut guest: VirtioTestGuest) {
     queues[0].stop().await;
 }
 
+// Test: Submit two independent descriptors to a split queue.
+// Expected: Both descriptor addresses correlate with their distinct completion lengths.
 #[async_test]
 async fn verify_split_queue_simple(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
     verify_queue_simple_inner(VirtioTestGuest::new_split(&driver, &test_mem, 1, 2, true)).await;
 }
+// Test: Submit two independent descriptors to a packed queue.
+// Expected: Both descriptor addresses correlate with their distinct completion lengths.
 #[async_test]
 async fn verify_packed_queue_simple(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -2661,6 +2689,8 @@ async fn verify_queue_simple_interrupt_control_inner(mut guest: VirtioTestGuest,
     queues[0].stop().await;
 }
 
+// Test: Enable and suppress split-queue interrupts without event-index negotiation.
+// Expected: Completions continue while only enabled interrupts are delivered.
 #[async_test]
 async fn verify_split_queue_simple_interrupt_control(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -2670,6 +2700,8 @@ async fn verify_split_queue_simple_interrupt_control(driver: DefaultDriver) {
     )
     .await;
 }
+// Test: Set split-queue interrupt event thresholds, then enable and suppress events.
+// Expected: Interrupts correlate with the threshold while every completion remains visible.
 #[async_test]
 async fn verify_split_queue_simple_interrupt_control_with_index(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -2679,6 +2711,8 @@ async fn verify_split_queue_simple_interrupt_control_with_index(driver: DefaultD
     )
     .await;
 }
+// Test: Enable and suppress packed-queue interrupts without event-index negotiation.
+// Expected: Completions continue while only enabled interrupts are delivered.
 #[async_test]
 async fn verify_packed_queue_simple_interrupt_control(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -2688,6 +2722,8 @@ async fn verify_packed_queue_simple_interrupt_control(driver: DefaultDriver) {
     )
     .await;
 }
+// Test: Set packed-queue interrupt event thresholds, then enable and suppress events.
+// Expected: Interrupts correlate with the threshold while every completion remains visible.
 #[async_test]
 async fn verify_packed_queue_simple_interrupt_control_with_index(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -2743,11 +2779,15 @@ async fn verify_queue_indirect_inner(mut guest: VirtioTestGuest) {
     queues[0].stop().await;
 }
 
+// Test: Submit indirect and direct descriptors to a split queue.
+// Expected: Indirect payload addresses and both distinct completions are preserved.
 #[async_test]
 async fn verify_split_queue_indirect(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
     verify_queue_indirect_inner(VirtioTestGuest::new_split(&driver, &test_mem, 1, 2, true)).await;
 }
+// Test: Submit indirect and direct descriptors to a packed queue.
+// Expected: Indirect payload addresses and both distinct completions are preserved.
 #[async_test]
 async fn verify_packed_queue_indirect(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -2802,11 +2842,15 @@ async fn verify_queue_linked_inner(mut guest: VirtioTestGuest) {
     queues[0].stop().await;
 }
 
+// Test: Submit a linked split descriptor chain followed by an independent descriptor.
+// Expected: Chain addresses and lengths remain ordered and completions identify each head.
 #[async_test]
 async fn verify_split_queue_linked(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
     verify_queue_linked_inner(VirtioTestGuest::new_split(&driver, &test_mem, 1, 8, true)).await;
 }
+// Test: Submit a linked packed descriptor chain followed by an independent descriptor.
+// Expected: Chain addresses and lengths remain ordered and completions identify each head.
 #[async_test]
 async fn verify_packed_queue_linked(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -2816,6 +2860,8 @@ async fn verify_packed_queue_linked(driver: DefaultDriver) {
 /// the beginning (indices 2 → 3 → 0 in a queue_size=4 ring). Without
 /// correct index wrapping in `descriptor()`, the NEXT index after 3 would
 /// be 4 (out of bounds) instead of 0.
+// Test: Submit a packed chain spanning the ring's last and first slots.
+// Expected: The wrapping chain has three payloads and completes at its original head.
 #[async_test]
 async fn verify_packed_queue_linked_wrapping(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -2867,6 +2913,8 @@ async fn verify_packed_queue_linked_wrapping(driver: DefaultDriver) {
 /// checking `active_indirect_len`, a stale or malicious NEXT flag on the
 /// last indirect descriptor could cause out-of-bounds access or incorrect
 /// chaining using the primary ring size instead of the indirect table size.
+// Test: Set NEXT on every entry in a packed indirect table, including its last entry.
+// Expected: Buffer length bounds the chain to three entries regardless of NEXT.
 #[async_test]
 async fn verify_packed_indirect_ignores_next_flag(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -2930,6 +2978,8 @@ async fn verify_packed_indirect_ignores_next_flag(driver: DefaultDriver) {
 /// Verify that packed queues work with a non-power-of-two queue size.
 /// The virtio spec (§2.8.10.1) does not require packed queue sizes to be
 /// powers of two, unlike split queues (§2.7.1).
+// Test: Wrap a linked packed chain in a six-slot ring.
+// Expected: Non-power-of-two queue sizes preserve the chain and its completion head.
 #[async_test]
 async fn verify_packed_queue_non_power_of_two(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -3025,12 +3075,16 @@ async fn verify_queue_indirect_linked_inner(mut guest: VirtioTestGuest) {
     queues[0].stop().await;
 }
 
+// Test: Submit a linked indirect table and a direct descriptor to a split queue.
+// Expected: Indirect addresses/lengths are ordered and both completions correlate correctly.
 #[async_test]
 async fn verify_split_queue_indirect_linked(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
     verify_queue_indirect_linked_inner(VirtioTestGuest::new_split(&driver, &test_mem, 1, 8, true))
         .await;
 }
+// Test: Submit a linked indirect table and a direct descriptor to a packed queue.
+// Expected: Indirect addresses/lengths are ordered and both completions correlate correctly.
 #[async_test]
 async fn verify_packed_queue_indirect_linked(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -3086,12 +3140,16 @@ async fn verify_queue_avail_rollover_inner(mut guest: VirtioTestGuest) {
     queues[0].stop().await;
 }
 
+// Test: Complete and reuse split descriptors past the ring's last slot.
+// Expected: Only submitted heads complete, with address-correlated lengths and no duplicates.
 #[async_test]
 async fn verify_split_queue_avail_rollover(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
     verify_queue_avail_rollover_inner(VirtioTestGuest::new_split(&driver, &test_mem, 1, 2, true))
         .await;
 }
+// Test: Complete and reuse packed descriptors past the ring's last slot.
+// Expected: Only submitted heads complete, with address-correlated lengths and no duplicates.
 #[async_test]
 async fn verify_packed_queue_avail_rollover(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -3146,12 +3204,16 @@ async fn verify_multi_queue_inner(mut guest: VirtioTestGuest) {
     }
 }
 
+// Test: Kick five direct split queues with distinct address and completion contracts.
+// Expected: Every queue completes its own descriptor without extra completions.
 #[async_test]
 async fn verify_split_multi_queue(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
     let guest = VirtioTestGuest::new_split(&driver, &test_mem, 5, 2, true);
     verify_multi_queue_inner(guest).await;
 }
+// Test: Kick five direct packed queues with distinct address and completion contracts.
+// Expected: Every queue completes its own descriptor without extra completions.
 #[async_test]
 async fn verify_packed_multi_queue(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -3239,6 +3301,8 @@ async fn verify_device_queue_simple_inner(
     drop(dev);
 }
 
+// Test: Negotiate MMIO split-queue features and kick a guest descriptor.
+// Expected: The guest receives the correct completion and used-buffer interrupt.
 #[async_test]
 async fn verify_device_split_queue_simple(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -3248,6 +3312,8 @@ async fn verify_device_split_queue_simple(driver: DefaultDriver) {
         .with_bank(1, VIRTIO_F_VERSION_1);
     verify_device_queue_simple_inner(test_mem, guest, features).await;
 }
+// Test: Negotiate MMIO packed-queue features and kick a guest descriptor.
+// Expected: The guest receives the correct completion and used-buffer interrupt.
 #[async_test]
 async fn verify_device_packed_queue_simple(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -3333,6 +3399,8 @@ async fn verify_device_multi_queue_inner(
     drop(dev);
 }
 
+// Test: Kick five MMIO split queues after guest feature negotiation.
+// Expected: Each queue's completion matches its address contract without extra work.
 #[async_test]
 async fn verify_device_split_multi_queue(driver: DefaultDriver) {
     let num_queues = 5;
@@ -3343,6 +3411,8 @@ async fn verify_device_split_multi_queue(driver: DefaultDriver) {
         .with_bank(1, VIRTIO_F_VERSION_1);
     verify_device_multi_queue_inner(test_mem, guest, num_queues, features).await;
 }
+// Test: Kick five MMIO packed queues after guest feature negotiation.
+// Expected: Each queue's completion matches its address contract without extra work.
 #[async_test]
 async fn verify_device_packed_multi_queue(driver: DefaultDriver) {
     let num_queues = 5;
@@ -3364,6 +3434,7 @@ async fn verify_device_multi_queue_pci_inner(
     let base_addr: Vec<_> = (0..num_queues)
         .map(|i| guest.get_queue_descriptor_backing_memory_address(i))
         .collect();
+    let (completed, mut completions) = mesh::mpsc_channel();
     let mut dev = VirtioPciTestDevice::new(
         &driver,
         num_queues + 1,
@@ -3373,12 +3444,11 @@ async fn verify_device_multi_queue_pci_inner(
             assert_eq!(work.payload[0].address, base_addr[i as usize]);
             assert_eq!(work.payload[0].length, 0x1000);
             queue.complete(work, 123 * i as u32);
+            completed.send(i);
         })),
     );
 
     guest.setup_pci_device(&mut dev, features).await;
-
-    let mut timer = PolledTimer::new(&driver);
 
     // verify no spurious interrupts were delivered during setup
     assert!(dev.test_intc.get_next_interrupt().is_none());
@@ -3418,11 +3488,17 @@ async fn verify_device_multi_queue_pci_inner(
         }
     }
     // verify all queue processing finished
-    timer.sleep(Duration::from_millis(100)).await;
+    let mut completed_queues = Vec::new();
+    for _ in 0..num_queues {
+        completed_queues.push(must_recv_in_timeout(&mut completions, Duration::from_secs(5)).await);
+    }
+    completed_queues.sort_unstable();
+    assert_eq!(completed_queues, (0..num_queues).collect::<Vec<_>>());
     for _ in 0..num_queues {
         let delivered = dev.test_intc.get_next_interrupt();
         assert!(delivered.is_some());
     }
+    assert!(dev.test_intc.get_next_interrupt().is_none());
     // check results
     for i in 0..num_queues {
         let (desc, len) = guest.get_next_completed(i).unwrap();
@@ -3439,6 +3515,8 @@ async fn verify_device_multi_queue_pci_inner(
     drop(dev);
 }
 
+// Test: Notify PCI split queues using halfword, dword and PCI config-window accesses.
+// Expected: All five queues acknowledge processing with one matching completion/interrupt.
 #[async_test]
 async fn verify_device_split_multi_queue_pci(driver: DefaultDriver) {
     let num_queues = 5;
@@ -3449,6 +3527,8 @@ async fn verify_device_split_multi_queue_pci(driver: DefaultDriver) {
         .with_bank(1, VIRTIO_F_VERSION_1);
     verify_device_multi_queue_pci_inner(test_mem, guest, num_queues, features).await;
 }
+// Test: Notify PCI packed queues using halfword, dword and PCI config-window accesses.
+// Expected: All five queues acknowledge processing with one matching completion/interrupt.
 #[async_test]
 async fn verify_device_packed_multi_queue_pci(driver: DefaultDriver) {
     let num_queues = 5;
@@ -3460,6 +3540,8 @@ async fn verify_device_packed_multi_queue_pci(driver: DefaultDriver) {
     verify_device_multi_queue_pci_inner(test_mem, guest, num_queues, features).await;
 }
 
+// Test: Write misaligned, oversized and out-of-range PCI queue notifications.
+// Expected: The transport rejects each request with the specific public IO error.
 #[async_test]
 async fn pci_notification_rejects_invalid_accesses(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -3486,6 +3568,8 @@ async fn pci_notification_rejects_invalid_accesses(driver: DefaultDriver) {
     dev.pci_device.stop().await;
 }
 
+// Test: Request MMIO DRIVER_OK when the backend fails queue activation.
+// Expected: A completed guest access never observes DRIVER_OK after failed enable.
 #[async_test]
 async fn verify_enable_failure_mmio_does_not_set_driver_ok(_driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -3528,7 +3612,7 @@ async fn verify_enable_failure_mmio_does_not_set_driver_ok(_driver: DefaultDrive
 
     // Attempt DRIVER_OK — enable() will fail
     dev.write_u32(112, VIRTIO_DRIVER_OK);
-    yield_and_poll_device(&mut dev).await;
+    settle_transport(&mut dev, 112).await;
 
     // Device status should NOT have DRIVER_OK set
     let status = dev.read_u32(112);
@@ -3539,6 +3623,8 @@ async fn verify_enable_failure_mmio_does_not_set_driver_ok(_driver: DefaultDrive
     );
 }
 
+// Test: Request PCI DRIVER_OK when the backend fails queue activation.
+// Expected: A completed guest access never observes DRIVER_OK after failed enable.
 #[async_test]
 async fn verify_enable_failure_pci_does_not_set_driver_ok(_driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -3651,7 +3737,7 @@ async fn verify_enable_failure_pci_does_not_set_driver_ok(_driver: DefaultDriver
     // Attempt DRIVER_OK — enable() will fail (use write_u32 to bypass deferred IO)
     let current = dev.read_u32(20);
     dev.write_u32(20, (current & !0xff) | VIRTIO_DRIVER_OK);
-    yield_and_poll_device(&mut dev).await;
+    settle_transport(&mut dev, bar_address1 + 20).await;
 
     // Read back device status
     let status = dev.read_u32(20) & 0xff;
@@ -3664,6 +3750,8 @@ async fn verify_enable_failure_pci_does_not_set_driver_ok(_driver: DefaultDriver
 
 /// A linked chain using all queue_size descriptors (last has no NEXT flag)
 /// must succeed — this is the maximum valid chain length per spec §2.7.5.3.1.
+// Test: Submit a split chain containing exactly the queue's maximum descriptor count.
+// Expected: The entire legal chain completes successfully under its original head.
 #[async_test]
 async fn verify_chain_at_queue_size_succeeds(driver: DefaultDriver) {
     let queue_size: u16 = 4;
@@ -3698,6 +3786,8 @@ async fn verify_chain_at_queue_size_succeeds(driver: DefaultDriver) {
 
 /// A descriptor chain that forms a cycle (all queue_size descriptors point to
 /// the next, with the last wrapping back to the first) must be rejected.
+// Test: Submit a split chain whose final NEXT link cycles back to its first descriptor.
+// Expected: Fetch rejects the cyclic chain instead of accepting or endlessly following it.
 #[async_test]
 async fn verify_chain_cycle_rejected(driver: DefaultDriver) {
     let queue_size: u16 = 4;
@@ -3732,6 +3822,8 @@ async fn verify_chain_cycle_rejected(driver: DefaultDriver) {
 /// An indirect descriptor table with more entries than queue_size must be
 /// clamped to queue_size (spec §2.7.5.3.1: "A driver MUST NOT create a
 /// descriptor chain longer than the Queue Size of the device").
+// Test: Submit an indirect linked chain longer than the negotiated queue size.
+// Expected: Fetch rejects the overlong chain rather than truncating or accepting it.
 #[async_test]
 async fn verify_indirect_chain_clamped_to_queue_size(driver: DefaultDriver) {
     let queue_size: u16 = 4;
@@ -3793,6 +3885,8 @@ async fn verify_indirect_chain_clamped_to_queue_size(driver: DefaultDriver) {
 
 /// An indirect table with exactly queue_size entries (last has no NEXT)
 /// must succeed — this is the maximum valid indirect chain.
+// Test: Submit an indirect chain containing exactly the negotiated queue size.
+// Expected: The maximum legal indirect chain completes successfully under its ring head.
 #[async_test]
 async fn verify_indirect_chain_at_queue_size_succeeds(driver: DefaultDriver) {
     let queue_size: u16 = 4;
@@ -3829,6 +3923,8 @@ async fn verify_indirect_chain_at_queue_size_succeeds(driver: DefaultDriver) {
 /// (spec §2.7.5.3.2: "The device MUST handle the case of zero or more normal
 /// chained descriptors followed by a single descriptor with
 /// flags&VIRTQ_DESC_F_INDIRECT").
+// Test: Link a normal split descriptor to an indirect table with three entries.
+// Expected: All four data descriptors form one completion; the table head is not payload.
 #[async_test]
 async fn verify_normal_then_indirect_succeeds(driver: DefaultDriver) {
     let queue_size: u16 = 8;
@@ -3974,6 +4070,8 @@ async fn verify_peek_does_not_advance(mut guest: VirtioTestGuest) {
     );
 }
 
+// Test: Construct a fresh split queue and read its public saved progress.
+// Expected: Both free-running counters start at zero.
 #[async_test]
 async fn split_queue_state_initial_zero(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -3999,12 +4097,16 @@ async fn split_queue_state_initial_zero(driver: DefaultDriver) {
     );
 }
 
+// Test: Drop a split peek, repeat it, then consume and complete the same descriptor.
+// Expected: Dropped peeks do not advance or complete work; consume completes exactly once.
 #[async_test]
 async fn verify_split_peek_does_not_advance(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
     verify_peek_does_not_advance(VirtioTestGuest::new_split(&driver, &test_mem, 1, 2, true)).await;
 }
 
+// Test: Drop a packed peek, repeat it, then consume and complete the same descriptor.
+// Expected: Dropped peeks do not advance or complete work; consume completes exactly once.
 #[async_test]
 async fn verify_packed_peek_does_not_advance(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -4061,12 +4163,16 @@ async fn verify_peek_then_next(mut guest: VirtioTestGuest) {
     assert!(guest.get_next_completed(0).is_none());
 }
 
+// Test: Peek without consuming, then pop two split descriptors.
+// Expected: The peeked descriptor remains first and both distinct completion lengths survive.
 #[async_test]
 async fn verify_split_peek_then_next(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
     verify_peek_then_next(VirtioTestGuest::new_split(&driver, &test_mem, 1, 2, true)).await;
 }
 
+// Test: Peek without consuming, then pop two packed descriptors.
+// Expected: The peeked descriptor remains first and both distinct completion lengths survive.
 #[async_test]
 async fn verify_packed_peek_then_next(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -4137,6 +4243,8 @@ async fn verify_packed_peek_linked(mut guest: VirtioTestGuest) {
     );
 }
 
+// Test: Peek, drop, then consume a three-slot packed chain.
+// Expected: Payload addresses/lengths stay ordered and only consuming publishes a completion.
 #[async_test]
 async fn verify_packed_peek_linked_multi_descriptor(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -4144,6 +4252,8 @@ async fn verify_packed_peek_linked_multi_descriptor(driver: DefaultDriver) {
     verify_packed_peek_linked(VirtioTestGuest::new_packed(&driver, &test_mem, 1, 8, true)).await;
 }
 
+// Test: Consume and complete a split descriptor while saving progress at each step.
+// Expected: Available progress advances on pop; used progress advances only on completion.
 #[async_test]
 async fn split_queue_state_advances_on_pop(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -4170,6 +4280,8 @@ async fn split_queue_state_advances_on_pop(driver: DefaultDriver) {
     assert_eq!(state.used_index, 1);
 }
 
+// Test: Reconstruct a split queue with different saved available and used counters.
+// Expected: Both counters retain the restored progress rather than resetting to zero.
 #[async_test]
 async fn split_queue_new_with_state_roundtrip(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -4192,6 +4304,8 @@ async fn split_queue_new_with_state_roundtrip(driver: DefaultDriver) {
     assert_eq!(queue.queue_state(), initial);
 }
 
+// Test: Construct a fresh packed queue and read its serialized progress.
+// Expected: Both cursors start at slot zero with the initial wrap bit set.
 #[async_test]
 async fn packed_queue_state_initial(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -4213,6 +4327,8 @@ async fn packed_queue_state_initial(driver: DefaultDriver) {
     assert_eq!(state.used_index, 0x8000);
 }
 
+// Test: Reconstruct a packed queue with distinct saved available and used cursors.
+// Expected: Slot indices and wrap bits retain their restored values.
 #[async_test]
 async fn packed_queue_new_with_state_roundtrip(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -4312,21 +4428,13 @@ trait TestTransport {
     fn read_status(&mut self) -> u32;
     /// Read the config generation counter.
     fn read_config_generation(&mut self) -> u32;
-    /// Drive poll_device once with a noop waker.
-    fn poll_once(&mut self);
+    /// Await a guest status access queued behind any pending transition.
+    fn settle(&mut self) -> impl Future<Output = ()>;
     /// Drive ChangeDeviceState::stop().
     fn stop(&mut self) -> impl Future<Output = ()>;
     /// Drive ChangeDeviceState::start().
     fn start(&mut self);
     fn teardown(self) -> impl Future<Output = ()>;
-}
-
-/// Yield to the executor and poll the transport once. This ensures the device
-/// task has a chance to process any commands and the transport picks up the
-/// result.
-async fn yield_and_poll(transport: &mut impl TestTransport) {
-    yield_now().await;
-    transport.poll_once();
 }
 
 struct MmioTestTransport {
@@ -4382,10 +4490,8 @@ impl TestTransport for MmioTestTransport {
     fn read_config_generation(&mut self) -> u32 {
         self.dev.read_u32(0xfc)
     }
-    fn poll_once(&mut self) {
-        let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(waker);
-        self.dev.poll_device(&mut cx);
+    async fn settle(&mut self) {
+        settle_transport(&mut self.dev, 112).await;
     }
     async fn stop(&mut self) {
         ChangeDeviceState::stop(&mut self.dev).await;
@@ -4523,10 +4629,8 @@ impl TestTransport for PciTestTransport {
     fn read_config_generation(&mut self) -> u32 {
         (self.dev.read_u32(20) >> 8) & 0xff
     }
-    fn poll_once(&mut self) {
-        let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(waker);
-        self.dev.poll_device(&mut cx);
+    async fn settle(&mut self) {
+        settle_transport(&mut self.dev, 0x10000000000 + 20).await;
     }
     async fn stop(&mut self) {
         ChangeDeviceState::stop(&mut self.dev).await;
@@ -4545,8 +4649,7 @@ async fn verify_partial_failure_enters_disabling(transport: &mut impl TestTransp
     // Attempt DRIVER_OK — queue 1 will fail, queue 0 succeeded.
     transport.write_driver_ok();
 
-    // Yield to let device task process the Enable command.
-    yield_and_poll(transport).await;
+    transport.settle().await;
 
     // DRIVER_OK must NOT be set.
     let status = transport.read_status();
@@ -4564,7 +4667,7 @@ async fn verify_partial_failure_enters_disabling(transport: &mut impl TestTransp
 async fn verify_stop_completes_pending_disable(transport: &mut impl TestTransport) {
     // Trigger failure → enters disabling state.
     transport.write_driver_ok();
-    yield_and_poll(transport).await;
+    transport.settle().await;
     assert_eq!(transport.read_status() & VIRTIO_DRIVER_OK, 0);
 
     // Call stop() — should be a no-op since enable failure already cleaned up.
@@ -4577,6 +4680,8 @@ async fn verify_stop_completes_pending_disable(transport: &mut impl TestTranspor
 
 // -- MMIO tests --
 
+// Test: Fail the second MMIO queue after the first queue has activated.
+// Expected: Completing the failed enable resets status without accepting DRIVER_OK.
 #[async_test]
 async fn partial_queue_failure_enters_disabling_mmio(_driver: DefaultDriver) {
     let mut transport =
@@ -4584,6 +4689,8 @@ async fn partial_queue_failure_enters_disabling_mmio(_driver: DefaultDriver) {
     verify_partial_failure_enters_disabling(&mut transport).await;
 }
 
+// Test: Stop an MMIO transport after partial activation fails.
+// Expected: Stop completes cleanup and leaves device status fully reset.
 #[async_test]
 async fn stop_completes_pending_disable_mmio(_driver: DefaultDriver) {
     let mut transport =
@@ -4593,6 +4700,8 @@ async fn stop_completes_pending_disable_mmio(_driver: DefaultDriver) {
 
 // -- PCI tests --
 
+// Test: Fail the second PCI queue after the first queue has activated.
+// Expected: Completing the failed enable resets status without accepting DRIVER_OK.
 #[async_test]
 async fn partial_queue_failure_enters_disabling_pci(_driver: DefaultDriver) {
     let mut transport =
@@ -4600,6 +4709,8 @@ async fn partial_queue_failure_enters_disabling_pci(_driver: DefaultDriver) {
     verify_partial_failure_enters_disabling(&mut transport).await;
 }
 
+// Test: Stop a PCI transport after partial activation fails.
+// Expected: Stop completes cleanup and leaves device status fully reset.
 #[async_test]
 async fn stop_completes_pending_disable_pci(_driver: DefaultDriver) {
     let mut transport =
@@ -4611,11 +4722,7 @@ async fn verify_reset_during_enable_disables_queues(transport: &mut impl TestTra
     // Write DRIVER_OK — starts an async Enable.
     transport.write_driver_ok();
 
-    // Yield so the device task processes the Enable (which succeeds).
-    yield_now().await;
-
-    // Poll once — enable completes, DRIVER_OK is set.
-    transport.poll_once();
+    transport.settle().await;
 
     assert_ne!(
         transport.read_status() & VIRTIO_DRIVER_OK,
@@ -4626,11 +4733,7 @@ async fn verify_reset_during_enable_disables_queues(transport: &mut impl TestTra
     // Now write STATUS=0 to trigger a disable.
     transport.write_status_zero();
 
-    // Yield so the device task processes the Disable (stops queues).
-    yield_now().await;
-
-    // Poll to observe DisableComplete.
-    transport.poll_once();
+    transport.settle().await;
 
     // Status must be fully reset.
     assert_eq!(
@@ -4640,6 +4743,8 @@ async fn verify_reset_during_enable_disables_queues(transport: &mut impl TestTra
     );
 }
 
+// Test: Complete successful MMIO activation and then issue a guest reset.
+// Expected: DRIVER_OK is observed before reset and all status bits clear afterward.
 #[async_test]
 async fn reset_during_enable_disables_queues_mmio(_driver: DefaultDriver) {
     // Use PartialFailTestDevice with fail_at > max_queues so all queues succeed.
@@ -4648,6 +4753,8 @@ async fn reset_during_enable_disables_queues_mmio(_driver: DefaultDriver) {
     verify_reset_during_enable_disables_queues(&mut transport).await;
 }
 
+// Test: Complete successful PCI activation and then issue a guest reset.
+// Expected: DRIVER_OK is observed before reset and all status bits clear afterward.
 #[async_test]
 async fn reset_during_enable_disables_queues_pci(_driver: DefaultDriver) {
     let mut transport =
@@ -4659,6 +4766,8 @@ async fn reset_during_enable_disables_queues_pci(_driver: DefaultDriver) {
 ///
 /// If poll_disable_all only clears interrupt_status without calling
 /// line.set_level(false), the IntX line stays asserted after reset.
+// Test: Complete guest work through PCI IntX and then reset the device.
+// Expected: The asserted interrupt line becomes low when reset completes.
 #[async_test]
 async fn pci_intx_line_deasserted_on_reset(driver: DefaultDriver) {
     let test_mem = VirtioTestMemoryAccess::new();
@@ -4771,7 +4880,7 @@ async fn pci_intx_line_deasserted_on_reset(driver: DefaultDriver) {
     let current = dev.read_u32(20);
     dev.write_u32(20, (current & !0xff) | VIRTIO_DRIVER_OK);
 
-    yield_and_poll_device(&mut dev).await;
+    settle_transport(&mut dev, bar_address + 20).await;
 
     // Add a buffer to the avail ring and notify the device to process it.
     guest.add_to_avail_queue(0);
@@ -4785,17 +4894,8 @@ async fn pci_intx_line_deasserted_on_reset(driver: DefaultDriver) {
     let current = dev.read_u32(20);
     dev.write_u32(20, current & !0xff);
 
-    // Poll until the async disable completes and status resets to 0.
-    let mut timer = PolledTimer::new(&driver);
-    loop {
-        let waker = std::task::Waker::noop();
-        let mut cx = std::task::Context::from_waker(waker);
-        dev.poll_device(&mut cx);
-        if dev.read_u32(20) & 0xff == 0 {
-            break;
-        }
-        timer.sleep(Duration::from_millis(10)).await;
-    }
+    settle_transport(&mut dev, bar_address + 20).await;
+    assert_eq!(dev.read_u32(20) & 0xff, 0);
 
     // After the fix, poll_disable_all deasserts the IntX line.
     assert!(
@@ -4806,6 +4906,8 @@ async fn pci_intx_line_deasserted_on_reset(driver: DefaultDriver) {
 
 // ==================== Save/Restore Tests ====================
 
+// Test: Stop/save a negotiated PCI transport and restore into a fresh endpoint.
+// Expected: Saved status/queue configuration survive and restore does not require activation.
 #[async_test]
 async fn pci_save_restore_round_trip(driver: DefaultDriver) {
     use vmcore::device_state::ChangeDeviceState;
@@ -4851,6 +4953,8 @@ async fn pci_save_restore_round_trip(driver: DefaultDriver) {
     dev2.pci_device.stop().await;
 }
 
+// Test: Stop/save a negotiated MMIO transport and restore into a fresh endpoint.
+// Expected: Saved queue configuration and DRIVER_OK are retained through restore.
 #[async_test]
 async fn mmio_save_restore_round_trip(driver: DefaultDriver) {
     use crate::spec::mmio::VirtioMmioRegister;
@@ -4934,6 +5038,8 @@ async fn mmio_save_restore_round_trip(driver: DefaultDriver) {
     dev2.stop().await;
 }
 
+// Test: Restore a PCI snapshot into a backend missing a previously negotiated feature.
+// Expected: Restore rejects the incompatible device rather than silently dropping the feature.
 #[async_test]
 async fn pci_save_restore_incompatible_features(driver: DefaultDriver) {
     use vmcore::device_state::ChangeDeviceState;
@@ -4987,6 +5093,8 @@ async fn pci_save_restore_incompatible_features(driver: DefaultDriver) {
     );
 }
 
+// Test: Save a PCI backend that does not support save/restore.
+// Expected: The public save operation reports unsupported state explicitly.
 #[async_test]
 async fn pci_save_not_supported_device(_driver: DefaultDriver) {
     use vmcore::save_restore::AsyncSaveRestore;
@@ -5017,6 +5125,8 @@ async fn pci_save_not_supported_device(_driver: DefaultDriver) {
     assert!(result.is_err(), "save should fail for unsupported device");
 }
 
+// Test: Save an MMIO backend that does not support save/restore.
+// Expected: The public save operation reports unsupported state explicitly.
 #[async_test]
 async fn mmio_save_not_supported_device(_driver: DefaultDriver) {
     use vmcore::save_restore::SaveRestore;
@@ -5046,6 +5156,8 @@ async fn mmio_save_not_supported_device(_driver: DefaultDriver) {
     assert!(result.is_err(), "save should fail for unsupported device");
 }
 
+// Test: Restore PCI queues after destroying the original endpoint, then ring each doorbell.
+// Expected: Exact registrations reach restored queues, preserve payload tails and drop cleanly.
 #[async_test]
 async fn pci_restore_reinstalls_doorbells(driver: DefaultDriver) {
     use vmcore::save_restore::AsyncSaveRestore;
@@ -5058,9 +5170,10 @@ async fn pci_restore_reinstalls_doorbells(driver: DefaultDriver) {
 
     let test_mem = VirtioTestMemoryAccess::new();
 
-    let guest = VirtioTestGuest::new_split(&driver, &test_mem, QUEUE_COUNT, 4, true);
+    let mut guest = VirtioTestGuest::new_split(&driver, &test_mem, QUEUE_COUNT, 4, true);
+    let (callback, mut completions) = restored_queue_callback(guest.mem());
 
-    let mut dev = VirtioPciTestDevice::new(&driver, QUEUE_COUNT, &test_mem, None);
+    let mut dev = VirtioPciTestDevice::new(&driver, QUEUE_COUNT, &test_mem, Some(callback.clone()));
     guest
         .setup_pci_device(&mut dev, guest.queue_features())
         .await;
@@ -5100,7 +5213,7 @@ async fn pci_restore_reinstalls_doorbells(driver: DefaultDriver) {
     // installed from an address the production path does not have yet at that
     // point, so the assertion held while every restored VM ran without a single
     // doorbell.
-    let mut dev2 = VirtioPciTestDevice::new(&driver, QUEUE_COUNT, &test_mem, None);
+    let mut dev2 = VirtioPciTestDevice::new(&driver, QUEUE_COUNT, &test_mem, Some(callback));
     dev2.pci_device
         .restore(saved)
         .await
@@ -5113,9 +5226,15 @@ async fn pci_restore_reinstalls_doorbells(driver: DefaultDriver) {
          without them each kick is an MMIO exit to userspace instead of the ioeventfd"
     );
 
+    dev2.pci_device.start();
+    exercise_restored_doorbells(&mut guest, &expected, &mut completions).await;
     dev2.pci_device.stop().await;
+    dev2.pci_device.teardown().await;
+    assert!(test_mem.installed_doorbells().is_empty());
 }
 
+// Test: Restore MMIO after destroying the original endpoint and ring the registered doorbell.
+// Expected: Its address/value/width reaches restored work with correct payload and completion.
 #[async_test]
 async fn mmio_restore_reinstalls_doorbells(driver: DefaultDriver) {
     use vmcore::save_restore::SaveRestore;
@@ -5125,7 +5244,8 @@ async fn mmio_restore_reinstalls_doorbells(driver: DefaultDriver) {
     let mem = GuestMemory::new("test", test_mem.clone());
     let driver_source = VmTaskDriverSource::new(SingleDriverBackend::new(driver.clone()));
 
-    let guest = VirtioTestGuest::new_split(&driver, &test_mem, 1, 4, true);
+    let mut guest = VirtioTestGuest::new_split(&driver, &test_mem, 1, 4, true);
+    let (callback, mut completions) = restored_queue_callback(guest.mem());
 
     let interrupt = LineInterrupt::detached();
     let mut dev = VirtioMmioDevice::new(
@@ -5139,7 +5259,7 @@ async fn mmio_restore_reinstalls_doorbells(driver: DefaultDriver) {
                 device_register_length: 0,
                 ..Default::default()
             },
-            None,
+            Some(callback.clone()),
         )),
         &driver,
         mem.clone(),
@@ -5154,16 +5274,18 @@ async fn mmio_restore_reinstalls_doorbells(driver: DefaultDriver) {
         .setup_chipset_device(&mut dev, guest.queue_features())
         .await;
 
-    // After setup, doorbells should be registered.
-    let doorbells_after_setup = test_mem.doorbell_count.load(Ordering::Relaxed);
-    assert!(
-        doorbells_after_setup > 0,
-        "doorbells should be registered after setup"
-    );
+    let expected = vec![DoorbellSpec {
+        address: 80,
+        value: Some(0),
+        length: Some(4),
+    }];
+    assert_eq!(test_mem.installed_doorbells(), expected);
 
     // Stop, save, restore into a new device.
     dev.stop().await;
     let saved = dev.save().expect("save should succeed");
+    dev.teardown().await;
+    assert!(test_mem.installed_doorbells().is_empty());
 
     let interrupt2 = LineInterrupt::detached();
     let mut dev2 = VirtioMmioDevice::new(
@@ -5177,7 +5299,7 @@ async fn mmio_restore_reinstalls_doorbells(driver: DefaultDriver) {
                 device_register_length: 0,
                 ..Default::default()
             },
-            None,
+            Some(callback),
         )),
         &driver,
         mem.clone(),
@@ -5188,18 +5310,73 @@ async fn mmio_restore_reinstalls_doorbells(driver: DefaultDriver) {
     )
     .unwrap();
 
-    // Reset counter to isolate restore behavior.
-    test_mem.doorbell_count.store(0, Ordering::Relaxed);
     dev2.restore(saved).expect("restore should succeed");
-
-    // Doorbells must be reinstalled during restore.
-    let doorbells_after_restore = test_mem.doorbell_count.load(Ordering::Relaxed);
-    assert!(
-        doorbells_after_restore > 0,
-        "doorbells should be reinstalled after restore, got {doorbells_after_restore}"
-    );
-
+    assert_eq!(test_mem.installed_doorbells(), expected);
+    dev2.start();
+    exercise_restored_doorbells(&mut guest, &expected, &mut completions).await;
     dev2.stop().await;
+    dev2.teardown().await;
+    assert!(test_mem.installed_doorbells().is_empty());
+}
+
+fn restored_queue_callback(memory: GuestMemory) -> (TestDeviceQueueWorkFn, mesh::Receiver<u16>) {
+    let (completed, completions) = mesh::mpsc_channel();
+    let callback = Arc::new(
+        move |index: u16, queue: &mut VirtioQueue, work: VirtioQueueCallbackWork| {
+            assert_eq!(work.descriptor_index(), 0);
+            assert_eq!(work.payload.len(), 1);
+            assert_eq!(
+                work.payload[0].address,
+                0x4000 + u64::from(index) * 0x10000000
+            );
+            assert_eq!(work.payload[0].length, 4);
+            assert!(work.payload[0].writeable);
+            work.write(&memory, &[0x51, index as u8, 0x72, 0x93])
+                .unwrap();
+            queue.complete(work, 4);
+            completed.send(index);
+        },
+    );
+    (callback, completions)
+}
+
+async fn exercise_restored_doorbells(
+    guest: &mut VirtioTestGuest,
+    doorbells: &[DoorbellSpec],
+    completions: &mut mesh::Receiver<u16>,
+) {
+    for (index, &doorbell) in doorbells.iter().enumerate() {
+        let index = index as u16;
+        let address = guest.get_queue_descriptor_backing_memory_address(index);
+        guest.test_mem.modify_memory_map(address, &[0xa5; 6], true);
+        guest.add_to_avail_queue(index);
+        let descriptor = guest.get_queue_descriptor(index, 0);
+        guest
+            .test_mem
+            .modify_memory_map(descriptor + 8, &4u32.to_le_bytes(), false);
+        guest.test_mem.modify_memory_map(
+            descriptor + 12,
+            &DescriptorFlags::new()
+                .with_write(true)
+                .into_bits()
+                .to_le_bytes(),
+            false,
+        );
+        guest.test_mem.ring_doorbell(doorbell);
+        assert_eq!(
+            must_recv_in_timeout(completions, Duration::from_secs(5)).await,
+            index
+        );
+        assert_eq!(guest.get_next_completed(index), Some((0, 4)));
+        let mut bytes = [0; 6];
+        guest.mem().read_at(address, &mut bytes).unwrap();
+        assert_eq!(bytes, [0x51, index as u8, 0x72, 0x93, 0xa5, 0xa5]);
+        assert!(guest.get_next_completed(index).is_none());
+    }
+    assert!(matches!(
+        completions.try_recv(),
+        Err(mesh::TryRecvError::Empty)
+    ));
 }
 
 // -- Tests for drain / stop / reset side-effects --
@@ -5225,9 +5402,13 @@ async fn verify_stop_during_enable_preserves_driver_ok(transport: &mut impl Test
 
     // start() should re-enable queues (only happens when driver_ok is set).
     transport.start();
-    yield_now().await;
+    // Stop acknowledges the backend's earlier detached Start command.
+    transport.stop().await;
+    assert_ne!(transport.read_status() & VIRTIO_DRIVER_OK, 0);
 }
 
+// Test: Stop while MMIO enable is in flight, then restart and stop again.
+// Expected: Both acknowledged stops preserve DRIVER_OK needed for queue reactivation.
 #[async_test]
 async fn stop_during_enable_preserves_driver_ok_mmio(_driver: DefaultDriver) {
     let mut transport =
@@ -5235,6 +5416,8 @@ async fn stop_during_enable_preserves_driver_ok_mmio(_driver: DefaultDriver) {
     verify_stop_during_enable_preserves_driver_ok(&mut transport).await;
 }
 
+// Test: Stop while PCI enable is in flight, then restart and stop again.
+// Expected: Both acknowledged stops preserve DRIVER_OK needed for queue reactivation.
 #[async_test]
 async fn stop_during_enable_preserves_driver_ok_pci(_driver: DefaultDriver) {
     let mut transport =
@@ -5249,8 +5432,7 @@ async fn verify_stop_drains_in_flight_disable(transport: &mut impl TestTransport
     transport.write_driver_ok();
 
     // Complete the enable.
-    yield_now().await;
-    transport.poll_once();
+    transport.settle().await;
 
     // Write STATUS=0 — starts an async Disable.
     transport.write_status_zero();
@@ -5271,6 +5453,8 @@ async fn verify_stop_drains_in_flight_disable(transport: &mut impl TestTransport
     );
 }
 
+// Test: Stop an MMIO transport while guest reset is in flight.
+// Expected: Stop drains reset and clears both device status and config generation.
 #[async_test]
 async fn stop_drains_pending_reset_mmio(_driver: DefaultDriver) {
     let mut transport =
@@ -5278,6 +5462,8 @@ async fn stop_drains_pending_reset_mmio(_driver: DefaultDriver) {
     verify_stop_drains_in_flight_disable(&mut transport).await;
 }
 
+// Test: Stop a PCI transport while guest reset is in flight.
+// Expected: Stop drains reset and clears both device status and config generation.
 #[async_test]
 async fn stop_drains_pending_reset_pci(_driver: DefaultDriver) {
     let mut transport =
@@ -5306,6 +5492,8 @@ async fn verify_stop_during_failed_enable_resets_config(transport: &mut impl Tes
     );
 }
 
+// Test: Stop an MMIO transport before a failed enable has completed.
+// Expected: Draining the failure clears status and config generation.
 #[async_test]
 async fn stop_during_failed_enable_resets_config_mmio(_driver: DefaultDriver) {
     let mut transport =
@@ -5313,6 +5501,8 @@ async fn stop_during_failed_enable_resets_config_mmio(_driver: DefaultDriver) {
     verify_stop_during_failed_enable_resets_config(&mut transport).await;
 }
 
+// Test: Stop a PCI transport before a failed enable has completed.
+// Expected: Draining the failure clears status and config generation.
 #[async_test]
 async fn stop_during_failed_enable_resets_config_pci(_driver: DefaultDriver) {
     let mut transport =
@@ -5334,6 +5524,8 @@ async fn stop_during_failed_enable_resets_config_pci(_driver: DefaultDriver) {
 /// at offset `0x900`, so `address + offset` wraps to GPA `0xFF`. A correct
 /// implementation must fail the write (its real target is out of range) and
 /// MUST NOT touch `0xFF`.
+// Test: Write at an offset that overflows a guest descriptor's 64-bit address.
+// Expected: The write fails without wrapping into or corrupting unrelated low guest memory.
 #[async_test]
 async fn write_at_offset_overflow_does_not_wrap_to_low_gpa(driver: DefaultDriver) {
     use crate::test_helpers::init_avail_ring;
@@ -5419,6 +5611,8 @@ async fn write_at_offset_overflow_does_not_wrap_to_low_gpa(driver: DefaultDriver
 /// conformant driver makes a full-ring 4-descriptor chain available, the
 /// device consumes and completes it, and the saved queue state must show both
 /// wrap counters flipped.
+// Test: Consume and complete one packed chain spanning the entire four-slot ring.
+// Expected: Both saved progress cursors toggle their wrap bit after the full lap.
 #[async_test]
 async fn packed_full_ring_chain_toggles_wrap_counters(driver: DefaultDriver) {
     // Packed descriptor: address(u64)@0, length(u32)@8, buffer_id(u16)@12,
@@ -5514,6 +5708,8 @@ async fn packed_full_ring_chain_toggles_wrap_counters(driver: DefaultDriver) {
 /// Directly exercises the in-order completion helper: with it in front of the
 /// queue, descriptors completed out of order are published to the used ring
 /// strictly in avail (consumption) order.
+// Test: Complete split descriptors out of order through the public in-order adapter.
+// Expected: Only the completed prefix publishes and every head retains its distinct length.
 #[async_test]
 async fn in_order_completion_publishes_in_avail_order(driver: DefaultDriver) {
     use crate::in_order::InOrderCompletion;
@@ -5600,6 +5796,8 @@ async fn in_order_completion_publishes_in_avail_order(driver: DefaultDriver) {
     );
 }
 
+// Test: Reuse a split descriptor while its completion is direct or buffered.
+// Expected: Reuse fails without consumption until publication releases ownership.
 #[async_test]
 async fn in_order_rejects_reuse_until_published(driver: DefaultDriver) {
     use crate::in_order::InOrderCompletion;
@@ -5668,6 +5866,8 @@ async fn in_order_rejects_reuse_until_published(driver: DefaultDriver) {
     }
 }
 
+// Test: Reuse packed slots through three laps with direct and reverse-order completion.
+// Expected: Publication frees ownership and preserves IDs, lengths and wrap flags.
 #[async_test]
 async fn in_order_packed_reuse_after_publication_and_wrap(driver: DefaultDriver) {
     use crate::in_order::InOrderCompletion;
@@ -5732,6 +5932,8 @@ async fn in_order_packed_reuse_after_publication_and_wrap(driver: DefaultDriver)
 /// internal invariant violation (`try_next` rejects guest-induced duplicates),
 /// so the in-order helper must fail fast rather than silently
 /// stalling the used ring.
+// Test: Bypass ownership tracking to simulate an internal duplicate completion.
+// Expected: Completing the same still-buffered head twice fails the invariant explicitly.
 #[async_test]
 #[should_panic(expected = "completed more than once")]
 async fn in_order_double_complete_panics(driver: DefaultDriver) {
@@ -5801,6 +6003,8 @@ async fn in_order_double_complete_panics(driver: DefaultDriver) {
     in_order.complete(&mut queue, w1b.into_completion(), 1);
 }
 
+// Test: Fail guest used-ring entry/index writes on direct and prepared completion paths.
+// Expected: Failed publication does not strand host capacity for the next full ring.
 #[async_test]
 async fn completion_write_failure_releases_queue_capacity(driver: DefaultDriver) {
     use crate::test_helpers::read_used_idx;
@@ -5839,6 +6043,8 @@ async fn completion_write_failure_releases_queue_capacity(driver: DefaultDriver)
     }
 }
 
+// Test: Fail guest used-ring writes during direct and buffered in-order completion.
+// Expected: Ownership is released and a subsequent full ring remains consumable.
 #[async_test]
 async fn in_order_write_failure_releases_ownership_and_capacity(driver: DefaultDriver) {
     use crate::in_order::InOrderCompletion;
@@ -6052,6 +6258,8 @@ fn write_packed_descriptor(
     .unwrap();
 }
 
+// Test: Peek and pop split heads equal to queue size and u16::MAX.
+// Expected: InvalidDescriptorIndex names the head and the retired queue stops yielding work.
 #[async_test]
 async fn split_queue_rejects_out_of_range_descriptor_head(driver: DefaultDriver) {
     use crate::test_helpers::make_available;
@@ -6084,6 +6292,8 @@ async fn split_queue_rejects_out_of_range_descriptor_head(driver: DefaultDriver)
     }
 }
 
+// Test: Peek, consume and complete split heads at both valid index boundaries.
+// Expected: Head zero and the final slot complete without leaving extra work.
 #[async_test]
 async fn split_queue_accepts_descriptor_head_boundaries(driver: DefaultDriver) {
     use crate::test_helpers::make_available;
@@ -6107,6 +6317,8 @@ async fn split_queue_accepts_descriptor_head_boundaries(driver: DefaultDriver) {
     }
 }
 
+// Test: Make one more split buffer available than the ring can hold in flight.
+// Expected: Fetch reports the full-ring capacity and rejects the extra buffer.
 #[async_test]
 async fn split_queue_rejects_too_many_in_flight(driver: DefaultDriver) {
     let (mem, mut queue) = new_bound_test_queue(&driver, false, None);
@@ -6118,6 +6330,8 @@ async fn split_queue_rejects_too_many_in_flight(driver: DefaultDriver) {
     assert_in_flight_error(next_error(&mut queue), BOUND_TEST_QUEUE_SIZE, 1);
 }
 
+// Test: Restamp a packed slot for the next lap while all current slots remain outstanding.
+// Expected: Capacity validation rejects premature reuse.
 #[async_test]
 async fn packed_queue_rejects_restamped_slots(driver: DefaultDriver) {
     let (mem, mut queue) = new_bound_test_queue(&driver, true, None);
@@ -6143,6 +6357,8 @@ async fn packed_queue_rejects_restamped_slots(driver: DefaultDriver) {
     assert_in_flight_error(next_error(&mut queue), BOUND_TEST_QUEUE_SIZE, 1);
 }
 
+// Test: Submit a three-slot packed chain when a two-slot chain is already outstanding.
+// Expected: The entire new chain must fit; two free slots cannot accept three.
 #[async_test]
 async fn packed_queue_rejects_chain_exceeding_free_space(driver: DefaultDriver) {
     let (mem, mut queue) = new_bound_test_queue(&driver, true, None);
@@ -6170,6 +6386,8 @@ async fn packed_queue_rejects_chain_exceeding_free_space(driver: DefaultDriver) 
 /// violation. Completing outstanding work frees ring capacity but does not
 /// revive it: the rejected chain was never consumed, so the queue would hand
 /// out a descriptor the guest had already oversubscribed.
+// Test: Oversubscribe a split queue then complete previously accepted work.
+// Expected: Completion remains possible but freeing capacity cannot revive the retired queue.
 #[async_test]
 async fn split_queue_stays_retired_after_capacity_error(driver: DefaultDriver) {
     let (mem, mut queue) = new_bound_test_queue(&driver, false, None);
@@ -6190,6 +6408,8 @@ async fn split_queue_stays_retired_after_capacity_error(driver: DefaultDriver) {
     );
 }
 
+// Test: Restore split progress with two buffers outstanding and submit three more.
+// Expected: Restored ownership consumes capacity and the third new buffer is rejected.
 #[async_test]
 async fn split_queue_restore_seeds_in_flight(driver: DefaultDriver) {
     let (mem, mut queue) = new_bound_test_queue(
@@ -6208,6 +6428,8 @@ async fn split_queue_restore_seeds_in_flight(driver: DefaultDriver) {
     assert_in_flight_error(next_error(&mut queue), 4, 1);
 }
 
+// Test: Construct a packed queue with more than 32768 slots.
+// Expected: InvalidQueueSize reports the unsupported size before consuming descriptors.
 #[async_test]
 async fn packed_queue_new_rejects_oversized_size(driver: DefaultDriver) {
     let mem = GuestMemory::allocate(0x110000);
@@ -6234,6 +6456,8 @@ async fn packed_queue_new_rejects_oversized_size(driver: DefaultDriver) {
     ));
 }
 
+// Test: Restore impossible split progress and invalid packed cursor indices/distances.
+// Expected: InvalidSavedState reports the original counters and negotiated ring size.
 #[async_test]
 async fn queue_new_rejects_corrupt_saved_state(driver: DefaultDriver) {
     let cases = [
@@ -6266,6 +6490,8 @@ async fn queue_new_rejects_corrupt_saved_state(driver: DefaultDriver) {
 /// failure once and then report the queue as empty, so that a device worker
 /// which logs the error and keeps polling makes no further progress instead of
 /// spinning on the same bad chain forever.
+// Test: Fetch a cyclic split chain and then retry through pop and peek.
+// Expected: TooLong is reported exactly once; both subsequent calls report no work.
 #[async_test]
 async fn queue_reports_failure_only_once(driver: DefaultDriver) {
     let (mem, mut queue) = new_bound_test_queue(&driver, false, None);
@@ -6290,6 +6516,8 @@ async fn queue_reports_failure_only_once(driver: DefaultDriver) {
 /// error on every poll. It must not end the stream either: `None` would be
 /// ready synchronously on every poll, so a caller looping over the stream
 /// would spin on it exactly as it would on the repeated error.
+// Test: Drive a cyclic split queue through the Stream API.
+// Expected: One TooLong error is followed by Pending, not repeated errors or stream end.
 #[async_test]
 async fn queue_stream_parks_after_failure(driver: DefaultDriver) {
     let (mem, mut queue) = new_bound_test_queue(&driver, false, None);
@@ -6365,6 +6593,8 @@ async fn verify_teardown_drops_backend(
     );
 }
 
+// Test: Teardown fresh and previously activated PCI backends.
+// Expected: Teardown returns only after backend destruction has been acknowledged.
 #[async_test]
 async fn teardown_drops_backend_pci(driver: DefaultDriver) {
     for started in [false, true] {
@@ -6375,6 +6605,8 @@ async fn teardown_drops_backend_pci(driver: DefaultDriver) {
     }
 }
 
+// Test: Teardown fresh and previously activated MMIO backends.
+// Expected: Teardown returns only after backend destruction has been acknowledged.
 #[async_test]
 async fn teardown_drops_backend_mmio(driver: DefaultDriver) {
     for started in [false, true] {

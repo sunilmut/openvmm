@@ -282,6 +282,8 @@ mod tests {
     use super::*;
     use test_with_tracing::test;
 
+    // Test: Arm packed kicks with and without event indices across wrap boundaries.
+    // Expected: The guest-visible event flags, slot index and wrap match negotiation.
     #[test]
     fn kick_event_tracks_negotiated_index_and_wrap() {
         for use_event_index in [false, true] {
@@ -322,6 +324,8 @@ mod tests {
         }
     }
 
+    // Test: Publish packed work after kicks were armed, then arm again.
+    // Expected: Rechecking detects available work and suppresses redundant kicks.
     #[test]
     fn arming_rechecks_available_work_and_suppresses_kicks() {
         for use_event_index in [false, true] {

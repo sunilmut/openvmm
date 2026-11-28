@@ -4,18 +4,6 @@
 use super::*;
 use test_with_tracing::test;
 
-async fn finish_io<F: Future>(device: &mut impl PollDevice, future: F) -> F::Output {
-    let mut future = std::pin::pin!(future);
-    mesh::CancelContext::new()
-        .with_timeout(Duration::from_secs(5))
-        .until_cancelled(poll_fn(|cx| {
-            device.poll_device(cx);
-            future.as_mut().poll(cx)
-        }))
-        .await
-        .expect("transport did not complete deferred guest IO")
-}
-
 // Test: Queue reads and a guest reset behind an MMIO device enable operation.
 // Expected: The pre-reset read sees DRIVER_OK, reset cancels outstanding reads,
 //       and a fresh access observes reset status after both async transitions.

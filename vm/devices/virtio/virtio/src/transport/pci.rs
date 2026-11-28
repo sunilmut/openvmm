@@ -1344,7 +1344,10 @@ pub(crate) mod capabilities {
         use super::*;
         use pci_core::capabilities::ReadOnlyCapability;
         use pci_core::test_helpers::read_cap_u32;
+        use test_with_tracing::test;
 
+        // Test: Serialize a virtio common capability into public PCI config dwords.
+        // Expected: Type, BAR, offset and length retain their exact wire positions.
         #[test]
         fn common_check() {
             let common =
@@ -1355,6 +1358,8 @@ pub(crate) mod capabilities {
             assert_eq!(read_cap_u32(&common, 12), 0x200);
         }
 
+        // Test: Serialize a notification capability into public PCI config dwords.
+        // Expected: Notification type, BAR, offset and length retain their wire positions.
         #[test]
         fn notify_check() {
             let notify = ReadOnlyCapability::new(

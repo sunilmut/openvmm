@@ -739,6 +739,7 @@ impl Iterator for DescriptorChain<'_> {
 mod tests {
     use super::QueueError;
     use super::packed_in_flight;
+    use test_with_tracing::test;
 
     /// Encodes a packed cursor as it is stored in `QueueState`:
     /// `index | (wrap_counter << 15)`.
@@ -746,6 +747,8 @@ mod tests {
         index | (u16::from(wrap) << 15)
     }
 
+    // Test: Decode empty, partial, full and wrapped packed saved cursor distances.
+    // Expected: Both wrap polarities produce the correct outstanding slot count.
     #[test]
     fn packed_in_flight_decode() {
         let qs = 8;
@@ -784,6 +787,8 @@ mod tests {
         );
     }
 
+    // Test: Decode saved packed progress implying more than a full ring outstanding.
+    // Expected: InvalidSavedState rejects the impossible cursor distance.
     #[test]
     fn packed_in_flight_rejects_corrupt_state() {
         // Same wrap but avail index behind used index implies more than a full
