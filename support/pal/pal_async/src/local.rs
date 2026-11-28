@@ -259,27 +259,38 @@ impl PollTimer for Timer {
 mod tests {
     use super::block_with_io;
     use crate::executor_tests;
+    use test_with_tracing::test;
 
+    // Test: Complete a registered future from another thread on the local executor.
+    // Expected: The wake delivers the sent value and allows executor progress.
     #[test]
     fn waker_works() {
         block_with_io(|_| executor_tests::waker_tests())
     }
 
+    // Test: Delay and shorten a registered timer deadline on the local executor.
+    // Expected: Timers do not fire early and the replacement deadline wakes the waiter.
     #[test]
     fn sleep_works() {
         block_with_io(executor_tests::sleep_tests)
     }
 
+    // Test: Signal, cancel, reuse and drop event waits on the local executor.
+    // Expected: Signals are accounted for once and retained resources are released.
     #[test]
     fn wait_works() {
         block_with_io(executor_tests::wait_tests)
     }
 
+    // Test: Transfer, close and accept streams while changing readiness interests.
+    // Expected: The local executor delivers exact bytes and buffered data before EOF.
     #[test]
     fn socket_works() {
         block_with_io(executor_tests::socket_tests)
     }
 
+    // Test: Read, write, cancel and drop overlapped files and named pipes.
+    // Expected: File offsets, pipe payloads and cancellation errors are preserved.
     #[cfg(windows)]
     #[test]
     fn overlapped_file_works() {

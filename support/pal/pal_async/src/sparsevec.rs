@@ -80,6 +80,8 @@ mod tests {
     use super::SparseVec;
     use test_with_tracing::test;
 
+    // Test: Allocate two entries in an empty sparse vector.
+    // Expected: Both live entries retain their distinct indices and values.
     #[test]
     fn add_appends_entries() {
         let mut entries = SparseVec::new();
@@ -89,6 +91,8 @@ mod tests {
         assert_eq!(entries[1], "second");
     }
 
+    // Test: Remove nonadjacent entries and allocate replacements.
+    // Expected: The first vacancy is reused without changing the surviving entry.
     #[test]
     fn add_reuses_first_vacancy() {
         let mut entries = SparseVec::new();

@@ -676,8 +676,11 @@ mod tests {
     use futures::AsyncWriteExt;
     use futures::FutureExt;
     use pal_async_test::async_test;
+    use test_with_tracing::test;
     use unix_socket::UnixStream;
 
+    // Test: Echo data through split socket halves with concurrent reads and writes.
+    // Expected: Ordered payloads survive half-close and the relay reaches EOF.
     #[async_test]
     async fn split(driver: DefaultDriver) {
         let (a, b) = UnixStream::pair().unwrap();
@@ -701,6 +704,8 @@ mod tests {
         futures::future::join(copy, rest).await;
     }
 
+    // Test: Repeatedly peek and then read a live stream before peer closure.
+    // Expected: Peeks retain bytes for subsequent reads and closure produces EOF.
     #[async_test]
     async fn peek(driver: DefaultDriver) {
         let (a, b) = UnixStream::pair().unwrap();

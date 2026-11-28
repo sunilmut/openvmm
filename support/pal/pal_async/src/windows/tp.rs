@@ -549,32 +549,45 @@ mod tests {
     use crate::executor_tests;
     use crate::task::Spawn;
     use futures::executor::block_on;
+    use test_with_tracing::test;
 
+    // Test: Complete a registered future from another thread on the thread pool.
+    // Expected: The wake delivers the sent value and allows executor progress.
     #[test]
     fn waker_works() {
         block_on(TpPool::system().spawn("test", executor_tests::waker_tests()))
     }
 
+    // Test: Run empty, ready and pending task queues on the thread pool.
+    // Expected: Tasks complete after notification without leaked task metadata.
     #[test]
     fn spawn_works() {
         executor_tests::spawn_tests(|| (TpPool::system(), || ()))
     }
 
+    // Test: Delay and shorten a registered timer deadline on the thread pool.
+    // Expected: Timers do not fire early and the replacement deadline wakes the waiter.
     #[test]
     fn sleep_works() {
         block_on(TpPool::system().spawn("test", executor_tests::sleep_tests(TpPool::system())))
     }
 
+    // Test: Signal, cancel, reuse and drop event waits on the thread pool.
+    // Expected: Signals are accounted for once and retained resources are released.
     #[test]
     fn wait_works() {
         block_on(TpPool::system().spawn("test", executor_tests::wait_tests(TpPool::system())))
     }
 
+    // Test: Transfer, close and accept streams while changing readiness interests.
+    // Expected: The thread pool delivers exact bytes and buffered data before EOF.
     #[test]
     fn socket_works() {
         block_on(TpPool::system().spawn("test", executor_tests::socket_tests(TpPool::system())))
     }
 
+    // Test: Read, write, cancel and drop overlapped files and named pipes.
+    // Expected: File offsets, pipe payloads and cancellation errors are preserved.
     #[test]
     fn overlapped_file_works() {
         block_on(TpPool::system().spawn(
@@ -583,6 +596,8 @@ mod tests {
         ))
     }
 
+    // Test: Wait on successful, failed, running and already-reaped child processes.
+    // Expected: Exit results and child ownership survive asynchronous wait teardown.
     #[test]
     fn process_works() {
         block_on(TpPool::system().spawn("test", executor_tests::process_tests(TpPool::system())))

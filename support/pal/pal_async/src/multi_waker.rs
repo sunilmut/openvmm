@@ -183,6 +183,7 @@ mod tests {
     use std::task::Poll;
     use std::task::Waker;
     use std::time::Duration;
+    use test_with_tracing::test;
 
     #[derive(Default)]
     struct SlimEvent {
@@ -218,28 +219,51 @@ mod tests {
         }
     }
 
+    // Test: Register two concurrent waiters on an event with one saved waker.
+    // Expected: One signal completes both waits after both registrations.
     #[test]
     fn test_multiwaker() {
         let mw = Arc::new(MultiWaker::<2>::new());
         let event = Arc::new(SlimEvent::default());
+        let (registered, receive_registered) = std::sync::mpsc::channel();
+        let (done, receive_done) = std::sync::mpsc::channel();
         let f = |index| {
             let mw = mw.clone();
             let event = event.clone();
+            let mut registered = Some(registered.clone());
+            let done = done.clone();
             move || {
                 block_on(async {
-                    poll_fn(|cx| mw.poll_wrapped(cx, index, |cx| event.poll_wait(cx))).await
-                })
+                    poll_fn(|cx| {
+                        let result = mw.poll_wrapped(cx, index, |cx| event.poll_wait(cx));
+                        if let Some(registered) = registered.take() {
+                            assert!(result.is_pending());
+                            registered.send(()).unwrap();
+                        }
+                        result
+                    })
+                    .await
+                });
+                done.send(()).unwrap();
             }
         };
         let t1 = std::thread::spawn(f(0));
         let t2 = std::thread::spawn(f(1));
-        std::thread::sleep(Duration::from_millis(100));
+        for _ in 0..2 {
+            receive_registered
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }
         event.signal();
-
+        for _ in 0..2 {
+            receive_done.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
         t1.join().unwrap();
         t2.join().unwrap();
     }
 
+    // Test: Check the thread-safety bounds required by the borrowed raw waker.
+    // Expected: Its referent implements Send and Sync as required by the vtable.
     #[test]
     fn ref_is_send_sync() {
         fn assert_send<T: Send>() {}

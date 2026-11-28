@@ -27,6 +27,8 @@ use windows_sys::Win32::Foundation::ERROR_PIPE_NOT_CONNECTED;
 use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Foundation::GENERIC_WRITE;
 
+// Test: Reuse a server while clients close around connection event registration.
+// Expected: Closure is observed in every generation and disconnect permits reuse.
 #[async_test]
 async fn reuse_server_pipe_after_client_close(driver: DefaultDriver) {
     let mut id = [0; 16];
@@ -76,6 +78,8 @@ async fn reuse_server_pipe_after_client_close(driver: DefaultDriver) {
     }
 }
 
+// Test: Start listening after a client has already connected.
+// Expected: Listening completes immediately with a connected server pipe.
 #[async_test]
 async fn listening_pipe_ready_when_client_already_connected(driver: DefaultDriver) {
     let mut id = [0; 16];
@@ -103,6 +107,8 @@ async fn listening_pipe_ready_when_client_already_connected(driver: DefaultDrive
     assert!(server.is_pipe_connected().unwrap());
 }
 
+// Test: Register closure polling after the connected client has closed.
+// Expected: The closure poll completes immediately without a new notification.
 #[async_test]
 async fn poll_closing_ready_when_client_closed_before_registration(driver: DefaultDriver) {
     let mut id = [0; 16];
@@ -134,6 +140,8 @@ async fn poll_closing_ready_when_client_closed_before_registration(driver: Defau
     );
 }
 
+// Test: Disconnect a server while its client's read is pending.
+// Expected: The registered read wakes and completes with EOF.
 #[async_test]
 async fn client_read_completes_when_server_disconnects(driver: DefaultDriver) {
     let mut id = [0; 16];
@@ -159,6 +167,8 @@ async fn client_read_completes_when_server_disconnects(driver: DefaultDriver) {
     assert_eq!(read.await.unwrap(), 0);
 }
 
+// Test: Supply a disconnected-pipe query error after a real server disconnect.
+// Expected: Closure polling and reading expose closure and EOF, not the query error.
 #[async_test]
 async fn disconnected_pipe_event_query_reports_eof(driver: DefaultDriver) {
     let mut id = [0; 16];
@@ -197,6 +207,8 @@ async fn disconnected_pipe_event_query_reports_eof(driver: DefaultDriver) {
     assert_eq!(connected.read(&mut [0]).await.unwrap(), 0);
 }
 
+// Test: Poll closure while a full pipe waits for its client to drain writes.
+// Expected: Closure remains pending and a later write wakes and transfers one byte.
 #[async_test]
 async fn poll_closing_preserves_write_readiness(driver: DefaultDriver) {
     let mut id = [0; 16];
@@ -237,4 +249,7 @@ async fn poll_closing_preserves_write_readiness(driver: DefaultDriver) {
     .await
     .unwrap();
     assert_eq!(n, 1);
+    let mut received = [0];
+    client.read_exact(&mut received).unwrap();
+    assert_eq!(&received, b"x");
 }

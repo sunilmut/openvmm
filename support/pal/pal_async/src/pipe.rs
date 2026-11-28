@@ -12,7 +12,10 @@ mod tests {
     use futures::AsyncReadExt;
     use futures::AsyncWriteExt;
     use pal_async_test::async_test;
+    use test_with_tracing::test;
 
+    // Test: Read a pipe before and after its writer closes with buffered data.
+    // Expected: Exact bytes arrive in order and EOF follows the final payload.
     #[async_test]
     async fn pipe(driver: DefaultDriver) {
         let (mut a, mut b) = PolledPipe::pair(&driver).unwrap();
@@ -28,11 +31,13 @@ mod tests {
         assert_eq!(v.as_slice(), b"abcdef");
     }
 
+    // Test: Relay a large stream through independently owned bidirectional halves.
+    // Expected: The whole stream drains and closing writers terminates both reads.
     #[cfg(windows)] // relies on pipes being bidirectional
     #[async_test]
     async fn pipe_relay(driver: DefaultDriver) {
         let (a, b) = PolledPipe::pair(&driver).unwrap();
-        let (a_r, mut a_w) = a.split();
+        let (mut a_r, mut a_w) = a.split();
         let (b_r, mut b_w) = b.split();
         let relay = async move {
             assert_eq!(
@@ -53,12 +58,10 @@ mod tests {
             drop(a_w);
         };
         let drain = async {
-            assert_eq!(
-                futures::io::copy(a_r, &mut futures::io::sink())
-                    .await
-                    .unwrap(),
-                0x100000
-            );
+            let mut received = Vec::new();
+            a_r.read_to_end(&mut received).await.unwrap();
+            assert_eq!(received.len(), 0x100000);
+            assert!(received.iter().all(|&byte| byte == 0xcc));
         };
         futures::future::join3(relay, feed, drain).await;
     }

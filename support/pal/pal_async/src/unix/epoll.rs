@@ -521,12 +521,17 @@ impl PollTimer for Timer {
 mod tests {
     use super::EpollPool;
     use crate::executor_tests;
+    use test_with_tracing::test;
 
+    // Test: Complete a registered future from another thread on the epoll pool.
+    // Expected: The wake delivers the sent value and allows executor progress.
     #[test]
     fn waker_works() {
         EpollPool::run_with(|_| executor_tests::waker_tests())
     }
 
+    // Test: Run empty, ready and pending task queues on the epoll pool.
+    // Expected: Tasks complete after notification and the pool shuts down cleanly.
     #[test]
     fn spawn_works() {
         executor_tests::spawn_tests(|| {
@@ -535,26 +540,36 @@ mod tests {
         })
     }
 
+    // Test: Delay and shorten a registered timer deadline on the epoll pool.
+    // Expected: Timers do not fire early and the replacement deadline wakes the waiter.
     #[test]
     fn sleep_works() {
         EpollPool::run_with(executor_tests::sleep_tests)
     }
 
+    // Test: Signal, cancel, reuse and drop event waits on the epoll pool.
+    // Expected: Signals are accounted for once and retained resources are released.
     #[test]
     fn wait_works() {
         EpollPool::run_with(executor_tests::wait_tests)
     }
 
+    // Test: Transfer, close and accept streams while changing readiness interests.
+    // Expected: The epoll pool delivers exact bytes and buffered data before EOF.
     #[test]
     fn socket_works() {
         EpollPool::run_with(executor_tests::socket_tests)
     }
 
+    // Test: Wait on successful, failed, running and already-reaped child processes.
+    // Expected: Exit results and child ownership survive asynchronous wait teardown.
     #[test]
     fn process_works() {
         EpollPool::run_with(executor_tests::process_tests)
     }
 
+    // Test: Submit probed, queued, remote and real I/O operations through io_uring.
+    // Expected: All completions, result lengths and transferred bytes are preserved.
     #[test]
     fn uring_works() {
         EpollPool::run_with(executor_tests::io_uring_tests::uring_tests)

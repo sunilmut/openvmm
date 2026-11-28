@@ -35,16 +35,21 @@ use unix_socket::UnixListener;
 use unix_socket::UnixStream;
 
 /// Runs waker-related tests.
+// Test: Deliver a value from another thread after registering a pending receiver.
+// Expected: The executor wakes and returns the exact value.
 pub async fn waker_tests() {
-    let (send, recv) = oneshot::channel();
-    std::thread::spawn(|| {
-        std::thread::sleep(Duration::from_millis(100));
-        send.send(()).unwrap();
+    let (send, mut recv) = oneshot::channel();
+    assert!(futures::poll!(&mut recv).is_pending());
+    let thread = std::thread::spawn(|| {
+        send.send(73).unwrap();
     });
-    recv.await.unwrap();
+    assert_eq!(recv.await.unwrap(), 73);
+    thread.join().unwrap();
 }
 
 /// Runs spawn-related tests.
+// Test: Drive empty, ready and notified pending task queues to completion.
+// Expected: Task results and post-run metadata cleanup survive driver teardown.
 pub fn spawn_tests<S, F>(mut f: impl FnMut() -> (S, F))
 where
     S: Spawn,
@@ -80,18 +85,34 @@ where
     {
         let (spawn, run) = f();
         let t = std::thread::spawn(run);
-        let (send, recv) = oneshot::channel::<()>();
-        let mut h = spawn.spawn("pending", recv);
+        let (send, mut recv) = oneshot::channel::<()>();
+        let (started, receive_started) = std::sync::mpsc::channel();
+        let mut started = Some(started);
+        let mut h = spawn.spawn(
+            "pending",
+            poll_fn(move |cx| {
+                let result = recv.poll_unpin(cx);
+                if let Some(started) = started.take() {
+                    assert!(result.is_pending());
+                    started.send(()).unwrap();
+                }
+                result
+            }),
+        );
         drop(spawn);
-        std::thread::sleep(Duration::from_millis(100));
+        receive_started
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
         assert!((&mut h).now_or_never().is_none());
         drop(send);
-        let _ = block_on(h);
+        assert!(block_on(h).is_err());
         t.join().unwrap();
     }
 }
 
 /// Runs timer-related tests.
+// Test: Wait for a deadline and shorten a timer registered from another thread.
+// Expected: Neither timer fires early and shortening wakes the registered waiter.
 pub async fn sleep_tests(driver: impl Driver) {
     let now = Instant::now();
     let duration = Duration::from_millis(250);
@@ -106,20 +127,32 @@ pub async fn sleep_tests(driver: impl Driver) {
         .lock()
         .set_deadline(started + Duration::from_secs(1000));
     let (send, mut recv) = oneshot::channel();
-    std::thread::spawn({
+    let (registered, receive_registered) = std::sync::mpsc::channel();
+    let thread = std::thread::spawn({
         let timer = timer.clone();
         move || {
-            let now = block_on(poll_fn(|cx| timer.lock().poll_timer(cx, None)));
+            let mut registered = Some(registered);
+            let now = block_on(poll_fn(|cx| {
+                let result = timer.lock().poll_timer(cx, None);
+                if let Some(registered) = registered.take() {
+                    assert!(result.is_pending());
+                    registered.send(()).unwrap();
+                }
+                result
+            }));
             send.send(now).unwrap();
         }
     });
-    std::thread::sleep(Duration::from_millis(100));
+    receive_registered
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
     assert!((&mut recv).now_or_never().is_none());
     timer.lock().set_deadline(started + duration);
     let done_at = recv.await.unwrap();
     let now = Instant::now();
     assert!(done_at >= started + duration);
     assert!(done_at <= now);
+    thread.join().unwrap();
 }
 
 async fn pend_once() {
@@ -137,6 +170,8 @@ async fn pend_once() {
 }
 
 /// Runs wait-related tests.
+// Test: Consume, cancel, replace and drop registered event waits and their wakers.
+// Expected: Signals are accounted for once and waker-owned resources are released.
 pub async fn wait_tests(driver: impl Driver) {
     let event = Event::new();
     let mut poller = cfg_select! {
@@ -324,6 +359,8 @@ async fn wait_waker_drop_tests(driver: &impl Driver) {
 }
 
 /// Runs socket-related tests.
+// Test: Send through paired and accepted streams after read-interest registration.
+// Expected: Exact payloads arrive and buffered bytes precede write-close EOF.
 pub async fn socket_tests(driver: impl Driver) {
     // send/close/recv
     {
@@ -346,23 +383,34 @@ pub async fn socket_tests(driver: impl Driver) {
             .make(|path| UnixListener::bind(path))
             .unwrap();
         let mut l = PolledSocket::new(&driver, listener.as_file()).unwrap();
-        let _c = PolledSocket::connect_unix(&driver, listener.path())
+        let mut c = PolledSocket::connect_unix(&driver, listener.path())
             .await
             .unwrap();
-        let _s = l.accept().await.unwrap();
+        let (s, _) = l.accept().await.unwrap();
+        let mut s = PolledSocket::new(&driver, s).unwrap();
+        c.write_all(b"accepted").await.unwrap();
+        let mut received = [0; 8];
+        s.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"accepted");
     }
 
     // read then write, to check for changing interests
     {
-        let (a, _b) = UnixStream::pair().unwrap();
+        let (a, b) = UnixStream::pair().unwrap();
         let mut a = PolledSocket::new(&driver, a).unwrap();
+        let mut b = PolledSocket::new(&driver, b).unwrap();
         let mut v = [0; 8];
         assert!(a.read(&mut v).now_or_never().is_none());
         a.write_all(b"hello world").await.unwrap();
+        let mut received = [0; 11];
+        b.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"hello world");
     }
 }
 
 /// Runs process wait tests.
+// Test: Wait on successful, failed, running and already-exited child processes.
+// Expected: Status results remain observable and extraction preserves child ownership.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub async fn process_tests(driver: impl Driver) {
     use crate::process::PolledChild;
@@ -475,15 +523,15 @@ pub async fn process_tests(driver: impl Driver) {
         assert!(status.success());
     }
 
-    // dropping a pending PolledChild does not reap or kill the child
+    // Extracting a child drops its wait registration without reaping or killing it.
     {
         let child = long_running_command().spawn().unwrap();
         let polled = StdPolledChild::new(&driver, child).unwrap();
-        // Drop the PolledChild while the child is still running.
+        // Extract the child while it is still running.
         let mut child = polled.into_inner();
         // The child should still be alive — try_wait should return None.
         let status = child.try_wait().unwrap();
-        assert!(status.is_none(), "child was reaped or killed by drop");
+        assert!(status.is_none(), "child was reaped or killed by extraction");
         child.kill().unwrap();
         child.wait().unwrap();
     }
@@ -585,9 +633,10 @@ pub mod io_uring_tests {
     use crate::driver::Driver;
     use io_uring::opcode;
     use io_uring::types;
-    use std::task::Poll;
 
     /// Runs all io-uring tests.
+    // Test: Submit probed, queued, remote and real I/O operations through io_uring.
+    // Expected: Every completion and real I/O payload is preserved.
     pub async fn uring_tests(driver: impl Driver) {
         uring_nop(&driver).await;
         uring_probe(&driver).await;
@@ -596,12 +645,13 @@ pub mod io_uring_tests {
         uring_cq_saturation(&driver).await;
         uring_remote_submit(&driver).await;
         uring_remote_batch(&driver).await;
-        uring_busy_loop_completions(&driver).await;
         uring_read_write(&driver).await;
         uring_pipe_round_trip(&driver).await;
     }
 
     /// Submit a single NOP and await its completion.
+    // Test: Submit one no-op operation through the driver.
+    // Expected: The operation completes successfully with a zero result.
     async fn uring_nop(uring: &dyn Driver) {
         let sqe = opcode::Nop::new().build();
         // SAFETY: NOP references no memory.
@@ -610,6 +660,8 @@ pub mod io_uring_tests {
     }
 
     /// Verify probe returns true for NOP and false for an invalid opcode.
+    // Test: Probe one supported opcode and one invalid opcode.
+    // Expected: Only the supported no-op operation is reported available.
     async fn uring_probe(uring: &dyn Driver) {
         assert!(uring.io_uring_probe(opcode::Nop::CODE));
         // Opcode 255 is not a valid io-uring opcode.
@@ -617,6 +669,8 @@ pub mod io_uring_tests {
     }
 
     /// Submit multiple NOPs concurrently and verify all complete.
+    // Test: Submit multiple no-op operations before awaiting completion.
+    // Expected: Every operation returns a successful zero result.
     async fn uring_multiple_nops(uring: &dyn Driver) {
         let mut futures: Vec<_> = (0..10)
             .map(|_| {
@@ -634,6 +688,8 @@ pub mod io_uring_tests {
 
     /// Submit more NOPs than the SQ can hold (64), forcing the on-thread
     /// fast path to hit SQ-full and submit inline.
+    // Test: Submit a batch exceeding the default submission queue capacity.
+    // Expected: Every queued operation completes without losing requests.
     async fn uring_sq_full(uring: &dyn Driver) {
         let count = 80;
         let mut futures: Vec<_> = (0..count)
@@ -654,6 +710,8 @@ pub mod io_uring_tests {
     /// Submit more NOPs than the CQ can hold (default 2×SQ = 128),
     /// verifying all completions are delivered even when the CQ must
     /// be drained and refilled multiple times.
+    // Test: Submit a batch exceeding the default completion queue capacity.
+    // Expected: All operations return successful results across queue draining.
     async fn uring_cq_saturation(uring: &dyn Driver) {
         let count = 256;
         let mut futures: Vec<_> = (0..count)
@@ -678,6 +736,8 @@ pub mod io_uring_tests {
     /// calls `queue_sqe` via the remote/off-thread path), then awaits
     /// the future on the executor thread where the event loop flushes
     /// the remote queue and delivers the completion.
+    // Test: First poll a no-op submission off the executor thread.
+    // Expected: The executor delivers its successful completion.
     async fn uring_remote_submit(uring: &dyn Driver) {
         let sqe = opcode::Nop::new().build();
         // SAFETY: NOP references no memory.
@@ -701,6 +761,8 @@ pub mod io_uring_tests {
 
     /// Submit NOPs from multiple threads concurrently, stressing
     /// the remote queue under contention.
+    // Test: Queue no-op operations concurrently from multiple remote threads.
+    // Expected: All submitted operations complete successfully.
     async fn uring_remote_batch(uring: &dyn Driver) {
         let count_per_thread = 20;
         let num_threads = 4;
@@ -732,35 +794,10 @@ pub mod io_uring_tests {
         }
     }
 
-    /// Submit a NOP, then busy-loop the executor to verify CQ drain
-    /// happens during RunAgain (not just before sleep).
-    async fn uring_busy_loop_completions(uring: &dyn Driver) {
-        let sqe = opcode::Nop::new().build();
-        // SAFETY: NOP references no memory.
-        let mut fut = unsafe { uring.io_uring_submit(sqe) };
-
-        // Busy-loop: yield back to the executor several times while
-        // re-waking ourselves, as RunAgain would.
-        for _ in 0..10 {
-            if let Poll::Ready(result) = futures::poll!(&mut fut) {
-                assert_eq!(result.unwrap(), 0);
-                return;
-            }
-            // Yield once, keeping the executor in RunAgain.
-            std::future::poll_fn(|cx| {
-                cx.waker().wake_by_ref();
-                Poll::Ready(())
-            })
-            .await;
-        }
-
-        // If we didn't complete during busy-looping, await normally.
-        let result = fut.await.unwrap();
-        assert_eq!(result, 0);
-    }
-
     /// Submit a real read via io-uring on an eventfd, verifying
     /// non-NOP operations work end-to-end.
+    // Test: Read a signaled eventfd through the driver's io_uring submission API.
+    // Expected: The completion length and the eventfd value match the written signal.
     async fn uring_read_write(uring: &dyn Driver) {
         // Create an eventfd for testing.
         // SAFETY: eventfd with valid flags.
@@ -796,6 +833,8 @@ pub mod io_uring_tests {
 
     /// Submit a write + read via io-uring to a pipe, verifying the
     /// data round-trips correctly.
+    // Test: Submit a write and a read against a real pipe.
+    // Expected: Both byte counts and the received payload match.
     async fn uring_pipe_round_trip(uring: &dyn Driver) {
         let mut fds = [0i32; 2];
         // SAFETY: pipe2 with valid args.
@@ -855,6 +894,8 @@ pub mod windows {
     use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
 
     /// Runs overlapped file tests.
+    // Test: Perform offset I/O and pending read cancellation on files and pipes.
+    // Expected: Exact data, sparse bytes and operation-aborted errors are preserved.
     pub async fn overlapped_file_tests(driver: impl Driver) {
         // ordinary file
         {

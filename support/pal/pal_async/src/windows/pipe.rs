@@ -447,7 +447,10 @@ mod tests {
     use futures::AsyncWriteExt;
     use pal_async_test::async_test;
     use std::fs::OpenOptions;
+    use test_with_tracing::test;
 
+    // Test: Reaccept clients on one named-pipe server and send the final payload.
+    // Expected: Each accept succeeds and the final client reads exact bytes then EOF.
     #[async_test]
     async fn named_pipe_server(driver: DefaultDriver) {
         let mut path = [0; 16];
@@ -482,6 +485,8 @@ mod tests {
         assert_eq!(b.as_slice(), b"abc");
     }
 
+    // Test: Register a pipe after its peer has already closed.
+    // Expected: The first read observes EOF rather than waiting for another event.
     #[async_test]
     async fn half_open(driver: DefaultDriver) {
         let (p1, p2) = pal::windows::pipe::bidirectional_pair(false).unwrap();

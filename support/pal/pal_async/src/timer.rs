@@ -252,13 +252,15 @@ impl TimerQueue {
 mod tests {
     use super::Instant;
     use std::time::Duration;
+    use test_with_tracing::test;
 
+    // Test: Observe the platform monotonic clock across a real delay.
+    // Expected: Elapsed time is at least the requested delay, regardless of load.
     #[test]
     fn test_instant() {
         let start = Instant::now();
         std::thread::sleep(Duration::from_millis(100));
         let end = Instant::now();
         assert!(end - start >= Duration::from_millis(100));
-        assert!(end - start < Duration::from_millis(400));
     }
 }

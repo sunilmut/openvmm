@@ -586,12 +586,17 @@ impl IoOverlapped for OverlappedIo {
 mod tests {
     use super::IocpPool;
     use crate::executor_tests;
+    use test_with_tracing::test;
 
+    // Test: Complete a registered future from another thread on the IOCP pool.
+    // Expected: The wake delivers the sent value and allows executor progress.
     #[test]
     fn waker_works() {
         IocpPool::run_with(|_| executor_tests::waker_tests())
     }
 
+    // Test: Run empty, ready and pending task queues on the IOCP pool.
+    // Expected: Tasks complete after notification and the pool shuts down cleanly.
     #[test]
     fn spawn_works() {
         executor_tests::spawn_tests(|| {
@@ -600,26 +605,36 @@ mod tests {
         })
     }
 
+    // Test: Delay and shorten a registered timer deadline on the IOCP pool.
+    // Expected: Timers do not fire early and the replacement deadline wakes the waiter.
     #[test]
     fn sleep_works() {
         IocpPool::run_with(executor_tests::sleep_tests)
     }
 
+    // Test: Signal, cancel, reuse and drop event waits on the IOCP pool.
+    // Expected: Signals are accounted for once and retained resources are released.
     #[test]
     fn wait_works() {
         IocpPool::run_with(executor_tests::wait_tests)
     }
 
+    // Test: Transfer, close and accept streams while changing readiness interests.
+    // Expected: The IOCP pool delivers exact bytes and buffered data before EOF.
     #[test]
     fn socket_works() {
         IocpPool::run_with(executor_tests::socket_tests)
     }
 
+    // Test: Read, write, cancel and drop overlapped files and named pipes.
+    // Expected: File offsets, pipe payloads and cancellation errors are preserved.
     #[test]
     fn overlapped_file_works() {
         IocpPool::run_with(executor_tests::windows::overlapped_file_tests)
     }
 
+    // Test: Wait on successful, failed, running and already-reaped child processes.
+    // Expected: Exit results and child ownership survive asynchronous wait teardown.
     #[test]
     fn process_works() {
         IocpPool::run_with(executor_tests::process_tests)
