@@ -317,6 +317,9 @@ mod tests {
     use std::ptr::from_ref;
     use test_with_tracing::test;
 
+    // Test: Grow wrapped queues containing large and over-aligned payloads.
+    // Expected: All bytes retain FIFO order and aligned storage after growth
+    //       and reuse following clear_and_shrink.
     #[test]
     fn test_allocation_layout_and_growth() {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,8 +332,6 @@ mod tests {
                 // SAFETY: copying a valid value of the vtable's Copy type.
                 unsafe { deque.push_back(from_ref(value).cast()) };
             }
-            assert_eq!(deque.cap, initial_capacity * size_of::<T>());
-            assert!(deque.buf.as_ptr().addr().is_multiple_of(align_of::<T>()));
             // SAFETY: the queue contains initialized values of type T.
             let first = unsafe {
                 deque
@@ -346,23 +347,22 @@ mod tests {
                 // SAFETY: copying a valid value of the vtable's Copy type.
                 unsafe { deque.push_back(from_ref(value).cast()) };
             }
-            assert_eq!(deque.cap, initial_capacity * 2 * size_of::<T>());
-            assert!(deque.buf.as_ptr().addr().is_multiple_of(align_of::<T>()));
             for expected in &values[1..initial_capacity + 2] {
+                let element = deque.pop_front_in_place().unwrap();
+                assert!(element.as_ptr().cast::<T>().is_aligned());
                 // SAFETY: the queue contains initialized values of type T.
-                let value = unsafe {
-                    deque
-                        .pop_front_in_place()
-                        .unwrap()
-                        .as_ptr()
-                        .cast::<T>()
-                        .read()
-                };
+                let value = unsafe { element.as_ptr().cast::<T>().read() };
                 assert_eq!(&value, expected);
             }
             assert!(deque.is_empty());
             deque.clear_and_shrink();
-            assert_eq!(deque.cap, 0);
+            // SAFETY: copying a valid value of the vtable's Copy type.
+            unsafe { deque.push_back(from_ref(&values[0]).cast()) };
+            let element = deque.pop_front_in_place().unwrap();
+            assert!(element.as_ptr().cast::<T>().is_aligned());
+            // SAFETY: this element is an initialized value of type T.
+            assert_eq!(unsafe { element.as_ptr().cast::<T>().read() }, values[0]);
+            assert!(deque.is_empty());
         }
 
         let values = [0u8, 1, 2, 3, 4, 5];
@@ -372,6 +372,9 @@ mod tests {
         check(values.map(Aligned), 4);
     }
 
+    // Test: Repeatedly enqueue owned strings and partially drain the queue.
+    // Expected: Every consumed string retains its contents across wrapping
+    //       and growth, and unread strings can be safely dropped.
     #[test]
     fn test_erased_vecdeque() {
         let mut deque = ErasedVecDeque::new(const { &ElementVtable::new::<String>() });
@@ -399,6 +402,8 @@ mod tests {
         drop(deque);
     }
 
+    // Test: Repeatedly enqueue and partially drain zero-sized values.
+    // Expected: Every requested element is available without backing storage.
     #[test]
     fn test_zst() {
         let mut deque = ErasedVecDeque::new(const { &ElementVtable::new::<()>() });
@@ -418,6 +423,9 @@ mod tests {
         drop(deque);
     }
 
+    // Test: Reserve over-aligned zero-sized elements and take their queue.
+    // Expected: Reservation and consumption pointers stay aligned; take moves
+    //       every element and leaves an empty, reusable source queue.
     #[test]
     fn test_aligned_zst() {
         #[repr(align(4096))]

@@ -7,6 +7,8 @@ use futures::executor::block_on;
 use mesh_node::local_node::Port;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll, Wake, Waker};
+use test_with_tracing::test;
 
 // Test: Bridge two channels with messages already queued on both sides.
 // Expected: Existing and future messages arrive in order, and dropping the last
@@ -198,5 +200,153 @@ fn queued_messages_survive_last_sender_close_and_receiver_conversion() {
             (100..=120).collect::<Vec<_>>()
         );
         assert!(matches!(receiver.try_recv(), Err(TryRecvError::Closed)));
+    }
+}
+
+#[derive(Default)]
+struct WakeCount(AtomicUsize);
+
+impl Wake for WakeCount {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+// Test: Cancel a pending receive and register a replacement task on local and
+//       port-backed channels, then deliver messages and close the last sender.
+// Expected: Only the replacement task wakes; cancellation consumes no payload,
+//       complete messages retain order, and final closure also wakes reception.
+#[test]
+fn cancelled_receive_preserves_messages_and_wakes_replacement() {
+    use std::future::Future;
+
+    for port_backed in [false, true] {
+        let (sender, receiver) = channel::<Vec<u8>>();
+        let (sender, mut receiver) = if port_backed {
+            (
+                Sender::from(Port::from(sender)),
+                Receiver::from(Port::from(receiver)),
+            )
+        } else {
+            (sender, receiver)
+        };
+        let old = Arc::new(WakeCount::default());
+        let current = Arc::new(WakeCount::default());
+        let old_waker = Waker::from(old.clone());
+        let current_waker = Waker::from(current.clone());
+        {
+            let pending = std::pin::pin!(receiver.recv());
+            assert!(
+                pending
+                    .poll(&mut Context::from_waker(&old_waker))
+                    .is_pending()
+            );
+        }
+        let mut cx = Context::from_waker(&current_waker);
+        assert!(receiver.poll_recv(&mut cx).is_pending());
+        let payloads = [vec![0, 255, 3, 128], vec![9; 257]];
+        for payload in &payloads {
+            sender.send(payload.clone());
+        }
+        assert_eq!(old.0.load(Ordering::SeqCst), 0);
+        assert!(current.0.load(Ordering::SeqCst) > 0);
+        for expected in payloads {
+            let Poll::Ready(Ok(actual)) = receiver.poll_recv(&mut cx) else {
+                panic!("accepted payload did not arrive");
+            };
+            assert_eq!(actual, expected);
+        }
+        assert!(receiver.poll_recv(&mut cx).is_pending());
+        current.0.store(0, Ordering::SeqCst);
+        drop(sender);
+        assert!(current.0.load(Ordering::SeqCst) > 0);
+        assert!(matches!(
+            receiver.poll_recv(&mut cx),
+            Poll::Ready(Err(RecvError::Closed))
+        ));
+        assert_eq!(old.0.load(Ordering::SeqCst), 0);
+    }
+}
+
+// Test: Fail one port-backed sender with an incompatible payload while another
+//       local or port-backed sender remains connected.
+// Expected: The failed peer closes without terminating healthy reception; the
+//       surviving peer preserves full-width values and owns final closure.
+#[test]
+fn malformed_peer_does_not_close_surviving_sender() {
+    use futures::stream::FusedStream;
+
+    for port_backed in [false, true] {
+        let (sender, mut receiver) = channel::<u32>();
+        let malformed = Sender::<String>::from(Port::from(sender.clone()));
+        let survivor = if port_backed {
+            Sender::from(Port::from(sender))
+        } else {
+            sender
+        };
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        malformed.send("wrong wire type".into());
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        assert!(malformed.is_closed());
+        assert!(!survivor.is_closed());
+        assert!(!receiver.is_terminated());
+        for value in [0, u32::MAX] {
+            survivor.send(value);
+        }
+        assert_eq!(receiver.try_recv().unwrap(), 0);
+        assert_eq!(receiver.try_recv().unwrap(), u32::MAX);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
+        drop(survivor);
+        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Closed)));
+        assert!(receiver.is_terminated());
+    }
+}
+
+// Test: Replace the task awaiting a local or port-backed oneshot before sending
+//       a complete payload or cancelling by dropping its sender.
+// Expected: Only the replacement task wakes and observes the intact payload or
+//       Closed, with no lost completion notification.
+#[test]
+fn oneshot_replacement_waker_observes_delivery_and_cancellation() {
+    use std::future::Future;
+    use std::pin::Pin;
+
+    for port_backed in [false, true] {
+        for cancel in [false, true] {
+            let (sender, mut receiver) = oneshot::<Vec<u8>>();
+            let sender = if port_backed {
+                crate::OneshotSender::from(Port::from(sender))
+            } else {
+                sender
+            };
+            let old = Arc::new(WakeCount::default());
+            let current = Arc::new(WakeCount::default());
+            let old_waker = Waker::from(old.clone());
+            let current_waker = Waker::from(current.clone());
+            assert!(
+                Pin::new(&mut receiver)
+                    .poll(&mut Context::from_waker(&old_waker))
+                    .is_pending()
+            );
+            let mut cx = Context::from_waker(&current_waker);
+            assert!(Pin::new(&mut receiver).poll(&mut cx).is_pending());
+            let expected = vec![0, 255, 42, 128];
+            if cancel {
+                drop(sender);
+            } else {
+                sender.send(expected.clone());
+            }
+            assert_eq!(old.0.load(Ordering::SeqCst), 0);
+            assert!(current.0.load(Ordering::SeqCst) > 0);
+            let result = Pin::new(&mut receiver).poll(&mut cx);
+            if cancel {
+                assert!(matches!(result, Poll::Ready(Err(RecvError::Closed))));
+            } else {
+                let Poll::Ready(Ok(actual)) = result else {
+                    panic!("oneshot completion did not arrive");
+                };
+                assert_eq!(actual, expected);
+            }
+        }
     }
 }

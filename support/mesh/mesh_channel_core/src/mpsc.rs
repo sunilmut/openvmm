@@ -1031,7 +1031,6 @@ mod tests {
     }
 
     struct ReentrantWaker {
-        queue: Arc<super::Queue>,
         sender: Mutex<Option<Sender<u32>>>,
         action: CloneAction,
         clones: AtomicUsize,
@@ -1046,13 +1045,8 @@ mod tests {
             Self::drop_waker,
         );
 
-        fn make(
-            receiver: &Receiver<u32>,
-            sender: Sender<u32>,
-            action: CloneAction,
-        ) -> (Waker, Arc<Self>) {
+        fn make(sender: Sender<u32>, action: CloneAction) -> (Waker, Arc<Self>) {
             let state = Arc::new(Self {
-                queue: receiver.0.queue.0.clone(),
                 sender: Mutex::new(Some(sender)),
                 action,
                 clones: AtomicUsize::new(0),
@@ -1103,16 +1097,21 @@ mod tests {
         unsafe fn drop_waker(data: *const ()) {
             // SAFETY: drop consumes the waker's owned strong reference.
             let state = unsafe { Arc::from_raw(data.cast::<Self>()) };
-            // Reenter even when another Arc keeps the sender alive.
-            drop(state.queue.local.lock());
+            // Reenter through the public sender even while another Arc lives.
+            if let Some(sender) = state.sender.lock().as_ref() {
+                drop(sender.clone());
+            }
         }
     }
 
+    // Test: Register a waker whose clone and drop reenter sender cloning.
+    // Expected: Polling completes without deadlock, repeated polling reuses
+    //       the waker, and sending wakes it and delivers the full payload.
     #[test]
     fn test_waker_clone_reenters_sender_clone() {
         assert_completes(|| {
             let (sender, mut receiver) = channel();
-            let (waker, state) = ReentrantWaker::make(&receiver, sender, CloneAction::CloneSender);
+            let (waker, state) = ReentrantWaker::make(sender, CloneAction::CloneSender);
             let mut cx = Context::from_waker(&waker);
             assert!(receiver.poll_recv(&mut cx).is_pending());
             assert_eq!(state.clones.load(Ordering::SeqCst), 1);
@@ -1124,11 +1123,14 @@ mod tests {
         });
     }
 
+    // Test: Send a message from the registered waker's clone callback.
+    // Expected: The same poll returns that message instead of losing progress
+    //       or deadlocking when the unused candidate waker is dropped.
     #[test]
     fn test_message_arrives_during_waker_clone() {
         assert_completes(|| {
             let (sender, mut receiver) = channel();
-            let (waker, state) = ReentrantWaker::make(&receiver, sender, CloneAction::Send);
+            let (waker, state) = ReentrantWaker::make(sender, CloneAction::Send);
             assert!(matches!(
                 receiver.poll_recv(&mut Context::from_waker(&waker)),
                 Poll::Ready(Ok(7))
@@ -1137,11 +1139,13 @@ mod tests {
         });
     }
 
+    // Test: Drop the last sender from the registered waker's clone callback.
+    // Expected: That poll reports closure instead of waiting for a lost wake.
     #[test]
     fn test_sender_closes_during_waker_clone() {
         assert_completes(|| {
             let (sender, mut receiver) = channel();
-            let (waker, state) = ReentrantWaker::make(&receiver, sender, CloneAction::Close);
+            let (waker, state) = ReentrantWaker::make(sender, CloneAction::Close);
             assert!(matches!(
                 receiver.poll_recv(&mut Context::from_waker(&waker)),
                 Poll::Ready(Err(RecvError::Closed))
@@ -1150,6 +1154,8 @@ mod tests {
         });
     }
 
+    // Test: Abandon a queued message that owns a sender for its own channel.
+    // Expected: Receiver destruction completes and releases the owned resource.
     #[test]
     fn test_drop_receiver_with_sender_in_queued_message() {
         assert_completes(|| {
@@ -1171,6 +1177,8 @@ mod tests {
         });
     }
 
+    // Test: Drop a receiver whose registered waker owns the last sender.
+    // Expected: Destruction completes without deadlock and releases the waker.
     #[test]
     fn test_drop_receiver_with_sender_in_registered_waker() {
         assert_completes(|| {
@@ -1189,6 +1197,9 @@ mod tests {
         });
     }
 
+    // Test: Replace a registered waker that owns the last sender.
+    // Expected: The old waker is released, pending work is woken if necessary,
+    //       and the new poll observes closure without deadlock.
     #[test]
     fn test_replace_waker_owning_last_sender() {
         assert_completes(|| {
@@ -1217,6 +1228,8 @@ mod tests {
         });
     }
 
+    // Test: Send a string and then close its local channel.
+    // Expected: The stream yields the complete string before terminating.
     #[test]
     fn test_basic() {
         block_on(async {
@@ -1228,6 +1241,9 @@ mod tests {
         })
     }
 
+    // Test: Close the last sender while a fixture keeps the queue alive.
+    // Expected: Nonfinal close remains pending; final close wakes the selected
+    //       stream and terminates it without waiting for allocation destruction.
     #[test]
     fn test_last_sender_close_with_queue_reference() {
         let (sender, receiver) = channel::<()>();
@@ -1249,6 +1265,10 @@ mod tests {
         assert_eq!(streams.poll_next_unpin(&mut cx), Poll::Ready(None));
     }
 
+    // Test: Close the last local sender while a port-backed sender remains,
+    //       then reopen the receiver after both have closed.
+    // Expected: The remote peer still delivers, closure waits for it, and a
+    //       fresh sender restores reception before its own final close.
     #[test]
     fn test_last_local_sender_with_remote_sender() {
         let (sender, mut receiver) = channel::<u32>();
@@ -1275,6 +1295,8 @@ mod tests {
         ));
     }
 
+    // Test: Clone a port-backed sender, convert one clone, and drop the other.
+    // Expected: The surviving sender still delivers and its drop closes reception.
     #[test]
     fn test_remote_sender_clone_and_conversion() {
         block_on(async {
@@ -1290,6 +1312,9 @@ mod tests {
         });
     }
 
+    // Test: Clone a sender after converting its receiver to a port.
+    // Expected: Dropping earlier senders preserves the clone's delivery and
+    //       closure occurs only after that clone is dropped.
     #[test]
     fn test_sender_clone_after_receiver_becomes_remote() {
         block_on(async {
@@ -1306,6 +1331,8 @@ mod tests {
         });
     }
 
+    // Test: Convert a string sender through a port and send before closing.
+    // Expected: Reception preserves the entire string and subsequent closure.
     #[test]
     fn test_convert_sender_port() {
         block_on(async {
@@ -1318,6 +1345,8 @@ mod tests {
         })
     }
 
+    // Test: Convert a string receiver through a port and send before closing.
+    // Expected: Reception preserves the entire string and subsequent closure.
     #[test]
     fn test_convert_receiver_port() {
         block_on(async {
@@ -1330,6 +1359,8 @@ mod tests {
         })
     }
 
+    // Test: Send distinct strings from local and port-backed senders.
+    // Expected: Both complete messages arrive in order before final closure.
     #[test]
     fn test_non_port_and_port_sender() {
         block_on(async {
@@ -1345,6 +1376,9 @@ mod tests {
         })
     }
 
+    // Test: Convert a receiver with messages queued by local and remote senders.
+    // Expected: Both complete messages survive conversion in order, followed
+    //       by closure only after both senders are dropped.
     #[test]
     fn test_port_receiver_with_senders_and_messages() {
         block_on(async {
@@ -1361,6 +1395,8 @@ mod tests {
         })
     }
 
+    // Test: Send an incompatible payload to a port-backed integer receiver.
+    // Expected: Reception reports a channel error and terminates the stream.
     #[test]
     fn test_message_corruption() {
         block_on(async {
@@ -1375,6 +1411,9 @@ mod tests {
         })
     }
 
+    // Test: Transfer a non-Send payload through a port within one thread.
+    // Expected: Conversion and reception preserve the full string without
+    //       imposing a Send requirement on same-thread communication.
     #[test]
     fn test_no_send() {
         block_on(async {

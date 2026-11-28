@@ -730,6 +730,8 @@ mod tests {
         }
     }
 
+    // Test: Drop a oneshot receiver whose registered waker owns its sender.
+    // Expected: Destruction completes without deadlock and releases the waker.
     #[test]
     fn test_oneshot_drop_receiver_with_sender_in_waker() {
         assert_completes(|| {
@@ -748,6 +750,9 @@ mod tests {
         });
     }
 
+    // Test: Replace a oneshot waker that owns the last sender.
+    // Expected: The old waker is released, pending work is woken if necessary,
+    //       and the receiver observes closure without deadlock.
     #[test]
     fn test_oneshot_replace_waker_owning_sender() {
         assert_completes(|| {
@@ -772,6 +777,8 @@ mod tests {
         });
     }
 
+    // Test: Convert a oneshot receiver whose registered waker owns its sender.
+    // Expected: Conversion releases the waker and preserves the resulting closure.
     #[test]
     fn test_oneshot_convert_receiver_with_sender_in_waker() {
         assert_completes(|| {
@@ -809,6 +816,9 @@ mod tests {
         (receiver, payload_receiver)
     }
 
+    // Test: Receive after a second message fails a oneshot holding an owned sender.
+    // Expected: Reception reports failure and releases the held sender, closing
+    //       its peer instead of leaking the failed payload.
     #[test]
     fn test_oneshot_failed_payload_dropped_on_receive() {
         let (receiver, mut payload_receiver) = failed_oneshot_with_payload();
@@ -819,6 +829,8 @@ mod tests {
         ));
     }
 
+    // Test: Drop a failed oneshot receiver holding a sender payload.
+    // Expected: Destruction releases the payload and closes its peer.
     #[test]
     fn test_oneshot_failed_payload_dropped_on_receiver_drop() {
         let (receiver, mut payload_receiver) = failed_oneshot_with_payload();
@@ -829,6 +841,8 @@ mod tests {
         ));
     }
 
+    // Test: Convert a failed oneshot receiver holding a sender through a port.
+    // Expected: Conversion releases the payload and preserves failure on reception.
     #[test]
     fn test_oneshot_failed_payload_dropped_on_receiver_conversion() {
         let (receiver, mut payload_receiver) = failed_oneshot_with_payload();
@@ -840,6 +854,8 @@ mod tests {
         assert!(matches!(block_on(receiver), Err(RecvError::Error(_))));
     }
 
+    // Test: Send a local oneshot string.
+    // Expected: Awaiting returns the complete string.
     #[test]
     fn test_oneshot() {
         block_on(async {
@@ -849,6 +865,8 @@ mod tests {
         })
     }
 
+    // Test: Convert a oneshot sender through a port before sending.
+    // Expected: The original receiver obtains the complete string.
     #[test]
     fn test_oneshot_convert_sender_port() {
         block_on(async {
@@ -859,6 +877,8 @@ mod tests {
         })
     }
 
+    // Test: Convert a oneshot receiver through a port before sending.
+    // Expected: The restored receiver obtains the complete string.
     #[test]
     fn test_oneshot_convert_receiver_port() {
         block_on(async {
@@ -869,6 +889,8 @@ mod tests {
         })
     }
 
+    // Test: Convert a oneshot receiver after its string has been sent.
+    // Expected: The accepted payload survives conversion intact.
     #[test]
     fn test_oneshot_convert_receiver_port_after_send() {
         block_on(async {
@@ -879,6 +901,8 @@ mod tests {
         })
     }
 
+    // Test: Convert both oneshot endpoints through ports before sending.
+    // Expected: The restored receiver obtains the complete string.
     #[test]
     fn test_oneshot_convert_both() {
         block_on(async {
@@ -890,6 +914,8 @@ mod tests {
         })
     }
 
+    // Test: Poll a oneshot after sender conversion, then convert its receiver.
+    // Expected: Pending reception does not lose the later complete payload.
     #[test]
     fn test_oneshot_convert_both_poll_first() {
         block_on(async {
@@ -907,6 +933,8 @@ mod tests {
         })
     }
 
+    // Test: Send an incompatible payload while a oneshot receiver is awaiting.
+    // Expected: The waiting task wakes and returns a typed channel failure.
     #[test]
     fn test_oneshot_message_corruption() {
         let mut pool = futures::executor::LocalPool::new();
@@ -926,6 +954,8 @@ mod tests {
         })
     }
 
+    // Test: Send two messages to a oneshot already polled for reception.
+    // Expected: The receiver rejects the protocol violation with channel failure.
     #[test]
     fn test_oneshot_extra_messages() {
         block_on(async {
@@ -941,6 +971,8 @@ mod tests {
         })
     }
 
+    // Test: Drop the oneshot sender without sending a value.
+    // Expected: Awaiting returns Closed rather than a fabricated payload.
     #[test]
     fn test_oneshot_closed() {
         block_on(async {
