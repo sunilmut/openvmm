@@ -1524,6 +1524,8 @@ mod tests {
     use test_with_tracing::test;
     use zerocopy::FromZeros;
 
+    // Test: Decode legacy and Turin TCB bytes with distinct component and reserved values.
+    // Expected: Each revision retains its wire layout and rejects incorrect buffer sizes.
     #[test]
     fn snp_tcb_layouts_and_little_endian_decoding() {
         assert_eq!(core::mem::offset_of!(SnpTcbVersionLegacy, bootloader), 0);
@@ -1562,6 +1564,8 @@ mod tests {
         assert!(SnpTcbVersionTurin::read_from_bytes(&[0; 9]).is_err());
     }
 
+    // Test: Check the version-three attestation report fields against the firmware ABI.
+    // Expected: CPUID, TCB, chip ID, and signature offsets retain the report wire layout.
     #[test]
     fn snp_report_layout() {
         // AMD 56860 ATTESTATION_REPORT. Naming the v3 CPUID fields must not
@@ -1577,6 +1581,8 @@ mod tests {
         assert_eq!(core::mem::offset_of!(SnpReport, signature), 0x2a0);
     }
 
+    // Test: Read an unaligned version-three attestation report and a truncated prefix.
+    // Expected: The full report preserves every byte; an incomplete report is rejected.
     #[test]
     fn snp_report_read_from_unaligned_bytes() {
         let mut bytes = [0u8; SNP_REPORT_SIZE + 16];
@@ -1604,6 +1610,8 @@ mod tests {
 
     // ---- SecureAvicControl bitfield tests ----
 
+    // Test: Construct the disabled secure AVIC control register.
+    // Expected: Enable, allowed NMI, and backing-page fields all remain clear.
     #[test]
     fn secure_avic_control_default_is_zero() {
         let ctrl = SecureAvicControl::new();
@@ -1613,6 +1621,8 @@ mod tests {
         assert_eq!(ctrl.guest_apic_backing_page_ptr(), 0);
     }
 
+    // Test: Enable secure AVIC in its control register.
+    // Expected: The architectural enable bit is set and decodes as enabled.
     #[test]
     fn secure_avic_control_enable_bit() {
         let ctrl = SecureAvicControl::new().with_secure_avic_en(true);
@@ -1620,6 +1630,8 @@ mod tests {
         assert_eq!(ctrl.into_bits() & 1, 1);
     }
 
+    // Test: Permit NMI delivery in the secure AVIC control register.
+    // Expected: The architectural allowed-NMI bit is set and decodes as permitted.
     #[test]
     fn secure_avic_control_allowed_nmi_bit() {
         let ctrl = SecureAvicControl::new().with_allowed_nmi(true);
@@ -1627,6 +1639,8 @@ mod tests {
         assert_eq!(ctrl.into_bits() & 0b10, 0b10);
     }
 
+    // Test: Encode a backing-page PFN with secure AVIC enabled.
+    // Expected: The PFN occupies bits 63:12 without disturbing the enable flag.
     #[test]
     fn secure_avic_control_page_ptr() {
         // The page pointer is in bits [63:12], representing a PFN.
@@ -1640,15 +1654,26 @@ mod tests {
         assert_eq!(ctrl.into_bits() >> 12, pfn);
     }
 
+    // Test: Decode a full-width secure AVIC control operand and permit NMI delivery.
+    // Expected: The PFN and enable state decode correctly and survive the NMI update.
     #[test]
     fn secure_avic_control_roundtrip() {
         let raw = 0xABCD_1234_5678_9001_u64;
         let ctrl = SecureAvicControl::from(raw);
         assert_eq!(ctrl.into_bits(), raw);
+        assert!(ctrl.secure_avic_en());
+        assert!(!ctrl.allowed_nmi());
+        assert_eq!(ctrl.guest_apic_backing_page_ptr(), 0x000a_bcd1_2345_6789);
+        assert_eq!(
+            ctrl.with_allowed_nmi(true).into_bits(),
+            0xABCD_1234_5678_9003
+        );
     }
 
     // ---- SevAvicNoAccelInfo bitfield tests ----
 
+    // Test: Encode the EOI register in a nonaccelerated AVIC access operand.
+    // Expected: Register number 0xb occupies bits 11:4 and decodes as EOI.
     #[test]
     fn no_accel_info_register_number_extraction() {
         // Register number is in bits [11:4].
@@ -1658,6 +1683,8 @@ mod tests {
         assert_eq!((info.into_bits() >> 4) & 0xFF, 0xB);
     }
 
+    // Test: Encode write and read accesses in nonaccelerated AVIC exit information.
+    // Expected: Bit 32 distinguishes write from read.
     #[test]
     fn no_accel_info_write_access_bit() {
         // Write access is bit 32.
@@ -1669,6 +1696,8 @@ mod tests {
         assert!(!info_read.write_access());
     }
 
+    // Test: Encode an ICR-low write in nonaccelerated AVIC exit information.
+    // Expected: Register selection and write direction coexist without overlap.
     #[test]
     fn no_accel_info_combined() {
         let info = SevAvicNoAccelInfo::new()
@@ -1678,6 +1707,8 @@ mod tests {
         assert!(info.write_access());
     }
 
+    // Test: Encode the supported nonaccelerated AVIC register selections.
+    // Expected: Each selection survives the register-number field conversion.
     #[test]
     fn no_accel_info_all_register_numbers_roundtrip() {
         let registers = [
@@ -1717,6 +1748,8 @@ mod tests {
 
     // ---- SevAvicIncompleteIpiInfo1/2 bitfield tests ----
 
+    // Test: Encode distinct ICR low and high halves in an incomplete IPI operand.
+    // Expected: Each half retains its 32-bit wire position.
     #[test]
     fn incomplete_ipi_info1_icr_fields() {
         let icr_low = 0x0004_10FFu32;
@@ -1729,6 +1762,8 @@ mod tests {
         assert_eq!(info.into_bits(), icr_low as u64 | ((icr_high as u64) << 32));
     }
 
+    // Test: Encode a not-running target and its index in incomplete IPI information.
+    // Expected: The target index and failure reason coexist without overlap.
     #[test]
     fn incomplete_ipi_info2_fields() {
         let info = SevAvicIncompleteIpiInfo2::new()
@@ -1738,6 +1773,8 @@ mod tests {
         assert_eq!(info.failure(), SevAvicIpiFailure::NOT_RUNNING);
     }
 
+    // Test: Encode each documented incomplete IPI failure reason.
+    // Expected: Every reason survives the failure-field conversion.
     #[test]
     fn incomplete_ipi_info2_all_failure_codes() {
         let failures = [
@@ -1760,6 +1797,8 @@ mod tests {
 
     // ---- SevFeatures secure AVIC fields ----
 
+    // Test: Advertise secure AVIC in the VMSA feature operand.
+    // Expected: Secure AVIC occupies architectural feature bit 16.
     #[test]
     fn sev_features_secure_avic_bit() {
         let features = SevFeatures::new().with_secure_avic(true);
@@ -1768,6 +1807,8 @@ mod tests {
         assert_ne!(features.into_bits() & (1 << 16), 0);
     }
 
+    // Test: Advertise guest intercept control in the VMSA feature operand.
+    // Expected: Guest intercept control occupies architectural feature bit 13.
     #[test]
     fn sev_features_guest_intercept_control_bit() {
         let features = SevFeatures::new().with_guest_intercept_control(true);
@@ -1776,6 +1817,8 @@ mod tests {
         assert_ne!(features.into_bits() & (1 << 13), 0);
     }
 
+    // Test: Encode the secure-AVIC feature combination used during VMSA initialization.
+    // Expected: Secure AVIC and intercept control are set; alternate injection is clear.
     #[test]
     fn sev_features_secure_avic_with_no_alternate_injection() {
         // Secure AVIC and alternate injection are mutually exclusive per the
@@ -1789,6 +1832,8 @@ mod tests {
         assert!(!features.alternate_injection());
     }
 
+    // Test: Encode alternate injection with secure AVIC disabled.
+    // Expected: These independently stored feature flags retain the selected values.
     #[test]
     fn sev_features_alternate_injection_without_secure_avic() {
         let features = SevFeatures::new()
@@ -1800,6 +1845,8 @@ mod tests {
 
     // ---- SevStatusMsr secure AVIC field ----
 
+    // Test: Advertise secure AVIC in the SEV status MSR.
+    // Expected: Secure AVIC occupies architectural status bit 18.
     #[test]
     fn sev_status_msr_secure_avic_bit() {
         let status = SevStatusMsr::new().with_secure_avic(true);
@@ -1813,6 +1860,8 @@ mod tests {
 
     // ---- SevVirtualInterruptControl NMI fields ----
 
+    // Test: Encode pending, masked, and enabled NMI state in virtual interrupt control.
+    // Expected: All three NMI fields retain their independently selected states.
     #[test]
     fn v_intr_cntrl_nmi_fields() {
         let ctrl = SevVirtualInterruptControl::new()
@@ -1826,12 +1875,16 @@ mod tests {
 
     // ---- SevAvicPage layout tests ----
 
+    // Test: Check the secure AVIC backing-page footprint.
+    // Expected: The hardware-visible page retains its 4096-byte ABI.
     #[test]
     fn sev_avic_page_size_is_4096() {
         // Already asserted at compile time, but verify at runtime too.
         assert_eq!(size_of::<SevAvicPage>(), 4096);
     }
 
+    // Test: Compare a secure AVIC IRR slot with a standard APIC register slot.
+    // Expected: Both register representations occupy the same hardware slot width.
     #[test]
     fn sev_avic_irr_register_size() {
         // Each IRR register has value + allowed + reserved = 16 bytes,
@@ -1842,6 +1895,8 @@ mod tests {
         );
     }
 
+    // Test: Locate the secure AVIC page's ID, priority, interrupt, and ICR fields.
+    // Expected: Their offsets match the architectural 16-byte APIC register map.
     #[test]
     fn sev_avic_page_field_offsets() {
         // Verify key field offsets match the APIC register map.
@@ -1880,6 +1935,8 @@ mod tests {
 
     // ---- VMSA SecureAvicControl field offset test ----
 
+    // Test: Locate secure AVIC control between RBX and RBP in the VMSA.
+    // Expected: The control occupies the RSP slot without overlapping neighboring GPRs.
     #[test]
     fn vmsa_secure_avic_control_at_rsp_offset() {
         // In the VMSA, secure_avic_control occupies the RSP slot (between RBX and RBP).
@@ -1897,6 +1954,8 @@ mod tests {
 
     // ---- SevAvicRegisterNumber to x2APIC MSR mapping ----
 
+    // Test: Compare SNP AVIC exit register identities with APIC register definitions.
+    // Expected: Each alias selects the same architectural register.
     #[test]
     fn avic_register_number_matches_apic_register_enum() {
         // The SevAvicRegisterNumber values should match the corresponding
@@ -1948,19 +2007,25 @@ mod tests {
         );
     }
 
+    // Test: Translate EOI and ICR-low AVIC register numbers to x2APIC MSRs.
+    // Expected: Both the AVIC arithmetic and APIC conversion select MSRs 0x80b and 0x830.
     #[test]
     fn avic_register_to_x2apic_msr() {
         // Verify the MSR computation: X2APIC_MSR_BASE + register_number.
         use crate::apic::X2APIC_MSR_BASE;
         let msr = X2APIC_MSR_BASE + SevAvicRegisterNumber::EOI.0;
         assert_eq!(msr, 0x80B); // EOI is register 0xB
+        assert_eq!(crate::apic::ApicRegister::EOI.x2apic_msr(), 0x80b);
 
         let msr = X2APIC_MSR_BASE + SevAvicRegisterNumber::ICR_LOW.0;
         assert_eq!(msr, 0x830); // ICR_LOW is register 0x30
+        assert_eq!(crate::apic::ApicRegister::ICR0.x2apic_msr(), 0x830);
     }
 
     // ---- SevExitCode AVIC constants ----
 
+    // Test: Check the exit codes used to dispatch incomplete IPI and no-acceleration exits.
+    // Expected: The two secure AVIC exits retain their distinct architectural encodings.
     #[test]
     fn sev_exit_code_avic_values() {
         assert_eq!(SevExitCode::AVIC_INCOMPLETE_IPI.0, 0x401);

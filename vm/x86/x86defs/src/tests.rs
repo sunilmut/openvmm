@@ -5,6 +5,7 @@ extern crate std;
 
 use super::*;
 use std::format;
+use test_with_tracing::test;
 
 // Test: Classify addresses around both canonical boundaries for four- and five-level paging.
 // Expected: Only sign-extended addresses are accepted, including the extreme addresses.
@@ -307,13 +308,38 @@ fn apic_and_msi_destination_updates_preserve_other_message_bits() {
 #[test]
 fn cpuid_vendors_preserve_register_order_and_diagnostics() {
     use cpuid::Vendor;
-    for (vendor, intel, amd) in [
-        (Vendor::INTEL, true, false),
-        (Vendor::AMD, false, true),
-        (Vendor::HYGON, false, true),
-        (Vendor(*b"OtherVendor!"), false, false),
+    for (vendor, registers, intel, amd) in [
+        (
+            Vendor::INTEL,
+            (0x756e6547, 0x6c65746e, 0x49656e69),
+            true,
+            false,
+        ),
+        (
+            Vendor::AMD,
+            (0x68747541, 0x444d4163, 0x69746e65),
+            false,
+            true,
+        ),
+        (
+            Vendor::HYGON,
+            (0x6f677948, 0x656e6975, 0x6e65476e),
+            false,
+            true,
+        ),
+        (
+            Vendor(*b"OtherVendor!"),
+            (0x6568744f, 0x21726f64, 0x6e655672),
+            false,
+            false,
+        ),
     ] {
         let (ebx, ecx, edx) = vendor.to_ebx_ecx_edx();
+        assert_eq!((ebx, ecx, edx), registers);
+        assert_eq!(
+            Vendor::from_ebx_ecx_edx(registers.0, registers.1, registers.2),
+            vendor
+        );
         assert_eq!(Vendor::from_ebx_ecx_edx(ebx, ecx, edx), vendor);
         assert_eq!(vendor.is_intel_compatible(), intel);
         assert_eq!(vendor.is_amd_compatible(), amd);
@@ -385,5 +411,66 @@ fn canonical_validation_checks_every_sign_extension_bit() {
                 );
             }
         }
+    }
+}
+
+// Test: Relocate a PTE at the zero, highest, and high-bit physical frame boundaries.
+// Expected: All 40 PFN bits survive while permissions and software bits remain unchanged.
+#[test]
+fn page_relocation_retains_full_frame_width_and_software_bits() {
+    let original = Pte::from_bits(0xdab0_1234_5678_9b6f);
+    for (address, expected) in [
+        (0, 0xdab0_0000_0000_0b6f),
+        (0x000f_ffff_ffff_f000, 0xdabf_ffff_ffff_fb6f),
+        (0x0008_0000_0000_0000, 0xdab8_0000_0000_0b6f),
+    ] {
+        let built = original.with_address(address);
+        assert_eq!(built.address(), address);
+        assert_eq!(built.into_bits(), expected);
+        let mut updated = original;
+        updated.set_address(address);
+        assert_eq!(updated.address(), address);
+        assert_eq!(updated.into_bits(), expected);
+    }
+}
+
+// Test: Attempt unaligned and out-of-width relocations on an existing page mapping.
+// Expected: Rejected addresses panic without modifying the original PFN or permissions.
+#[test]
+fn pte_rejected_relocation_keeps_original_mapping() {
+    for address in [1, 0xfff, 0x0010_0000_0000_0000, u64::MAX] {
+        let mut pte = Pte::from_bits(0x8000_0000_1234_5007);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pte.set_address(address);
+        }));
+        assert!(result.is_err(), "accepted invalid address {address:#x}");
+        assert_eq!(pte.into_bits(), 0x8000_0000_1234_5007);
+    }
+}
+
+// Test: Decode and replace virtual MSI destinations at both split-field boundaries.
+//       Include the ignored extension bit and the alias above the 15-bit width.
+// Expected: Routing IDs match independent wire fixtures; updates clear the ignored bit
+//       and preserve the base address, destination mode, and redirection hint.
+#[test]
+fn virtual_msi_destinations_preserve_routing_flags_and_width() {
+    for (destination, wire) in [
+        (0, 0xfee0_000c),
+        (0xff, 0xfeef_f00c),
+        (0x100, 0xfee0_002c),
+        (0x3fff, 0xfeef_f7ec),
+        (0x4000, 0xfee0_080c),
+        (0x7fff, 0xfeef_ffec),
+        (0xffff, 0xfeef_ffec),
+    ] {
+        let decoded = msi::MsiAddress::from_bits(wire);
+        assert_eq!(decoded.virt_destination(), destination & 0x7fff);
+        let ignored_bit = msi::MsiAddress::from_bits(wire | 0x10);
+        assert_eq!(ignored_bit.virt_destination(), destination & 0x7fff);
+        let built = msi::MsiAddress::from_bits(0xfee0_001c).with_virt_destination(destination);
+        assert_eq!(built.into_bits(), wire);
+        let mut updated = msi::MsiAddress::from_bits(0xfeef_ffec);
+        updated.set_virt_destination(destination);
+        assert_eq!(updated.into_bits(), wire);
     }
 }
