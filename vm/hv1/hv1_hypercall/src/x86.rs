@@ -272,6 +272,8 @@ mod tests {
         fn set_xmm(&mut self, _n: usize, _value: u128) {}
     }
 
+    // Test: Advance and retry an IO transport that manages the instruction pointer.
+    // Expected: Neither operation accesses RIP; retry updates the control value.
     #[test]
     fn no_ip_advance_does_not_access_rip() {
         let mut io = X64RegisterIo::new(NoRipState { gp: [0; 9] }, true, false);

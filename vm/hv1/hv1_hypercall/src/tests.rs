@@ -1955,6 +1955,8 @@ fn vtl_return(test_params: &TestParams, vtl_input: u64, lower_vtl_enabled: bool)
     assert_ne!(vp.ip == TestVp::INITIAL_IP, test_success);
 }
 
+// Test: Dispatch null calls through every register ABI in slow and fast modes.
+// Expected: Calls succeed without accessing guest memory or unrelated registers.
 #[test]
 fn test_null() {
     let slow_params = TestParams::new(TestResult::Simple(SimpleResult::Success));
@@ -1970,6 +1972,8 @@ fn test_null() {
     }
 }
 
+// Test: Dispatch an input-only simple call through every slow and fast ABI.
+// Expected: The handler receives the payload and no output registers change.
 #[test]
 fn test_simple_no_output() {
     let slow_params = TestParams::new(TestResult::Simple(SimpleResult::Success));
@@ -1985,6 +1989,8 @@ fn test_simple_no_output() {
     }
 }
 
+// Test: Dispatch a simple input/output call through supported slow and fast ABIs.
+// Expected: Status and payload match, and only output registers are written.
 #[test]
 fn test_simple() {
     let slow_params = TestParams::new(TestResult::Simple(SimpleResult::Success));
@@ -2002,6 +2008,8 @@ fn test_simple() {
     }
 }
 
+// Test: Dispatch input-only rep calls from zero and nonzero start indices.
+// Expected: The handler receives the pending suffix and completion is absolute.
 #[test]
 fn test_rep_no_output() {
     const REP_COUNT: usize = 31;
@@ -2033,6 +2041,8 @@ fn test_rep_no_output() {
     }
 }
 
+// Test: Dispatch rep calls from zero and nonzero start indices in each ABI.
+// Expected: Output matches each element while completed prefixes are preserved.
 #[test]
 fn test_rep() {
     const REP_COUNT: usize = 31;
@@ -2064,6 +2074,8 @@ fn test_rep() {
     }
 }
 
+// Test: Fail rep calls after partial progress in slow and supported fast ABIs.
+// Expected: Error and absolute progress return with only completed output written.
 #[test]
 fn test_rep_fail() {
     const REP_COUNT: usize = 3;
@@ -2098,6 +2110,9 @@ fn test_rep_fail() {
     }
 }
 
+// Test: Time out rep calls after partial progress in each supported ABI.
+// Expected: The IP remains at the call, control records progress and output
+//       preserves completed prefixes and untouched trailing register pairs.
 #[test]
 fn test_rep_timeout() {
     const REP_COUNT: usize = 3;
@@ -2123,6 +2138,8 @@ fn test_rep_timeout() {
     }
 }
 
+// Test: Dispatch variable-header input-only calls through supported ABIs.
+// Expected: Fixed and variable payloads reach the handler without output writes.
 #[test]
 fn test_variable_no_output() {
     const VAR_SIZE: usize = 24;
@@ -2142,6 +2159,8 @@ fn test_variable_no_output() {
     }
 }
 
+// Test: Dispatch variable-header calls with output through supported ABIs.
+// Expected: Both input regions match and the complete output payload is returned.
 #[test]
 fn test_variable() {
     const VAR_SIZE: usize = 24;
@@ -2161,6 +2180,9 @@ fn test_variable() {
     }
 }
 
+// Test: Dispatch variable-header rep calls from zero and nonzero start indices.
+// Expected: Headers and pending elements reach the handler, with prior output
+//       preserved and all requested elements reported complete.
 #[test]
 fn test_variable_rep() {
     const REP_COUNT: usize = 3;
@@ -2186,6 +2208,8 @@ fn test_variable_rep() {
     }
 }
 
+// Test: Supply nonzero rep counts or start indices for a simple call.
+// Expected: InvalidHypercallInput returns without accessing unmapped buffers.
 #[test]
 fn test_simple_with_reps() {
     for &abi in TestHypercallAbi::LIST {
@@ -2218,6 +2242,8 @@ fn test_simple_with_reps() {
     }
 }
 
+// Test: Supply a zero rep count or a start index equal to the count.
+// Expected: InvalidHypercallInput returns without processing elements.
 #[test]
 fn test_rep_incorrect_rep_params() {
     for &abi in TestHypercallAbi::LIST {
@@ -2251,6 +2277,8 @@ fn test_rep_incorrect_rep_params() {
     }
 }
 
+// Test: Dispatch a code absent from the dispatcher table through every ABI.
+// Expected: InvalidHypercallCode returns without unrelated register writes.
 #[test]
 fn test_unimplemented() {
     for &abi in TestHypercallAbi::LIST {
@@ -2279,6 +2307,9 @@ fn max_test_fast_rep_count(abi: &TestHypercallAbi) -> usize {
     max_rep_count
 }
 
+// Test: Supply unaligned or page-straddling buffers and exceed fast capacity.
+// Expected: InvalidAlignment or InvalidHypercallInput rejects invalid requests;
+//       the largest supported fast request still succeeds.
 #[test]
 fn test_alignment_and_straddling() {
     for &abi in TestHypercallAbi::LIST {
@@ -2336,6 +2367,8 @@ fn test_alignment_and_straddling() {
     }
 }
 
+// Test: Dispatch a VTL-switch hypercall with valid input through the x64 ABI.
+// Expected: The VTL-switch callback is invoked.
 #[test]
 fn test_vtl() {
     vtl_switch_hypercall(
@@ -2344,6 +2377,9 @@ fn test_vtl() {
     );
 }
 
+// Test: Return to a lower VTL with valid and invalid input, control and VTL state.
+// Expected: Valid returns invoke the callback and advance IP; invalid returns
+//       inject an invalid-opcode fault without switching or advancing IP.
 #[test]
 fn test_vtl_return() {
     // Restrictions on the ability to implement VtlSwitchOps reasonably means that this test is only

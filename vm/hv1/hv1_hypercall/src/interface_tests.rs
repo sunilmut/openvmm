@@ -8,6 +8,7 @@ use hv1_structs::ProcessorSet;
 use hvdef::hypercall as defs;
 use hvdef::{HvError, HvMessage, HvRegisterName, HvRegisterValue, HvResult, Vtl};
 use std::cell::RefCell;
+use test_with_tracing::test;
 use zerocopy::{FromZeros, Immutable, IntoBytes};
 
 #[derive(Debug, PartialEq)]
@@ -24,6 +25,7 @@ struct Backend {
     ip: u64,
     calls: RefCell<Vec<Call>>,
     error: Option<HvError>,
+    apic_failure: Option<(HvError, usize)>,
 }
 
 impl Backend {
@@ -378,10 +380,11 @@ impl GetVpIndexFromApicId for Backend {
     ) -> HvRepResult {
         self.record("apic", &[partition, vtl as u64], apics.as_bytes())
             .map_err(|error| (error, 0))?;
-        for (apic, index) in apics.iter().zip(indices) {
+        let completed = self.apic_failure.map_or(apics.len(), |(_, count)| count);
+        for (apic, index) in apics.iter().zip(indices).take(completed) {
             *index = *apic + 100;
         }
-        Ok(())
+        self.apic_failure.map_or(Ok(()), Err)
     }
 }
 impl AcceptGpaPages for Backend {
@@ -1140,4 +1143,167 @@ fn post_message_payload_boundaries_and_retry_preserve_guest_contract() {
         0,
         HvError::InvalidParameter,
     );
+}
+
+// Test: Dispatch a raw fast signal with nonzero upper halves in x86 registers.
+// Expected: The 32-bit ABI uses only each low dword, the 64-bit ABI keeps its
+//       payload, and completion changes only result registers and wraps the IP.
+#[test]
+fn raw_fast_signal_respects_register_width_and_preserves_non_targets() {
+    use X64HypercallRegister::{R8, Rax, Rbx, Rcx, Rdi, Rdx, Rsi};
+
+    for is_64bit in [false, true] {
+        let mut backend = Backend {
+            registers: std::array::from_fn(|i| 0xaabb_ccdd_1234_0000 + i as u64),
+            xmm: std::array::from_fn(|i| u128::MAX - i as u128),
+            ip: if is_64bit {
+                u64::MAX - 1
+            } else {
+                u32::MAX as u64 - 1
+            },
+            ..Default::default()
+        };
+        if is_64bit {
+            backend.set_gp(Rcx, 0x0001_005d);
+            backend.set_gp(Rdx, 0x0000_91f3_89ab_cdef);
+            backend.set_gp(R8, 0x1122_3344_5566_7788);
+        } else {
+            backend.set_gp(Rax, 0xfeed_face_0001_005d);
+            backend.set_gp(Rdx, 0xdead_beef_0000_0000);
+            backend.set_gp(Rbx, 0xcafe_babe_0000_91f3);
+            backend.set_gp(Rcx, 0xface_feed_89ab_cdef);
+            backend.set_gp(Rdi, 0x1234_5678_1122_3344);
+            backend.set_gp(Rsi, 0x8765_4321_5566_7788);
+        }
+        let mut expected = backend.registers;
+        let expected_xmm = backend.xmm;
+        expected[Rax as usize] = 0;
+        if !is_64bit {
+            expected[Rdx as usize] = 0;
+        }
+
+        crate::dispatcher!(Backend, [HvSignalEvent]).dispatch(
+            &GuestMemory::allocate(0),
+            X64RegisterIo::new(&mut backend, is_64bit, true),
+        );
+
+        backend.expect("signal", &[0x89ab_cdef, 0x91f3], &[]);
+        assert_eq!(backend.registers, expected);
+        assert_eq!(backend.xmm, expected_xmm);
+        assert_eq!(backend.ip, 1);
+    }
+}
+
+impl Arm64RegisterState for Backend {
+    fn pc(&mut self) -> u64 {
+        self.ip
+    }
+
+    fn set_pc(&mut self, value: u64) {
+        self.ip = value;
+    }
+
+    fn x(&mut self, n: u8) -> u64 {
+        self.registers[n as usize]
+    }
+
+    fn set_x(&mut self, n: u8, value: u64) {
+        self.registers[n as usize] = value;
+    }
+}
+
+// Test: Query capabilities through raw Hyper-V and SMCCC fast-register layouts,
+//       with and without a transport-advanced PC.
+// Expected: Output occupies X15/X16 for Hyper-V or X2/X3 for SMCCC, status is
+//       X0, other registers survive, and only an unadvanced PC advances.
+#[test]
+fn arm_fast_output_uses_convention_slots_and_transport_pc_policy() {
+    for smccc in [false, true] {
+        for pre_advanced in [false, true] {
+            let mut backend = Backend {
+                registers: std::array::from_fn(|i| 0xaabb_ccdd_9876_0000 + i as u64),
+                ip: u64::MAX - 1,
+                ..Default::default()
+            };
+            backend.registers[usize::from(smccc)] = 0x0001_8001;
+            let mut expected = backend.registers;
+            expected[0] = 0;
+            let first_output = if smccc { 2 } else { 15 };
+            expected[first_output] = 0x1234_5678_9abc_def0;
+            expected[first_output + 1] = 0;
+
+            crate::dispatcher!(Backend, [HvExtQueryCapabilities]).dispatch(
+                &GuestMemory::allocate(0),
+                Arm64RegisterIo::new(&mut backend, pre_advanced, smccc),
+            );
+
+            backend.expect("capabilities", &[], &[]);
+            assert_eq!(backend.registers, expected);
+            assert_eq!(backend.ip, if pre_advanced { u64::MAX - 1 } else { 2 });
+        }
+    }
+}
+
+// Test: Partially resolve APIC IDs, then resume the same request after a timeout
+//       or an ordinary error using the guest-visible completed-element count.
+// Expected: The resumed callback sees only the pending suffix, earlier output
+//       and surrounding memory survive, and completion counts stay absolute.
+#[test]
+fn apic_partial_completion_resumes_without_replaying_completed_elements() {
+    use X64HypercallRegister::{R8, Rax, Rcx, Rdx};
+
+    for error in [HvError::Timeout, HvError::InvalidParameter] {
+        let memory = GuestMemory::allocate(8192);
+        let mut input = [0; 32];
+        input[..8].copy_from_slice(&0x1122_3344_5566_7788_u64.to_le_bytes());
+        input[8] = 2;
+        input[16..].copy_from_slice([11_u32, 13, 17, 19].as_bytes());
+        memory.write_at(0, &input).unwrap();
+        memory.write_at(4096, &[0xa5; 4096]).unwrap();
+        let mut backend = Backend {
+            ip: 0x1000,
+            apic_failure: Some((error, 2)),
+            ..Default::default()
+        };
+        backend.set_gp(Rcx, 0x0000_0004_0000_009a);
+        backend.set_gp(Rdx, 0);
+        backend.set_gp(R8, 4104);
+        backend.set_gp(Rax, 0x9876_5432_10fe_dcba);
+        let dispatcher = crate::dispatcher!(Backend, [HvGetVpIndexFromApicId]);
+        dispatcher.dispatch(&memory, X64RegisterIo::new(&mut backend, true, true));
+        backend.expect(
+            "apic",
+            &[0x1122_3344_5566_7788, 2],
+            [11_u32, 13, 17, 19].as_bytes(),
+        );
+        if error == HvError::Timeout {
+            assert_eq!(backend.ip, 0x1000);
+            assert_eq!(backend.gp(Rax), 0x9876_5432_10fe_dcba);
+            assert_eq!(backend.gp(Rcx), 0x0002_0004_0000_009a);
+        } else {
+            let result: defs::HypercallOutput = backend.gp(Rax).into();
+            assert_eq!(result.call_status(), Err(error).into());
+            assert_eq!(result.elements_processed(), 2);
+            assert_eq!(backend.ip, 0x1003);
+            backend.set_gp(Rcx, 0x0002_0004_0000_009a);
+        }
+        let mut expected = [0xa5; 4096];
+        expected[8..16].copy_from_slice([111_u32, 113].as_bytes());
+        let mut output = [0; 4096];
+        memory.read_at(4096, &mut output).unwrap();
+        assert_eq!(output, expected);
+
+        backend.apic_failure = None;
+        let resume_ip = backend.ip;
+        dispatcher.dispatch(&memory, X64RegisterIo::new(&mut backend, true, true));
+        backend.expect("apic", &[0x1122_3344_5566_7788, 2], [17_u32, 19].as_bytes());
+        assert_eq!(backend.gp(Rax), 0x0000_0004_0000_0000);
+        assert_eq!(backend.ip, resume_ip + 3);
+        expected[16..24].copy_from_slice([117_u32, 119].as_bytes());
+        memory.read_at(4096, &mut output).unwrap();
+        assert_eq!(output, expected);
+        let mut remaining_input = [0; 32];
+        memory.read_at(0, &mut remaining_input).unwrap();
+        assert_eq!(remaining_input, input);
+    }
 }
