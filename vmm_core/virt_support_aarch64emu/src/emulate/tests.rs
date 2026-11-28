@@ -668,6 +668,91 @@ fn simd_instructions_transfer_data_without_changing_other_registers() {
     assert!(devices.writes.borrow().is_empty());
 }
 
+// Test: Read seeded state and update distinct register classes through the adapter.
+// Expected: Widths, register identities, FP/LR aliases, and commit reach the backing CPU.
+#[test]
+fn cpu_adapter_preserves_architectural_register_identity() {
+    let gm = GuestMemory::allocate(0);
+    let devices = Devices::default();
+    let mut support = Support {
+        sp: 0x123456789abcdef0,
+        ..Default::default()
+    };
+    for (index, value) in support.qs.iter_mut().enumerate() {
+        *value = 0xfedcba98765432100123456789abcd00 | index as u128;
+    }
+    support.xs[29] = 0x1122334455667788;
+    support.xs[30] = 0x8877665544332211;
+    let original_vectors = support.qs;
+    {
+        let mut cpu = EmulatorCpu::new(&gm, &devices, &mut support, EsrEl2::new());
+        assert_eq!(cpu.q(0), 0xfedcba98765432100123456789abcd00);
+        assert_eq!(cpu.d(1), 0x0123456789abcd01);
+        assert_eq!(cpu.h(2), 0x89abcd02);
+        assert_eq!(cpu.s(3), 0xcd03);
+        assert_eq!(cpu.b(4), 4);
+        assert_eq!(cpu.sp(), 0x123456789abcdef0);
+        assert_eq!(cpu.fp(), 0x1122334455667788);
+        assert_eq!(cpu.lr(), 0x8877665544332211);
+        cpu.update_q(0, 0x102030405060708090a0b0c0d0e0f001);
+        cpu.update_d(1, 0x1122334455667788);
+        cpu.update_h(2, 0x99aabbcc);
+        cpu.update_s(3, 0xddee);
+        cpu.update_b(4, 0xff);
+        cpu.update_sp(0x1020304050607080);
+        cpu.update_fp(0x2132435465768798);
+        cpu.update_lr(0x98a9bacbdcedfe0f);
+        cpu.commit();
+    }
+    assert_eq!(
+        support.qs[..5],
+        [
+            0x102030405060708090a0b0c0d0e0f001,
+            0x1122334455667788,
+            0x99aabbcc,
+            0xddee,
+            0xff,
+        ]
+    );
+    assert_eq!(support.qs[5..], original_vectors[5..]);
+    assert_eq!(support.xs[..29], [0; 29]);
+    assert_eq!(support.xs[29..], [0x2132435465768798, 0x98a9bacbdcedfe0f]);
+    assert_eq!(support.sp, 0x1020304050607080);
+    assert_eq!(support.commits, 1);
+}
+
+// IGNORED: Reproduced enabled on the unchanged production decoder: the first
+//          RAM slot contains the second register's value. This retains the
+//          paired-store address regression already recorded for entry42
+//          aarch64emu, not a new finding or evidence of hardware execution.
+//
+// Test: Save distinct frame/link values with a pre-indexed stack pair store.
+// Expected: Consecutive RAM slots receive the two values and SP decrements once.
+#[test]
+#[ignore = "existing entry42 aarch64emu paired-store address regression"]
+fn stack_pair_store_preserves_both_values() {
+    let gm = GuestMemory::allocate(0x4000);
+    let devices = Devices::default();
+    let mut support = Support {
+        mapped: true,
+        sp: 0x2020,
+        ..Default::default()
+    };
+    support.xs[29] = 0x1122334455667788;
+    support.xs[30] = 0x8877665544332211;
+    gm.write_at(0x2010, &[0x55; 16]).unwrap();
+    run(0xa9bf7bfd, &mut support, &gm, &devices).unwrap(); // STP X29, X30, [SP, #-16]!
+    assert_eq!(gm.read_plain::<u64>(0x2010).unwrap(), 0x1122334455667788);
+    assert_eq!(gm.read_plain::<u64>(0x2018).unwrap(), 0x8877665544332211);
+    assert_eq!(support.xs[29..], [0x1122334455667788, 0x8877665544332211]);
+    assert_eq!(support.sp, 0x2010);
+    assert_eq!(support.pc, 4);
+    assert_eq!(support.commits, 1);
+    assert!(support.events.is_empty());
+    assert!(devices.reads.borrow().is_empty());
+    assert!(devices.writes.borrow().is_empty());
+}
+
 // Test: Restore distinct frame/link values with a post-indexed stack pair load.
 // Expected: Both registers load from consecutive RAM slots and SP advances once.
 #[test]
