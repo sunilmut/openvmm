@@ -40,7 +40,18 @@ fn hypercall_marshalling_preserves_control_buffers_and_result() {
         assert_eq!(input.leaf, TdCallLeaf::VP_VMCALL);
         assert_eq!(
             registers(&input),
-            [0xd04, 0x1234_5000, 0xabcd_6000, 0, 0x3456, 0, 0, 0, 0, 0]
+            [
+                0xd04,
+                0x1234_5000,
+                0xabcd_6000,
+                0,
+                0x0234_0567_0000_3456,
+                0,
+                0,
+                0,
+                0,
+                0
+            ]
         );
         let mut reply = output(TdCallResultCode::SUCCESS);
         reply.r11 = 0x0042_0000_0000_0005;
@@ -48,7 +59,7 @@ fn hypercall_marshalling_preserves_control_buffers_and_result() {
     });
     let result = tdcall_hypercall(
         &mut call,
-        hvdef::hypercall::Control::from(0x3456),
+        hvdef::hypercall::Control::from(0x0234_0567_0000_3456),
         0x1234_5000,
         0xabcd_6000,
     );
@@ -239,7 +250,11 @@ fn invalidation_and_report_calls_preserve_inputs_and_errors() {
             TdGlaVmAndFlags::from(1),
             TdxGlaListInfo::from(0x1234_5000),
         );
-        assert_eq!(result.is_ok(), code == TdCallResultCode::SUCCESS);
+        if code == TdCallResultCode::SUCCESS {
+            result.unwrap();
+        } else {
+            assert_eq!(u64::from(result.unwrap_err()), u64::from(output(code).rax));
+        }
         let mut report = TdReport::new_zeroed();
         let address = core::ptr::from_mut(&mut report) as u64;
         let mut call = Stub(|input: TdcallInput| {
@@ -455,21 +470,61 @@ fn page_attributes_follow_acceptance_and_propagate_failures() {
         for fail in [false, true] {
             let mut last_mapping = 0;
             let mut writes = 0;
+            let mut accepted = 0;
+            let mut reads = 0;
             let mut call = Stub(|input: TdcallInput| {
                 let mut reply = output(TdCallResultCode::SUCCESS);
                 match input.leaf {
-                    TdCallLeaf::MEM_PAGE_ACCEPT => assert!(accept),
+                    TdCallLeaf::MEM_PAGE_ACCEPT => {
+                        assert!(accept);
+                        assert_eq!(accepted, writes);
+                        assert_eq!(
+                            registers(&input),
+                            [
+                                if accepted == 0 { 0x200001 } else { 0x400000 },
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0
+                            ]
+                        );
+                        accepted += 1;
+                    }
                     TdCallLeaf::MEM_PAGE_ATTR_WR => {
+                        if accept {
+                            assert_eq!(accepted, writes + 1);
+                        }
+                        assert_eq!(reads, if cfg!(debug_assertions) { writes } else { 0 });
+                        assert_eq!(
+                            registers(&input),
+                            [
+                                if writes == 0 { 0x200001 } else { 0x400000 },
+                                0x800f_0000,
+                                0x000f_0000,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0,
+                                0
+                            ]
+                        );
                         writes += 1;
                         last_mapping = input.rcx;
-                        assert_eq!(input.rdx, 0x800f_0000);
-                        assert_eq!(input.r8, 0x000f_0000);
                         if fail {
                             reply.rax =
                                 TdCallResult::new().with_code(TdCallResultCode::OPERAND_INVALID);
                         }
                     }
                     TdCallLeaf::MEM_PAGE_ATTR_RD => {
+                        assert_eq!(writes, reads + 1);
+                        reads += 1;
                         assert_eq!(input.rcx, last_mapping & !0xfff);
                         reply.rcx = last_mapping;
                         reply.rdx = 0x800f_0000;
@@ -507,6 +562,15 @@ fn page_attributes_follow_acceptance_and_propagate_failures() {
                 );
             }
             assert_eq!(writes, if fail { 1 } else { 2 });
+            assert_eq!(accepted, if accept { writes } else { 0 });
+            assert_eq!(
+                reads,
+                if !fail && cfg!(debug_assertions) {
+                    2
+                } else {
+                    0
+                }
+            );
         }
     }
 }
@@ -561,6 +625,115 @@ fn visibility_error_after_progress_allows_fresh_retry() {
         );
         tdcall_map_gpa(&mut call, MemoryRange::new(0x4000..0x8000), shared).unwrap();
         assert_eq!(calls, 3);
+    }
+}
+
+// Test: Read private MMIO mapping and attributes with nonzero high register bits.
+// Expected: RCX mapping flags and all four VM attribute slots survive the public
+//       result conversion, rather than being truncated or taken from R8.
+#[test]
+fn page_attribute_read_preserves_mapping_and_all_vm_attributes() {
+    let mut call = Stub(|input: TdcallInput| {
+        assert_eq!(input.leaf, TdCallLeaf::MEM_PAGE_ATTR_RD);
+        assert_eq!(registers(&input), [0x1234_5000, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let mut reply = output(TdCallResultCode::SUCCESS);
+        reply.rcx = 0x6000_0000_1234_5000;
+        reply.rdx = 0x8001_8002_8004_8008;
+        reply.r8 = u64::MAX;
+        reply
+    });
+    let result = tdcall_page_attr_rd(&mut call, 0x1234_5000).unwrap();
+    assert_eq!(u64::from(result.mapping), 0x6000_0000_1234_5000);
+    assert!(result.mapping.mmio());
+    assert!(result.mapping.pending());
+    assert_eq!(result.mapping.gpa_page_number(), 0x12345);
+    assert_eq!(u64::from(result.attributes), 0x8001_8002_8004_8008);
+}
+
+// Test: Invoke Connect leaves with segmented IDs and full-width operands/results.
+// Expected: Each complete input matches its leaf-specific ABI, successful reads
+//       return RCX intact, and every leaf preserves detailed module failures.
+#[test]
+fn connect_calls_preserve_full_operands_results_and_detailed_errors() {
+    let function = TdxFunctionId::new()
+        .with_requester_id(0xfedc)
+        .with_requester_segment(0xab)
+        .with_segment_valid(true);
+    for code in [
+        TdCallResultCode::SUCCESS,
+        TdCallResultCode::TDI_NOT_PRESENT,
+        TdCallResultCode::OPERAND_INVALID,
+    ] {
+        for leaf in [
+            TdCallLeaf::TDI_RD,
+            TdCallLeaf::TDI_START,
+            TdCallLeaf::DMAR_ACCEPT,
+            TdCallLeaf::TDI_MMIO_ACCEPT,
+        ] {
+            let mut call = Stub(|input: TdcallInput| {
+                assert_eq!(input.leaf, leaf);
+                let expected = match leaf {
+                    TdCallLeaf::TDI_RD => [0x01ab_fedc, 5, 0, 0, 0, 0, 0, 0, 0, 0],
+                    TdCallLeaf::TDI_START => {
+                        [0x01ab_fedc, 0xfedc_ba98_7654_3210, 0, 0, 0, 0, 0, 0, 0, 0]
+                    }
+                    TdCallLeaf::DMAR_ACCEPT => [0x01ab_fedc, 3, 0, 0, 0, 0, 0, 0, 0, 0],
+                    TdCallLeaf::TDI_MMIO_ACCEPT => [
+                        0x1234_5000,
+                        0xfffe,
+                        0x01ab_fedc,
+                        0x8765_4321_0000_0001,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ],
+                    _ => unreachable!(),
+                };
+                assert_eq!(registers(&input), expected);
+                let mut reply = output(code);
+                reply.rcx = 0xfedc_ba98_7654_3210;
+                reply.r8 = u64::MAX;
+                reply
+            });
+            let result = match leaf {
+                TdCallLeaf::TDI_RD => {
+                    tdcall_tdi_rd(&mut call, function, TdiRdField::GET_BIND_SESSION_ID, 0)
+                }
+                TdCallLeaf::TDI_START => {
+                    tdcall_tdi_start(&mut call, function, 0xfedc_ba98_7654_3210).map(|()| 0)
+                }
+                TdCallLeaf::DMAR_ACCEPT => {
+                    tdcall_dmar_accept(&mut call, function, DmarTarget::new().with_vm_idx(3))
+                        .map(|()| 0)
+                }
+                TdCallLeaf::TDI_MMIO_ACCEPT => tdcall_tdi_mmio_accept(
+                    &mut call,
+                    function,
+                    TdgTdiMmioAcceptRcx::new().with_gpa_page_number(0x12345),
+                    0xfffe,
+                    TdgTdiMmioAcceptR9::new()
+                        .with_range_size(1)
+                        .with_range_offset(0x8765_4321),
+                )
+                .map(|()| 0),
+                _ => unreachable!(),
+            };
+            if code == TdCallResultCode::SUCCESS {
+                assert_eq!(
+                    result.unwrap(),
+                    if leaf == TdCallLeaf::TDI_RD {
+                        0xfedc_ba98_7654_3210
+                    } else {
+                        0
+                    }
+                );
+            } else {
+                assert_eq!(u64::from(result.unwrap_err()), u64::from(output(code).rax));
+            }
+        }
     }
 }
 

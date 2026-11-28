@@ -1237,6 +1237,9 @@ mod tests {
         }
     }
 
+    // Test: Retry busy attribute writes, including beyond the tracing threshold.
+    // Expected: Every attempt preserves its operands until success or a terminal
+    //       error; the helper neither stops early nor retries a terminal error.
     #[test]
     fn page_attr_wr_retries_busy() {
         for (busy_calls, final_status, expected, expected_calls) in [
@@ -1340,6 +1343,9 @@ mod tests {
         TdxFunctionId::new().with_requester_id(0x1a2b)
     }
 
+    // Test: Read a bound interface's TDISP state through the public helper.
+    // Expected: The function and field select the TDI_RD leaf and RCX supplies
+    //       the returned state, with unrelated input registers left zero.
     #[test]
     fn tdi_rd_encoding() {
         let mut call =
@@ -1359,8 +1365,11 @@ mod tests {
         assert_eq!(input.rcx, 0x1a2b);
         assert_eq!(input.rdx, TdiRdField::GET_TDISP_STATE.0);
         assert_eq!(input.r8, 0);
+        assert_eq!(input.r9, 0);
     }
 
+    // Test: Read metadata for an interface that is not present.
+    // Expected: TDI_NOT_PRESENT is returned rather than treating RCX as a value.
     #[test]
     fn tdi_rd_reports_failure_status() {
         let mut call = RecordingTdcall::new(TdCallResultCode::TDI_NOT_PRESENT);
@@ -1376,6 +1385,8 @@ mod tests {
         assert_eq!(err.code(), TdCallResultCode::TDI_NOT_PRESENT);
     }
 
+    // Test: Request a TDISP report hash in a caller-provided private page.
+    // Expected: The buffer GPA reaches R8 and the returned hash length uses RCX.
     #[test]
     fn tdi_rd_passes_out_buf() {
         let mut call = RecordingTdcall::new(TdCallResultCode::SUCCESS).with_rcx(48);
@@ -1392,6 +1403,8 @@ mod tests {
         assert_eq!(call.input().r8, 0x4000);
     }
 
+    // Test: Read interface metadata using a nonzero valid PCI requester segment.
+    // Expected: Bit 24 and bits 23:16 accompany the requester ID in RCX.
     #[test]
     fn function_id_encodes_segment() {
         let function_id = TdxFunctionId::new()
@@ -1406,6 +1419,9 @@ mod tests {
         assert_eq!(call.input().rcx, 0x0107_1a2b);
     }
 
+    // Test: Authorize a TDI interface using its expected bind session.
+    // Expected: TDI_START receives the function ID and session in RCX and RDX,
+    //       leaving unrelated operands zero.
     #[test]
     fn tdi_start_encoding() {
         let mut call = RecordingTdcall::new(TdCallResultCode::SUCCESS);
@@ -1416,8 +1432,13 @@ mod tests {
         assert_eq!(input.leaf, TdCallLeaf::TDI_START);
         assert_eq!(input.rcx, 0x1a2b);
         assert_eq!(input.rdx, 0xfeed);
+        assert_eq!(input.r8, 0);
+        assert_eq!(input.r9, 0);
     }
 
+    // Test: Accept a device's DMA remapping entry for L1.
+    // Expected: DMAR_ACCEPT receives the requester ID and zero VM index without
+    //       adding unrelated operands.
     #[test]
     fn dmar_accept_encoding() {
         let mut call = RecordingTdcall::new(TdCallResultCode::SUCCESS);
@@ -1434,8 +1455,12 @@ mod tests {
         assert_eq!(input.rcx, 0x1a2b);
         assert_eq!(input.rdx, 0);
         assert_eq!(input.r8, 0);
+        assert_eq!(input.r9, 0);
     }
 
+    // Test: Accept one private MMIO page at a nonzero range index and offset.
+    // Expected: The complete GPA/level and range words match the ABI, with the
+    //       function ID in R8 rather than RCX.
     #[test]
     fn tdi_mmio_accept_encoding() {
         let mut call = RecordingTdcall::new(TdCallResultCode::SUCCESS);
@@ -1457,14 +1482,10 @@ mod tests {
         assert_eq!(input.leaf, TdCallLeaf::TDI_MMIO_ACCEPT);
         // The GPA goes in RCX and the function id in R8 for this leaf, unlike
         // the other Connect leaves.
-        assert_eq!(
-            TdgTdiMmioAcceptRcx::from(input.rcx).gpa_page_number(),
-            0x8000
-        );
+        assert_eq!(input.rcx, 0x0800_0000);
         assert_eq!(input.rdx, 2);
         assert_eq!(input.r8, 0x1a2b);
-        assert_eq!(TdgTdiMmioAcceptR9::from(input.r9).range_size(), 1);
-        assert_eq!(TdgTdiMmioAcceptR9::from(input.r9).range_offset(), 3);
+        assert_eq!(input.r9, 0x0000_0003_0000_0001);
     }
 }
 
