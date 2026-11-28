@@ -113,7 +113,8 @@ fn check_locks(memory: &GuestMemory, backing: &LockMapping, gpns: &[u64], expect
 }
 
 // Test: Lock Arc-backed memory with supported and unsupported locking.
-// Expected: Capabilities, ordered lock hooks and required unlocks are preserved.
+// Expected: Capabilities, ordered lock hooks and required unlocks are
+//       preserved.
 #[test]
 fn arc_preserves_locking_support_and_hooks() {
     for lockable in [false, true] {
@@ -139,7 +140,8 @@ fn arc_preserves_locking_support_and_hooks() {
 }
 
 // Test: Lock aligned and nested views over both backing capability settings.
-// Expected: Each view retains its parent's support and accepts only valid locks.
+// Expected: Each view retains its parent's support and accepts only valid
+//       locks.
 #[test]
 fn subranges_preserve_locking_support() {
     for lockable in [false, true] {
@@ -169,7 +171,8 @@ fn subranges_preserve_locking_support() {
 }
 
 // Test: Lock reordered pages through nested views with both unlock policies.
-// Expected: Hooks receive translated pages in order and unlock only when needed.
+// Expected: Hooks receive translated pages in order and unlock only when
+//       needed.
 #[test]
 fn subranges_forward_lock_hooks_with_offsets() {
     for unlock_required in [false, true] {
@@ -188,7 +191,8 @@ fn subranges_forward_lock_hooks_with_offsets() {
     }
 }
 
-// Test: Lock a view of the second region under all backing support combinations.
+// Test: Lock a view of the second region under all backing support
+//       combinations.
 // Expected: Support reflects all regions; only the selected backing is locked.
 #[test]
 fn multi_region_subranges_preserve_parent_support_and_translate_gpns() {
@@ -336,7 +340,8 @@ fn create_test_mapping() -> GuestMemoryMapping {
 }
 
 // Test: Read and write plain, page-sized and large buffers in RAM and a hole.
-// Expected: RAM starts zeroed and preserves copied bytes; the hole rejects reads.
+// Expected: RAM starts zeroed and preserves copied bytes; the hole rejects
+//       reads.
 #[test]
 fn test_basic_read_write() {
     let mapping = create_test_mapping();
@@ -420,7 +425,8 @@ fn test_compare_exchange_u128() {
         .unwrap_err();
 }
 
-// Test: Have four threads repeatedly compare-exchange paired 128-bit increments.
+// Test: Have four threads repeatedly compare-exchange paired 128-bit
+//       increments.
 // Expected: The joined total has no lost increments and neither half is torn.
 #[test]
 fn test_compare_exchange_u128_concurrent() {
@@ -487,7 +493,8 @@ fn test_multi() {
     gm.read_at(3 * region_len, &mut b).unwrap_err();
 }
 
-// Test: Read allowed, denied and page-crossing ranges under a permission bitmap.
+// Test: Read allowed, denied and page-crossing ranges under a permission
+//       bitmap.
 // Expected: Every touched page must be permitted, including the trailing page.
 #[cfg(feature = "bitmap")]
 #[test]
@@ -618,7 +625,8 @@ fn test_compare_exchange_alignment() {
 
 // Regression: Computing offset + len - 1 underflowed for an empty access.
 // Test: Read and write zero-sized values at zero with every bitmap page denied.
-// Expected: Both succeed without touching a page or computing a last-page index.
+// Expected: Both succeed without touching a page or computing a last-page
+//       index.
 #[cfg(feature = "bitmap")]
 #[test]
 fn test_zero_length_access_at_offset_zero() {
@@ -637,7 +645,8 @@ fn test_zero_length_access_at_offset_zero() {
 }
 
 // Test: Fill an allocated heap and borrow or recover it while clones exist.
-// Expected: Bytes survive; mutable access and recovery require unique ownership.
+// Expected: Bytes survive; mutable access and recovery require unique
+//       ownership.
 #[test]
 fn test_allocated() {
     let mut gm = GuestMemory::allocate(0x10000);
@@ -825,7 +834,8 @@ fn scattered_range_preserves_page_order_and_guards() {
 }
 
 // Test: Copy atomic buffers through scattered and contiguous memory APIs.
-// Expected: Atomic copies preserve page order and leave surrounding bytes intact.
+// Expected: Atomic copies preserve page order and leave surrounding bytes
+//       intact.
 #[test]
 fn atomic_copies_preserve_scattered_order_and_guards() {
     use std::sync::atomic::AtomicU8;
@@ -925,7 +935,8 @@ fn nested_subranges_constrain_visible_memory() {
     assert!(inner.subrange(u64::MAX, 2, false).is_err());
 }
 
-// Test: Submit layouts whose granularity, backing size, or address space is invalid.
+// Test: Submit layouts whose granularity, backing size, or address space is
+//       invalid.
 // Expected: Each invalid layout returns its corresponding error category.
 #[test]
 fn invalid_multi_region_layouts_return_errors() {
@@ -998,8 +1009,10 @@ fn check_stream_cursors(mut reader: impl crate::MemoryRead, mut writer: impl cra
     reader.skip(0).unwrap();
 }
 
-// Test: Stream data across a scattered page boundary and reject overlong accesses.
-// Expected: Only successful operations advance the cursor and data stays ordered.
+// Test: Stream data across a scattered page boundary and reject overlong
+//       accesses.
+// Expected: Only successful operations advance the cursor and data stays
+//       ordered.
 #[test]
 fn single_range_streams_preserve_cursor_and_data() {
     use crate::ranges::GuestMemoryView;
@@ -1020,7 +1033,8 @@ fn single_range_streams_preserve_cursor_and_data() {
     assert_eq!(memory.read_plain::<u8>(PAGE_SIZE64 * 2 + 9).unwrap(), 0xa5);
 }
 
-// Test: Stream through several disjoint ranges, including an empty middle range.
+// Test: Stream through several disjoint ranges, including an empty middle
+//       range.
 // Expected: Range boundaries do not introduce bytes or reset stream cursors.
 #[test]
 fn multiple_range_streams_preserve_cursor_and_data() {
@@ -1182,8 +1196,10 @@ fn check_fallback_access(memory: &GuestMemory, address: u64) {
     assert_eq!(memory.read_plain::<u8>(address + 8).unwrap(), 0xa5);
 }
 
-// Test: Perform data and atomic operations on an unmapped backing and nested view.
-// Expected: Fallback operations preserve values, offsets, guards, and DMA addresses.
+// Test: Perform data and atomic operations on an unmapped backing and nested
+//       view.
+// Expected: Fallback operations preserve values, offsets, guards, and DMA
+//       addresses.
 #[test]
 fn fallback_access_survives_nested_views() {
     let memory = GuestMemory::new("fallback", Arc::new(FallbackMemory::new()));
@@ -1204,7 +1220,8 @@ fn fallback_access_survives_nested_views() {
 }
 
 // Test: Access the second of two independent unmapped guest-memory regions.
-// Expected: All fallback operations target that region without modifying the first.
+// Expected: All fallback operations target that region without modifying the
+//       first.
 #[test]
 fn multi_region_fallback_access_is_isolated() {
     let first = Arc::new(FallbackMemory::new());
@@ -1235,7 +1252,8 @@ impl<'a> crate::LockedRange<'a> for LockedSegments<'a> {
 }
 
 // Test: Lock a partial scattered range and write through its exposed segments.
-// Expected: Data follows page order and dropping the range releases the same pages.
+// Expected: Data follows page order and dropping the range releases the same
+//       pages.
 #[test]
 fn locked_range_exposes_selected_bytes_and_releases_pages() {
     let backing = Arc::new(LockMapping {
@@ -1280,7 +1298,8 @@ fn locked_range_exposes_selected_bytes_and_releases_pages() {
 }
 
 // Test: Probe mapped, absent, out-of-bounds, and overflowing guest addresses.
-// Expected: Invalid probes fail and neither successful nor failed probes alter data.
+// Expected: Invalid probes fail and neither successful nor failed probes alter
+//       data.
 #[test]
 fn probes_validate_access_without_changing_data() {
     let memory = GuestMemory::new("probe", create_test_mapping());
@@ -1302,7 +1321,8 @@ fn probes_validate_access_without_changing_data() {
 }
 
 // Test: Lock repeated, reordered pages and retain them after dropping the view.
-// Expected: Handles retain data, repeated pages alias, and each lock is released.
+// Expected: Handles retain data, repeated pages alias, and each lock is
+//       released.
 #[test]
 fn locked_page_handles_preserve_order_aliases_and_lifetime() {
     let backing = Arc::new(LockMapping {
@@ -1346,8 +1366,10 @@ fn locked_page_handles_preserve_order_aliases_and_lifetime() {
     );
 }
 
-// Test: Allocate a non-page-sized heap and edit it through its byte and atomic APIs.
-// Expected: Allocation rounds up, starts zeroed, and every access sees the same bytes.
+// Test: Allocate a non-page-sized heap and edit it through its byte and atomic
+//       APIs.
+// Expected: Allocation rounds up, starts zeroed, and every access sees the
+//       same bytes.
 #[test]
 fn heap_memory_byte_and_atomic_views_share_aligned_storage() {
     use std::sync::atomic::AtomicU8;
@@ -1384,7 +1406,8 @@ fn shared_allocation_observes_bidirectional_writes() {
 }
 
 // Test: Nest aligned views across permitted and denied bitmap pages.
-// Expected: Views retain page permissions and do not expose a bypassing mapping.
+// Expected: Views retain page permissions and do not expose a bypassing
+//       mapping.
 #[cfg(feature = "bitmap")]
 #[test]
 fn bitmap_permissions_survive_aligned_nested_views() {

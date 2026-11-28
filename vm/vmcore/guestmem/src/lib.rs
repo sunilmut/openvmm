@@ -2671,7 +2671,8 @@ mod lock_mode_tests {
     }
 
     // Test: Lock aligned and nested views under independent support settings.
-    // Expected: Neither view swaps or combines the user and kernel capabilities.
+    // Expected: Neither view swaps or combines the user and kernel
+    //       capabilities.
     #[test]
     fn subranges_preserve_independent_lock_modes() {
         for user in [false, true] {

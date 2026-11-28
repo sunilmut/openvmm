@@ -10,7 +10,8 @@ use crate::ranges::PagedRanges;
 use test_with_tracing::test;
 
 // Test: Stream distinct bytes into overlapping guest ranges, then gather them.
-// Expected: Later writes win at aliases, reads retain range order, and guards survive.
+// Expected: Later writes win at aliases, reads retain range order, and guards
+//       survive.
 #[test]
 fn overlapping_ranges_preserve_sequential_copy_order() {
     let memory = GuestMemory::allocate(PAGE_SIZE);
@@ -39,8 +40,10 @@ fn overlapping_ranges_preserve_sequential_copy_order() {
     assert_eq!(gathered, [1, 2, 7, 8, 9, 10, 7, 8, 9, 10, 11, 12]);
 }
 
-// Test: Fault on the second range after copying a valid prefix in either direction.
-// Expected: Completed ranges stay consumed; retries preserve the faulting cursor and suffix.
+// Test: Fault on the second range after copying a valid prefix in either
+//       direction.
+// Expected: Completed ranges stay consumed; retries preserve the faulting
+//       cursor and suffix.
 #[test]
 fn later_range_fault_retains_completed_progress() {
     let memory = GuestMemory::allocate(PAGE_SIZE);
