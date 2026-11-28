@@ -18,6 +18,9 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::error::Error;
+use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::Ordering;
+use test_with_tracing::test;
 
 // Test: Read typed values and then consume the remaining byte stream.
 // Expected: Reads advance by their byte lengths and return the original bytes.
@@ -89,15 +92,25 @@ fn sequential_writes_fill_and_zero_the_requested_regions() {
 #[test]
 fn failed_slice_writes_are_non_destructive() {
     let mut bytes = [0xffu8; 2];
+    {
+        let mut writer = bytes.as_mut_slice();
+        assert!(matches!(
+            writer.write(&[1, 2, 3]),
+            Err(AccessError::OutOfRange(2, 3))
+        ));
+        assert_eq!(MemoryWrite::len(&writer), 2);
+    }
+    assert_eq!(bytes, [0xff; 2]);
+    {
+        let mut writer = bytes.as_mut_slice();
+        assert!(matches!(
+            MemoryWrite::fill(&mut writer, 0, 3),
+            Err(AccessError::OutOfRange(2, 3))
+        ));
+        assert_eq!(MemoryWrite::len(&writer), 2);
+    }
+    assert_eq!(bytes, [0xff; 2]);
     let mut writer = bytes.as_mut_slice();
-    assert!(matches!(
-        writer.write(&[1, 2, 3]),
-        Err(AccessError::OutOfRange(2, 3))
-    ));
-    assert!(matches!(
-        MemoryWrite::fill(&mut writer, 0, 3),
-        Err(AccessError::OutOfRange(2, 3))
-    ));
     writer.write(&[3, 4]).unwrap();
     assert_eq!(bytes, [3, 4]);
 }
@@ -107,16 +120,25 @@ fn failed_slice_writes_are_non_destructive() {
 #[test]
 fn limited_writes_protect_the_tail() {
     let mut bytes = [0xffu8; 7];
+    {
+        let mut writer = MemoryWrite::limit(bytes.as_mut_slice(), 4);
+        assert!(matches!(
+            writer.write(&[0; 5]),
+            Err(AccessError::OutOfRange(4, 5))
+        ));
+        assert_eq!(writer.len(), 4);
+    }
+    assert_eq!(bytes, [0xff; 7]);
+    {
+        let mut writer = MemoryWrite::limit(bytes.as_mut_slice(), 4);
+        assert!(matches!(
+            writer.fill(0, 5),
+            Err(AccessError::OutOfRange(4, 5))
+        ));
+        assert_eq!(writer.len(), 4);
+    }
+    assert_eq!(bytes, [0xff; 7]);
     let mut writer = MemoryWrite::limit(bytes.as_mut_slice(), 4);
-    assert_eq!(writer.len(), 4);
-    assert!(matches!(
-        writer.write(&[0; 5]),
-        Err(AccessError::OutOfRange(4, 5))
-    ));
-    assert!(matches!(
-        writer.fill(0, 5),
-        Err(AccessError::OutOfRange(4, 5))
-    ));
     writer.write(&[1, 2]).unwrap();
     writer.fill(3, 2).unwrap();
     assert_eq!(writer.len(), 0);
@@ -283,16 +305,56 @@ fn memory_errors_identify_each_operation() {
     }
 }
 
-// Test: Construct explicit and uncategorized page-fault failures.
-// Expected: Callers receive the supplied reason and the appropriate error category.
+#[derive(Debug)]
+struct OwnedFault(Arc<AtomicUsize>);
+
+impl core::fmt::Display for OwnedFault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("owned fault")
+    }
+}
+
+impl Error for OwnedFault {}
+
+impl Drop for OwnedFault {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// Test: Move explicit and uncategorized page-fault errors into access errors.
+// Expected: Category and root cause survive wrapping, and the final error owns
+//       the root cause until it is dropped exactly once.
 #[test]
 fn page_fault_errors_retain_their_reason() {
-    let error = PageFaultError::new(GuestMemoryErrorKind::NotShared, "private page");
-    assert_eq!(error.kind, GuestMemoryErrorKind::NotShared);
-    assert_eq!(error.err.to_string(), "private page");
-    let error = PageFaultError::other("unavailable");
-    assert_eq!(error.kind, GuestMemoryErrorKind::Other);
-    assert_eq!(error.err.to_string(), "unavailable");
+    for kind in [GuestMemoryErrorKind::NotShared, GuestMemoryErrorKind::Other] {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let fault = OwnedFault(drops.clone());
+        let fault = if kind == GuestMemoryErrorKind::Other {
+            PageFaultError::other(fault)
+        } else {
+            PageFaultError::new(kind, fault)
+        };
+        let error = GuestMemoryError::new(
+            &Arc::from("ram"),
+            Some(0x100..0x200),
+            GuestMemoryOperation::Read,
+            GuestMemoryBackingError {
+                gpa: 0x180,
+                kind: fault.kind,
+                err: fault.err,
+            },
+        );
+        assert_eq!(error.kind(), kind);
+        let access = AccessError::from(error);
+        assert_eq!(
+            access.source().unwrap().source().unwrap().to_string(),
+            "owned fault"
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(access);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
 }
 
 // Test: Apply successive skips and every valid truncation to a scatter/gather
@@ -345,5 +407,152 @@ fn scatter_gather_windows_preserve_the_logical_byte_sequence() {
                 "start={start}, len={len}"
             );
         }
+    }
+}
+
+// Reject the first access without modifying the backing; subsequent accesses
+// delegate to the ordinary slice implementation.
+struct FailOnce<T> {
+    inner: T,
+    fail: bool,
+}
+
+impl<T> FailOnce<T> {
+    fn check_access(&mut self) -> Result<(), AccessError> {
+        if core::mem::take(&mut self.fail) {
+            Err(AccessError::Memory(GuestMemoryError::new(
+                &Arc::from("faulting backing"),
+                None,
+                GuestMemoryOperation::Probe,
+                GuestMemoryBackingError::new(
+                    GuestMemoryErrorKind::VtlProtected,
+                    0x1234,
+                    "access denied",
+                ),
+            )))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<T: MemoryRead> MemoryRead for FailOnce<T> {
+    fn read(&mut self, data: &mut [u8]) -> Result<&mut Self, AccessError> {
+        self.check_access()?;
+        self.inner.read(data)?;
+        Ok(self)
+    }
+
+    fn skip(&mut self, len: usize) -> Result<&mut Self, AccessError> {
+        self.check_access()?;
+        self.inner.skip(len)?;
+        Ok(self)
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+impl<T: MemoryWrite> MemoryWrite for FailOnce<T> {
+    fn write(&mut self, data: &[u8]) -> Result<(), AccessError> {
+        self.check_access()?;
+        self.inner.write(data)
+    }
+
+    fn fill(&mut self, val: u8, len: usize) -> Result<(), AccessError> {
+        self.check_access()?;
+        self.inner.fill(val, len)
+    }
+
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+}
+
+// Test: Read or skip through nested limits when an otherwise valid access fails.
+// Expected: The backing error propagates, neither cap is spent, the failed read
+//       leaves its output untouched, and a retry receives all permitted bytes.
+#[test]
+fn limited_reads_preserve_budget_after_backing_errors() {
+    for skip in [false, true] {
+        let backing = FailOnce {
+            inner: [1, 2, 3, 4, 5].as_slice(),
+            fail: true,
+        };
+        let mut reader = MemoryRead::limit(MemoryRead::limit(backing, 4), 3);
+        let mut output = [0xaa; 2];
+        let result = if skip {
+            reader.skip(2)
+        } else {
+            reader.read(&mut output)
+        };
+        let Err(AccessError::Memory(error)) = result else {
+            panic!("expected the backing failure");
+        };
+        assert_eq!(error.kind(), GuestMemoryErrorKind::VtlProtected);
+        assert_eq!(error.source().unwrap().to_string(), "access denied");
+        assert_eq!(output, [0xaa; 2]);
+        assert_eq!(reader.len(), 3);
+        assert_eq!(reader.read_all().unwrap(), [1, 2, 3]);
+        assert_eq!(reader.len(), 0);
+    }
+}
+
+// Test: Write or fill through nested limits when an allowed access fails.
+// Expected: The original error is retained, retry has the whole cap, and
+//       bytes outside the smaller cap remain untouched.
+#[test]
+fn limited_writes_preserve_budget_after_backing_errors() {
+    for fill in [false, true] {
+        let mut bytes = [0xaa; 5];
+        {
+            let backing = FailOnce {
+                inner: bytes.as_mut_slice(),
+                fail: true,
+            };
+            let mut writer = MemoryWrite::limit(MemoryWrite::limit(backing, 4), 3);
+            let result = if fill {
+                writer.fill(0xff, 2)
+            } else {
+                writer.write(&[0xff; 2])
+            };
+            let Err(AccessError::Memory(error)) = result else {
+                panic!("expected the backing failure");
+            };
+            assert_eq!(error.kind(), GuestMemoryErrorKind::VtlProtected);
+            assert_eq!(error.source().unwrap().to_string(), "access denied");
+            assert_eq!(writer.len(), 3);
+            writer.write(&[1, 2, 3]).unwrap();
+            assert_eq!(writer.len(), 0);
+            assert!(matches!(
+                writer.write(&[9]),
+                Err(AccessError::OutOfRange(0, 1))
+            ));
+        }
+        assert_eq!(bytes, [1, 2, 3, 0xaa, 0xaa]);
+    }
+}
+
+// Test: Convert the highest representable page and iterate its last safe byte,
+//       then reject page numbers requiring more than 64 address bits.
+// Expected: High address bits are preserved and invalid GPNs never wrap.
+#[test]
+fn high_guest_page_conversion_preserves_address_bits() {
+    let highest_gpn = 0x000f_ffff_ffff_ffff;
+    assert_eq!(gpn_to_gpa(highest_gpn).unwrap(), 0xffff_ffff_ffff_f000);
+    let gpns = [highest_gpn];
+    let range = PagedRange::new(4094, 1, &gpns).unwrap();
+    assert_eq!(
+        range.ranges().collect::<Result<Vec<_>, _>>().unwrap(),
+        [AddressRange::from(
+            0xffff_ffff_ffff_fffe..0xffff_ffff_ffff_ffff
+        )]
+    );
+    for gpn in [0x0010_0000_0000_0000, u64::MAX] {
+        assert_eq!(
+            gpn_to_gpa(gpn).unwrap_err().to_string(),
+            alloc::format!("invalid guest page number {gpn:#x}")
+        );
     }
 }

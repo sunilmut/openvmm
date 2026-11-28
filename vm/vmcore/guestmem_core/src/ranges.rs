@@ -402,7 +402,10 @@ impl<'a, T: Iterator<Item = PagedRange<'a>>> Iterator for PagedRangesIter<'a, T>
 mod tests {
     use super::*;
     use alloc::vec::Vec;
+    use test_with_tracing::test;
 
+    // Test: Trim a multi-range buffer containing disjoint and adjacent pages.
+    // Expected: Guest addresses stay ordered and adjacent pages coalesce.
     #[test]
     fn test_ranges() {
         assert!(PagedRange::new(1, PAGE_SIZE, &[1]).is_none());
