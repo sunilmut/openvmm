@@ -203,7 +203,10 @@ mod tests {
     use super::*;
     use crate::protocol::ChannelId;
     use crate::protocol::GpadlId;
+    use test_with_tracing::test;
 
+    // Test: Serialize a channel-close request.
+    // Expected: The type, reserved header and channel ID match the wire packet.
     #[test]
     fn test_outgoing_message() {
         let message = OutgoingMessage::new(&protocol::CloseChannel {
@@ -213,6 +216,8 @@ mod tests {
         assert_eq!(&[0x7, 0, 0, 0, 0, 0, 0, 0, 0x5, 0, 0, 0], message.data())
     }
 
+    // Test: Serialize an unload request without a body.
+    // Expected: Only the type and zero reserved header bytes are emitted.
     #[test]
     fn test_outgoing_message_empty() {
         let message = OutgoingMessage::new(&protocol::Unload {});
@@ -220,6 +225,8 @@ mod tests {
         assert_eq!(&[0x10, 0, 0, 0, 0, 0, 0, 0], message.data())
     }
 
+    // Test: Append range data to a GPADL header.
+    // Expected: Both IDs and range metadata precede the unchanged trailing bytes.
     #[test]
     fn test_outgoing_message_with_data() {
         let message = OutgoingMessage::with_data(

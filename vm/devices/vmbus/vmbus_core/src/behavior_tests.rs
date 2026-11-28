@@ -3,6 +3,7 @@
 
 use super::*;
 use protocol::*;
+use test_with_tracing::test;
 use zerocopy::FromBytes;
 
 fn version(version: Version, feature_flags: FeatureFlags) -> Option<VersionInfo> {
@@ -54,7 +55,7 @@ fn negotiated_feature_constraints_preserve_capability_sets() {
         version: Version::Copper,
         feature_flags: limited,
     });
-    assert_eq!(max.version, parse_vmbus_version("6.0").unwrap());
+    assert_eq!(max.version, 0x0006_0000);
     assert_eq!(max.feature_flags, negotiated);
     let version_only = MaxVersionInfo::new(max.version);
     assert_eq!(version_only.version, max.version);
@@ -326,6 +327,9 @@ fn hvsock_connection_conversions_preserve_identity_and_failure_status() {
     wire.silo_id = guid::guid!("12345678-1234-5678-90ab-cdef12345678");
     for unaware in [false, true] {
         let request = HvsockConnectRequest::from_message(wire, unaware);
+        assert_eq!(request.endpoint_id, base.endpoint_id);
+        assert_eq!(request.service_id, base.service_id);
+        assert_eq!(request.silo_id, wire.silo_id);
         assert_eq!(request.hosted_silo_unaware, unaware);
         assert_eq!(TlConnectRequest2::from(request).as_bytes(), wire.as_bytes());
         for success in [false, true] {
@@ -411,5 +415,195 @@ fn multipart_gpadl_messages_preserve_full_page_lists() {
             other => panic!("unexpected GPADL body: {other:?}"),
         }
         assert_eq!(received, ranges);
+    }
+}
+
+// Test: Parse monitor-page changes and pause/resume packets across negotiations.
+// Expected: Copper and the specific capability are both required; accepted
+//       packets retain complete payloads and tails, and short bodies fail.
+#[test]
+fn connection_control_packets_require_their_own_negotiated_capability() {
+    let modify = OutgoingMessage::with_data(
+        &ModifyConnection {
+            parent_to_child_monitor_page_gpa: 0x1234_5678_9abc_d000,
+            child_to_parent_monitor_page_gpa: 0xfedc_ba98_7654_3000,
+        },
+        &[0xde, 0xad],
+    );
+    assert_eq!(
+        modify.data(),
+        &[
+            25, 0, 0, 0, 0, 0, 0, 0, 0, 0xd0, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12, 0, 0x30, 0x54,
+            0x76, 0x98, 0xba, 0xdc, 0xfe, 0xde, 0xad,
+        ]
+    );
+    let packets = [
+        (modify, MessageType::MODIFY_CONNECTION, false),
+        (
+            OutgoingMessage::with_data(
+                &ModifyConnectionResponse {
+                    connection_state: ConnectionState::FAILED_LOW_RESOURCES,
+                },
+                &[0xde, 0xad],
+            ),
+            MessageType::MODIFY_CONNECTION_RESPONSE,
+            false,
+        ),
+        (
+            OutgoingMessage::with_data(&Pause, &[0xde, 0xad]),
+            MessageType::PAUSE,
+            true,
+        ),
+        (
+            OutgoingMessage::with_data(&PauseResponse, &[0xde, 0xad]),
+            MessageType::PAUSE_RESPONSE,
+            true,
+        ),
+        (
+            OutgoingMessage::with_data(&Resume, &[0xde, 0xad]),
+            MessageType::RESUME,
+            true,
+        ),
+    ];
+    let modify_only = FeatureFlags::new().with_modify_connection(true);
+    let pause_only = FeatureFlags::new().with_pause_resume(true);
+    for (packet, kind, needs_pause) in packets {
+        for negotiated in [None, Some(Version::Iron), Some(Version::Copper)] {
+            for (features, modify_enabled, pause_enabled) in [
+                (FeatureFlags::new(), false, false),
+                (modify_only, true, false),
+                (pause_only, false, true),
+                (modify_only | pause_only, true, true),
+            ] {
+                let connected = negotiated.and_then(|value| version(value, features));
+                let accepted = negotiated == Some(Version::Copper)
+                    && if needs_pause {
+                        pause_enabled
+                    } else {
+                        modify_enabled
+                    };
+                let parsed = Message::parse(packet.data(), connected);
+                if !accepted {
+                    assert!(matches!(
+                        parsed,
+                        Err(ParseError::InvalidMessageType(actual)) if actual == kind
+                    ));
+                    continue;
+                }
+                let tail = match parsed.unwrap() {
+                    Message::ModifyConnection(value, tail) => {
+                        assert_eq!(kind, MessageType::MODIFY_CONNECTION);
+                        assert_eq!(
+                            value.parent_to_child_monitor_page_gpa,
+                            0x1234_5678_9abc_d000
+                        );
+                        assert_eq!(
+                            value.child_to_parent_monitor_page_gpa,
+                            0xfedc_ba98_7654_3000
+                        );
+                        tail
+                    }
+                    Message::ModifyConnectionResponse(value, tail) => {
+                        assert_eq!(kind, MessageType::MODIFY_CONNECTION_RESPONSE);
+                        assert_eq!(
+                            value.connection_state,
+                            ConnectionState::FAILED_LOW_RESOURCES
+                        );
+                        tail
+                    }
+                    Message::Pause(_, tail) => {
+                        assert_eq!(kind, MessageType::PAUSE);
+                        tail
+                    }
+                    Message::PauseResponse(_, tail) => {
+                        assert_eq!(kind, MessageType::PAUSE_RESPONSE);
+                        tail
+                    }
+                    Message::Resume(_, tail) => {
+                        assert_eq!(kind, MessageType::RESUME);
+                        tail
+                    }
+                    other => panic!("unexpected control packet: {other:?}"),
+                };
+                assert_eq!(tail, &[0xde, 0xad]);
+                let body_size = if needs_pause {
+                    0
+                } else if kind == MessageType::MODIFY_CONNECTION {
+                    16
+                } else {
+                    1
+                };
+                for length in 8..8 + body_size {
+                    assert!(matches!(
+                        Message::parse(&packet.data()[..length], connected),
+                        Err(ParseError::MessageTooSmall(Some(actual))) if actual == kind
+                    ));
+                }
+            }
+        }
+    }
+}
+
+// Test: Decode legacy and silo-aware socket requests from independent wire bytes.
+// Expected: RS5 selects the extension only when complete; earlier versions and
+//       short extensions preserve legacy identities and every unconsumed byte.
+#[test]
+fn socket_request_size_fallback_preserves_wire_identities_and_tails() {
+    let wire = [
+        21, 0, 0, 0, 0, 0, 0, 0, 0x67, 0x45, 0x23, 0x01, 0xab, 0x89, 0xef, 0xcd, 0x01, 0x23, 0x45,
+        0x67, 0x89, 0xab, 0xcd, 0xef, 0x98, 0xba, 0xdc, 0xfe, 0x54, 0x76, 0x10, 0x32, 0xfe, 0xdc,
+        0xba, 0x98, 0x76, 0x54, 0x32, 0x10, 0x44, 0x33, 0x22, 0x11, 0x66, 0x55, 0x88, 0x77, 0x99,
+        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+    ];
+    let endpoint = guid::guid!("01234567-89ab-cdef-0123-456789abcdef");
+    let service = guid::guid!("fedcba98-7654-3210-fedc-ba9876543210");
+    let silo = guid::guid!("11223344-5566-7788-99aa-bbccddeeff00");
+    let request = TlConnectRequest2 {
+        base: TlConnectRequest {
+            endpoint_id: endpoint,
+            service_id: service,
+        },
+        silo_id: silo,
+    };
+    assert_eq!(OutgoingMessage::new(&request).data(), &wire);
+    assert_eq!(OutgoingMessage::new(&request.base).data(), &wire[..40]);
+    let mut extended = wire.to_vec();
+    extended.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+    for negotiated in [Version::Win10, Version::Win10Rs5, Version::Copper] {
+        let connected = version(negotiated, FeatureFlags::new());
+        for length in 8..40 {
+            assert!(matches!(
+                Message::parse(&wire[..length], connected),
+                Err(ParseError::MessageTooSmall(Some(
+                    MessageType::TL_CONNECT_REQUEST
+                )))
+            ));
+        }
+        for length in 40..=extended.len() {
+            match Message::parse(&extended[..length], connected).unwrap() {
+                Message::TlConnectRequest(value, tail) => {
+                    assert!(negotiated == Version::Win10 || length < 56);
+                    assert_eq!(value.endpoint_id, endpoint);
+                    assert_eq!(value.service_id, service);
+                    assert_eq!(tail, &extended[40..length]);
+                }
+                Message::TlConnectRequest2(value, tail) => {
+                    assert!(negotiated != Version::Win10 && length >= 56);
+                    assert_eq!(value.base.endpoint_id, endpoint);
+                    assert_eq!(value.base.service_id, service);
+                    assert_eq!(value.silo_id, silo);
+                    assert_eq!(tail, &extended[56..length]);
+                }
+                other => panic!("unexpected socket request: {other:?}"),
+            }
+        }
+    }
+    for connected in [None, version(Version::Win8_1, FeatureFlags::new())] {
+        assert!(matches!(
+            Message::parse(&wire, connected),
+            Err(ParseError::InvalidMessageType(
+                MessageType::TL_CONNECT_REQUEST
+            ))
+        ));
     }
 }
