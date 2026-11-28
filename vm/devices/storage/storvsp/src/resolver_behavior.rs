@@ -7,6 +7,7 @@ use scsi_core::{ResolveScsiDeviceHandleParams, ResolvedScsiDevice};
 use storvsp_resources::{
     ScsiControllerHandle, ScsiControllerRequest, ScsiDeviceAndPath, StorvspIdeDeviceHandle,
 };
+use test_with_tracing::test;
 use vm_resource::kind::ScsiDeviceHandleKind;
 use vm_resource::{ResolveResource, Resource, ResourceId, ResourceResolver};
 use vmbus_channel::resources::{ResolveVmbusDeviceHandleParams, ResolvedVmbusDevice};

@@ -5,6 +5,7 @@ use super::*;
 use scsi_core::ScsiSaveRestore;
 use scsi_core::save_restore::{ScsiDiskSavedState, ScsiSavedState};
 use stackfuture::StackFuture;
+use test_with_tracing::test;
 
 #[derive(Default)]
 struct Gate {
@@ -90,9 +91,20 @@ async fn backend_statuses_map_to_guest_error_completions(driver: DefaultDriver) 
     for (status, expected) in [
         (SrbStatus::BUSY, NtStatus::DEVICE_BUSY),
         (SrbStatus::NO_DEVICE, NtStatus::DEVICE_DOES_NOT_EXIST),
+        (SrbStatus::INVALID_LUN, NtStatus::DEVICE_DOES_NOT_EXIST),
+        (
+            SrbStatus::INVALID_TARGET_ID,
+            NtStatus::DEVICE_DOES_NOT_EXIST,
+        ),
+        (SrbStatus::NO_HBA, NtStatus::DEVICE_DOES_NOT_EXIST),
         (SrbStatus::TIMEOUT, NtStatus::IO_TIMEOUT),
+        (SrbStatus::COMMAND_TIMEOUT, NtStatus::IO_TIMEOUT),
         (SrbStatus::SELECTION_TIMEOUT, NtStatus::DEVICE_NOT_CONNECTED),
         (SrbStatus::BAD_FUNCTION, NtStatus::INVALID_DEVICE_REQUEST),
+        (
+            SrbStatus::BAD_SRB_BLOCK_LENGTH,
+            NtStatus::INVALID_DEVICE_REQUEST,
+        ),
         (SrbStatus::DATA_OVERRUN, NtStatus::BUFFER_OVERFLOW),
         (SrbStatus::REQUEST_FLUSHED, NtStatus::UNSUCCESSFUL),
         (SrbStatus::ABORTED, NtStatus::CANCELLED),
@@ -102,14 +114,17 @@ async fn backend_statuses_map_to_guest_error_completions(driver: DefaultDriver) 
         assert_eq!(header.status, expected);
         assert_eq!(reply.srb_status.status(), status);
         assert!(!reply.srb_status.autosense_valid());
+        assert_eq!(reply.scsi_status, ScsiStatus::GOOD);
+        assert_eq!(reply.data_transfer_length, 0);
+        assert_eq!(reply.payload, [0; 20]);
     }
     drop(guest);
     fixture.finish().await;
 }
 
 // Test: Save an in-flight request, restore it into a fresh device and release I/O.
-// Expected: The restored backend is invoked again and the guest receives the
-//       original transaction's successful completion.
+// Expected: A fresh backend completes the original transaction with the full
+//       successful reply, then independently completes another request.
 #[async_test]
 async fn pending_io_survives_device_snapshot_restore(driver: DefaultDriver) {
     let gate = Arc::new(Gate::default());
@@ -132,26 +147,44 @@ async fn pending_io_survives_device_snapshot_restore(driver: DefaultDriver) {
     drop(guest);
     original.finish().await;
 
-    let restored = Fixture::new(&driver, &controller, memory).await;
-    let (mut guest, open, request) = restored.rings(&driver);
+    let restored_gate = Arc::new(Gate::default());
+    let restored_controller = backend_controller(Arc::new(Backend {
+        gate: Some(restored_gate.clone()),
+        save_supported: true,
+    }));
+    let restored = Fixture::new(&driver, &restored_controller, memory).await;
+    let (mut guest, open, gpadl) = restored.rings(&driver);
     *restored.bus.offers.lock()[0].plan.lock() = Some(RestoreResult {
         open_request: Some(open),
         gpadls: vec![RestoredGpadl {
-            request,
+            request: gpadl,
             accepted: true,
         }],
     });
     restored.handle.restore(saved).await.unwrap();
-    let entered = gate.entered.listen();
+    let entered = restored_gate.entered.listen();
     restored.handle.start();
     bounded(&driver, entered).await;
-    gate.release.notify(usize::MAX);
+    restored_gate.release.notify(usize::MAX);
     let (header, payload) = guest.completion(transaction).await;
     assert_eq!(header.status, storvsp_protocol::NtStatus::SUCCESS);
+    assert_eq!(payload, successful_completion(0).as_bytes());
     let reply = storvsp_protocol::ScsiRequest::read_from_prefix(&payload)
         .unwrap()
         .0;
     assert_eq!(reply.srb_status.status(), SrbStatus::SUCCESS);
+    assert_eq!(reply.scsi_status, ScsiStatus::GOOD);
+    assert_eq!(reply.data_transfer_length, 0);
+    assert!(!reply.srb_status.autosense_valid());
+    assert_eq!(reply.payload, [0; 20]);
+    // A new request must progress independently of the restored request.
+    let entered = restored_gate.entered.listen();
+    let retry = guest.submit_scsi(&request(SrbStatus::SUCCESS), 0).await;
+    bounded(&driver, entered).await;
+    restored_gate.release.notify(usize::MAX);
+    let (header, payload) = guest.completion(retry).await;
+    assert_eq!(header.status, storvsp_protocol::NtStatus::SUCCESS);
+    assert_eq!(payload, successful_completion(0).as_bytes());
     drop(guest);
     restored.finish().await;
 }

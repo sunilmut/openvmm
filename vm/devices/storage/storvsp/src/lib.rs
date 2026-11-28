@@ -1958,6 +1958,9 @@ mod tests {
         }
     }
 
+    // Test: Notify before polling, coalesce notifications and reset the latch.
+    // Expected: Each pending notification is delivered once, reset discards it,
+    //       and a replacement receiver can still consume a latched notification.
     #[test]
     fn test_rescan_notification_latches_coalesces_and_resets() {
         let notification = RescanNotification::default();
@@ -1989,6 +1992,9 @@ mod tests {
         }
     }
 
+    // Test: Replace a notification receiver's waker and deliver a delayed wake.
+    // Expected: Only the current waiter is signaled; consuming a notification
+    //       and receiving a delayed wake do not disarm later notifications.
     #[test]
     fn test_rescan_notification_rearms_and_updates_waker() {
         let notification = RescanNotification::default();
@@ -2011,7 +2017,7 @@ mod tests {
         assert!(receiver.poll(&mut second_cx).is_pending());
         // A delayed wake from the previous notification must not disarm the
         // receiver when its pending flag has already been consumed.
-        let delayed_waker = notification.waker.lock().clone().unwrap();
+        let delayed_waker = second_waker.clone();
         delayed_waker.wake();
         assert!(receiver.poll(&mut second_cx).is_pending());
         notification.notify();
@@ -2019,6 +2025,9 @@ mod tests {
         assert!(receiver.poll(&mut second_cx).is_ready());
     }
 
+    // Test: Write and read a block through a negotiated storage channel.
+    // Expected: Both requests complete successfully and the full read matches
+    //       the written bytes before the worker closes gracefully.
     #[async_test]
     async fn test_channel_working(driver: DefaultDriver) {
         // set up the channels and worker
@@ -2088,6 +2097,9 @@ mod tests {
         guest.verify_graceful_close(test_worker).await;
     }
 
+    // Test: Query an unsupported version with padded and oversized packets.
+    // Expected: Revision mismatch replies preserve the guest's framing up to
+    //       the protocol maximum, including ring alignment.
     #[async_test]
     async fn test_packet_sizes(driver: DefaultDriver) {
         // set up the channels and worker
@@ -2160,6 +2172,8 @@ mod tests {
         }
     }
 
+    // Test: End initialization before beginning it.
+    // Expected: The guest receives INVALID_DEVICE_STATE.
     #[async_test]
     async fn test_wrong_first_packet(driver: DefaultDriver) {
         // set up the channels and worker
@@ -2210,6 +2224,8 @@ mod tests {
             .await;
     }
 
+    // Test: Send an operation that is not a supported guest request.
+    // Expected: The worker terminates with that exact unrecognized operation.
     #[async_test]
     async fn test_unrecognized_operation(driver: DefaultDriver) {
         // set up the channels and worker
@@ -2250,6 +2266,9 @@ mod tests {
         }
     }
 
+    // Test: Request a subchannel from a controller configured without any.
+    // Expected: Negotiation succeeds but channel creation returns
+    //       INVALID_PARAMETER.
     #[async_test]
     async fn test_too_many_subchannels(driver: DefaultDriver) {
         // set up the channels and worker
@@ -2335,6 +2354,8 @@ mod tests {
             .await;
     }
 
+    // Test: Begin initialization again after completing negotiation.
+    // Expected: The ready channel rejects the request with INVALID_DEVICE_STATE.
     #[async_test]
     async fn test_begin_init_on_ready(driver: DefaultDriver) {
         // set up the channels and worker
@@ -2380,6 +2401,9 @@ mod tests {
             .await;
     }
 
+    // Test: Add and remove four disks while a negotiated guest is running.
+    // Expected: Each change signals enumeration, adjusts the reported LUN count,
+    //       and changes the addressed disk's write result without closing.
     #[async_test]
     async fn test_hot_add_remove(driver: DefaultDriver) {
         // set up channels and worker.
@@ -2543,6 +2567,8 @@ mod tests {
         guest.verify_graceful_close(test_worker).await;
     }
 
+    // Test: Write and read through an asynchronously dispatched RAM disk.
+    // Expected: Successful completions accompany an exact full-buffer round trip.
     #[async_test]
     async fn test_async_disk(driver: DefaultDriver) {
         let device = disklayer_ram::ram_disk(64 * 1024, false).unwrap();
@@ -2694,6 +2720,9 @@ mod tests {
     /// comes back. This drives the real `VmbusDevice::close` and observes the
     /// result the way an initiator would, through a SCSI command, rather than
     /// through the device's internals.
+    // Test: Lock a DVD tray, attempt ejection and close the primary channel.
+    // Expected: Ejection fails while the nexus is live and succeeds after close
+    //       clears the same drive's nexus-scoped lock.
     #[async_test]
     async fn test_close_ends_the_nexus(driver: DefaultDriver) {
         let controller = ScsiController::new();

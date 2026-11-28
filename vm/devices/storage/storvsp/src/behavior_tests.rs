@@ -8,6 +8,7 @@ use mesh::rpc::RpcSend;
 use pal_async::DefaultDriver;
 use pal_async::async_test;
 use pal_async::task::{Spawn, Task};
+use test_with_tracing::test;
 use vmbus_channel::bus::{
     ChannelRequest, ChannelServerRequest, GpadlRequest, OfferInput, OfferResources, OpenData,
     ParentBus, RestoreResult, RestoredGpadl,
@@ -191,6 +192,7 @@ impl Guest {
         let mut reader = packet.reader();
         let header: storvsp_protocol::Packet = reader.read_plain().unwrap();
         assert_eq!(header.operation, storvsp_protocol::Operation::COMPLETE_IO);
+        assert_eq!(header.flags, 0);
         let mut payload = vec![0; reader.len()];
         reader.read(&mut payload).unwrap();
         (header, payload)
@@ -210,6 +212,10 @@ impl Guest {
     }
 
     async fn submit_scsi(&mut self, request: &storvsp_protocol::ScsiRequest, length: usize) -> u64 {
+        self.submit_scsi_bytes(request.as_bytes(), length).await
+    }
+
+    async fn submit_scsi_bytes(&mut self, request: &[u8], length: usize) -> u64 {
         let header = storvsp_protocol::Packet {
             operation: storvsp_protocol::Operation::EXECUTE_SRB,
             flags: 0,
@@ -232,7 +238,7 @@ impl Guest {
             .write(OutgoingPacket {
                 packet_type,
                 transaction_id,
-                payload: &[header.as_bytes(), request.as_bytes()],
+                payload: &[header.as_bytes(), request],
             })
             .await
             .unwrap();
@@ -400,8 +406,8 @@ fn controller() -> ScsiController {
 async fn snapshots_resume_each_negotiation_phase(driver: DefaultDriver) {
     for phase in 0..=4 {
         let memory = GuestMemory::allocate(65536);
-        let controller = controller();
-        let original = Fixture::new(&driver, &controller, memory.clone()).await;
+        let original_controller = controller();
+        let original = Fixture::new(&driver, &original_controller, memory.clone()).await;
         let mut guest = original.open(&driver).await;
         for step in 0..phase {
             guest.negotiate_step(step).await;
@@ -410,7 +416,8 @@ async fn snapshots_resume_each_negotiation_phase(driver: DefaultDriver) {
         let saved = original.handle.save().await.unwrap().unwrap();
         drop(guest);
         original.finish().await;
-        let restored = Fixture::new(&driver, &controller, memory).await;
+        let restored_controller = controller();
+        let restored = Fixture::new(&driver, &restored_controller, memory).await;
         let (mut guest, open, request) = restored.rings(&driver);
         *restored.bus.offers.lock()[0].plan.lock() = Some(RestoreResult {
             open_request: Some(open),
@@ -428,6 +435,13 @@ async fn snapshots_resume_each_negotiation_phase(driver: DefaultDriver) {
             .exchange(storvsp_protocol::Operation::RESET_BUS, &[])
             .await;
         assert_eq!(reply.status, storvsp_protocol::NtStatus::SUCCESS);
+        let (header, response) = guest.scsi(&inquiry(0), 96).await;
+        assert_eq!(header.status, storvsp_protocol::NtStatus::SUCCESS);
+        assert_eq!(response.as_bytes(), successful_completion(96).as_bytes());
+        let mut identity = [0; 36];
+        restored.bus.memory.read_at(32768, &mut identity).unwrap();
+        assert_eq!(identity[0] & 0x1f, 0);
+        assert_eq!(&identity[8..16], b"Msft    ");
         drop(guest);
         restored.finish().await;
     }
@@ -505,12 +519,14 @@ async fn absent_lun_inquiry_reports_identity_and_validates_cdb(driver: DefaultDr
         assert_eq!(response.srb_status.status(), SrbStatus::SUCCESS);
         let mut data = [0; 96];
         fixture.bus.memory.read_at(32768, &mut data).unwrap();
-        assert_eq!(data[0], 0x7f);
+        let mut expected = [0; 96];
+        // The 96-byte allocation truncates the advertised 104-byte identity.
+        expected[..5].copy_from_slice(&[0x7f, 0, 5, 2, 99]);
         if lun == 0 {
-            assert_ne!(&data[8..36], &[0; 28]);
-        } else {
-            assert_eq!(&data[8..36], &[0; 28]);
+            expected[8..36].copy_from_slice(b"Msft    Virtual Disk    1.0 ");
         }
+        assert_eq!(data, expected);
+        assert_eq!(response.as_bytes(), successful_completion(96).as_bytes());
     }
     for (direction, allocation, flags, page, external_len) in [
         (0, 96, 0, 0, 96),
@@ -705,6 +721,12 @@ async fn inquiry_error_sense_does_not_leak_into_successful_retry(driver: Default
     assert_eq!(response.payload[0] & 0x7f, 0x70);
     assert_eq!(response.payload[2] & 0x0f, 0x05);
     assert_eq!(&response.payload[12..14], &[0x24, 0]);
+    assert_eq!(
+        response.payload,
+        [
+            0x70, 0, 5, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0x24, 0, 0, 0, 0, 0, 0, 0
+        ]
+    );
     let mut data = [0; 128];
     fixture.bus.memory.read_at(32768, &mut data).unwrap();
     assert_eq!(data, [0x5a; 128]);
@@ -716,9 +738,241 @@ async fn inquiry_error_sense_does_not_leak_into_successful_retry(driver: Default
     assert!(!response.srb_status.autosense_valid());
     assert_eq!(response.payload, [0; 20]);
     assert_eq!(response.data_transfer_length, 96);
+    assert_eq!(response.as_bytes(), successful_completion(96).as_bytes());
     fixture.bus.memory.read_at(32768, &mut data).unwrap();
     assert_eq!(data[0], 0x7f);
     assert_eq!(&data[96..], &[0x5a; 32]);
+    drop(guest);
+    fixture.finish().await;
+}
+
+fn successful_completion(transferred: u32) -> storvsp_protocol::ScsiRequest {
+    storvsp_protocol::ScsiRequest {
+        length: 52,
+        srb_status: SrbStatusAndFlags::new().with_status(SrbStatus::SUCCESS),
+        scsi_status: ScsiStatus::GOOD,
+        cdb_length: 16,
+        sense_info_ex_length: 20,
+        data_transfer_length: transferred,
+        ..FromZeros::new_zeroed()
+    }
+}
+
+fn block_request(path: ScsiPath, write: bool) -> storvsp_protocol::ScsiRequest {
+    let cdb = scsi::Cdb10 {
+        operation_code: if write { ScsiOp::WRITE } else { ScsiOp::READ },
+        logical_block: 3.into(),
+        transfer_blocks: 1.into(),
+        ..FromZeros::new_zeroed()
+    };
+    let mut request = storvsp_protocol::ScsiRequest {
+        length: 52,
+        path_id: path.path,
+        target_id: path.target,
+        lun: path.lun,
+        cdb_length: 10,
+        data_in: u8::from(!write),
+        data_transfer_length: 512,
+        ..FromZeros::new_zeroed()
+    };
+    request.payload[..10].copy_from_slice(cdb.as_bytes());
+    request
+}
+
+async fn assert_report_luns(fixture: &Fixture, guest: &mut Guest, path: ScsiPath, expected: &[u8]) {
+    let mut request = block_request(path, false);
+    request.payload = [0; 20];
+    request.payload[0] = ScsiOp::REPORT_LUNS.0;
+    request.cdb_length = 12;
+    request.payload[9] = 64;
+    request.data_transfer_length = 64;
+    fixture.bus.memory.write_at(32768, &[0xa5; 64]).unwrap();
+    let (header, response) = guest.scsi(&request, 64).await;
+    assert_eq!(header.status, storvsp_protocol::NtStatus::SUCCESS);
+    assert_eq!(
+        response.as_bytes(),
+        successful_completion(expected.len() as u32).as_bytes()
+    );
+    let mut data = [0; 64];
+    fixture.bus.memory.read_at(32768, &mut data).unwrap();
+    assert_eq!(&data[..expected.len()], expected);
+    assert_eq!(&data[expected.len()..], &vec![0xa5; 64 - expected.len()]);
+}
+
+// Test: Negotiate every supported version and send a version-sized SCSI request.
+// Expected: Version echoes, channel capabilities, padding and the complete SCSI
+//       reply match the selected wire format, including legacy request sizes.
+#[async_test]
+async fn negotiated_versions_preserve_capabilities_and_completion_framing(driver: DefaultDriver) {
+    use storvsp_protocol::{NtStatus, Operation};
+    for (version, size, subchannels, flags) in [
+        (0x0200u16, 36, 0u16, 0u32),
+        (0x0402, 36, 0, 0),
+        (0x0501, 52, 2, 1),
+        (0x0600, 52, 2, 1),
+    ] {
+        let fixture = Fixture::new(&driver, &controller(), GuestMemory::allocate(65536)).await;
+        let mut guest = fixture.open(&driver).await;
+        guest.negotiate_step(0).await;
+        let mut version_request = vec![0xa5; size];
+        version_request[..4].copy_from_slice(&[version as u8, (version >> 8) as u8, 0, 0]);
+        let (header, payload) = guest
+            .exchange(Operation::QUERY_PROTOCOL_VERSION, &version_request)
+            .await;
+        assert_eq!(header.status, NtStatus::SUCCESS);
+        let mut expected_version = vec![0; size];
+        expected_version[..2].copy_from_slice(&version.to_le_bytes());
+        assert_eq!(payload, expected_version);
+        let (header, payload) = guest
+            .exchange(Operation::QUERY_PROPERTIES, &vec![0xa5; size])
+            .await;
+        assert_eq!(header.status, NtStatus::SUCCESS);
+        let mut expected_properties = vec![0; size];
+        expected_properties[4..6].copy_from_slice(&subchannels.to_le_bytes());
+        expected_properties[8..12].copy_from_slice(&flags.to_le_bytes());
+        expected_properties[12..16].copy_from_slice(&0x40000u32.to_le_bytes());
+        assert_eq!(payload, expected_properties);
+        guest.negotiate_step(3).await;
+        let mut request = block_request(ScsiPath::default(), false);
+        request.queue_tag = 0xa5;
+        request.queue_sort_key = 0x12345678;
+        let transaction = guest
+            .submit_scsi_bytes(&request.as_bytes()[..size], 512)
+            .await;
+        let (header, payload) = guest.completion(transaction).await;
+        assert_eq!(header.status, NtStatus::SUCCESS);
+        assert_eq!(payload, &successful_completion(512).as_bytes()[..size]);
+        let mut data = [0xff; 512];
+        fixture.bus.memory.read_at(32768, &mut data).unwrap();
+        assert_eq!(data, [0; 512]);
+        drop(guest);
+        fixture.finish().await;
+    }
+}
+
+// Test: Enumerate sparse LUNs, reject a duplicate and remove one addressed disk.
+// Expected: Full sorted LUN lists exclude other paths and targets; rejected
+//       replacement and removal leave each peer's stored block intact.
+#[async_test]
+async fn sparse_luns_and_disk_removal_preserve_addressed_peers(driver: DefaultDriver) {
+    let controller = ScsiController::new();
+    let paths = [
+        ScsiPath {
+            path: 0,
+            target: 0,
+            lun: 9,
+        },
+        ScsiPath {
+            path: 0,
+            target: 0,
+            lun: 2,
+        },
+        ScsiPath {
+            path: 0,
+            target: 1,
+            lun: 5,
+        },
+        ScsiPath {
+            path: 1,
+            target: 0,
+            lun: 7,
+        },
+    ];
+    for path in paths {
+        let disk = scsidisk::SimpleScsiDisk::new(
+            disklayer_ram::ram_disk(1024 * 1024, false).unwrap(),
+            Default::default(),
+        );
+        controller
+            .attach(path, ScsiControllerDisk::new(Arc::new(disk)))
+            .unwrap();
+    }
+    let fixture = Fixture::new(&driver, &controller, GuestMemory::allocate(65536)).await;
+    let mut guest = fixture.open(&driver).await;
+    for step in 0..4 {
+        guest.negotiate_step(step).await;
+    }
+    for (index, path) in paths.into_iter().enumerate() {
+        fixture
+            .bus
+            .memory
+            .write_at(32768, &[0x31 + index as u8; 512])
+            .unwrap();
+        let (header, response) = guest.scsi(&block_request(path, true), 512).await;
+        assert_eq!(header.status, storvsp_protocol::NtStatus::SUCCESS);
+        assert_eq!(response.as_bytes(), successful_completion(512).as_bytes());
+    }
+    let replacement = scsidisk::SimpleScsiDisk::new(
+        disklayer_ram::ram_disk(1024 * 1024, false).unwrap(),
+        Default::default(),
+    );
+    assert!(
+        controller
+            .attach(paths[0], ScsiControllerDisk::new(Arc::new(replacement)))
+            .is_err()
+    );
+    for (path, expected) in [
+        (
+            paths[0],
+            &[
+                0, 0, 0, 16, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0,
+            ][..],
+        ),
+        (
+            paths[2],
+            &[0, 0, 0, 8, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0][..],
+        ),
+        (
+            paths[3],
+            &[0, 0, 0, 8, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0][..],
+        ),
+    ] {
+        assert_report_luns(&fixture, &mut guest, path, expected).await;
+    }
+    controller.remove(paths[1]).unwrap();
+    {
+        let (mut reader, _) = guest.queue.split();
+        let packet = bounded(&driver, reader.read()).await.unwrap();
+        let IncomingPacket::Data(packet) = &*packet else {
+            panic!("expected bus enumeration")
+        };
+        let mut reader = packet.reader();
+        let header: storvsp_protocol::Packet = reader.read_plain().unwrap();
+        assert_eq!(header.operation, storvsp_protocol::Operation::ENUMERATE_BUS);
+        assert_eq!(header.flags, 0);
+        assert_eq!(header.status, storvsp_protocol::NtStatus::SUCCESS);
+        let mut payload = vec![0xff; reader.len()];
+        reader.read(&mut payload).unwrap();
+        assert_eq!(payload, [0; 52]);
+    }
+    assert!(controller.remove(paths[1]).is_err());
+    assert_report_luns(
+        &fixture,
+        &mut guest,
+        paths[0],
+        &[0, 0, 0, 8, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0],
+    )
+    .await;
+    let (header, response) = guest.scsi(&block_request(paths[1], false), 512).await;
+    assert_eq!(
+        header.status,
+        storvsp_protocol::NtStatus::DEVICE_DOES_NOT_EXIST
+    );
+    assert_eq!(response.srb_status.status(), SrbStatus::INVALID_LUN);
+    assert_eq!(response.scsi_status, ScsiStatus::CHECK_CONDITION);
+    assert_eq!(response.data_transfer_length, 0);
+    assert!(!response.srb_status.autosense_valid());
+    assert_eq!(response.payload, [0; 20]);
+    for index in [0, 2, 3] {
+        fixture.bus.memory.write_at(32768, &[0xa5; 544]).unwrap();
+        let (header, response) = guest.scsi(&block_request(paths[index], false), 512).await;
+        assert_eq!(header.status, storvsp_protocol::NtStatus::SUCCESS);
+        assert_eq!(response.as_bytes(), successful_completion(512).as_bytes());
+        let mut data = [0; 544];
+        fixture.bus.memory.read_at(32768, &mut data).unwrap();
+        assert_eq!(&data[..512], &[0x31 + index as u8; 512]);
+        assert_eq!(&data[512..], &[0xa5; 32]);
+    }
     drop(guest);
     fixture.finish().await;
 }
