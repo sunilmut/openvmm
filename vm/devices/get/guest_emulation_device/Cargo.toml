@@ -6,6 +6,9 @@ name = "guest_emulation_device"
 edition.workspace = true
 rust-version.workspace = true
 
+[package.metadata.xtask.unused-deps]
+ignored = ["crypto"]
+
 [features]
 test_utilities = ["dep:disklayer_ram", "dep:pal_async", "dep:parking_lot"]
 
