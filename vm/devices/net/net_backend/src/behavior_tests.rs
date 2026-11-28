@@ -9,6 +9,7 @@ use net_backend_resources::null::NullHandle;
 use pal_async::DefaultDriver;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::Waker;
+use test_with_tracing::test;
 use vm_resource::ResolveResource;
 
 fn pool() -> Bufs {
@@ -209,12 +210,14 @@ async fn loopback_guest_memory_failure_preserves_receive_credit(driver: DefaultD
 fn receive_packet_segments_write_exact_payload_and_metadata() {
     let mut pool = pool();
     pool.set_capacity(RxId(2), 32);
-    for segments in [
-        &[][..],
-        &[&b"single"[..]][..],
-        &[&b"head"[..], &b""[..], &b"tail"[..]][..],
+    for (segments, expected) in [
+        (&[][..], &b""[..]),
+        (&[&b"single"[..]][..], &b"single"[..]),
+        (
+            &[&b"head"[..], &b""[..], &b"tail"[..]][..],
+            &b"headtail"[..],
+        ),
     ] {
-        let expected = segments.concat();
         let mut addresses = Vec::new();
         pool.push_guest_addresses(RxId(2), &mut addresses);
         pool.guest_memory()
@@ -225,12 +228,12 @@ fn receive_packet_segments_write_exact_payload_and_metadata() {
             ..Default::default()
         };
         pool.write_packet_segments(RxId(2), &metadata, segments);
-        received(&pool, RxId(2), &expected);
-        let mut sentinel = [0];
+        received(&pool, RxId(2), expected);
+        let mut sentinel = vec![0; 32 - expected.len()];
         pool.guest_memory()
             .read_at(addresses[0].gpa + expected.len() as u64, &mut sentinel)
             .unwrap();
-        assert_eq!(sentinel, [0xa5]);
+        assert_eq!(sentinel, vec![0xa5; 32 - expected.len()]);
     }
 }
 
@@ -444,4 +447,156 @@ async fn loopback_backpressure_preserves_the_unaccepted_packet(driver: DefaultDr
     received(&pool, done[1], b"next");
     assert_eq!(queue.rx_poll(&mut pool, &mut done).unwrap(), 0);
     assert!(queue.poll_ready(&mut context(), &mut pool).is_pending());
+}
+
+// Test: Read a scattered packet whose second segment initially has no memory.
+// Expected: Failure leaves the packet cursor intact; repairing the address reads
+//       the entire packet, advances exactly one packet, and preserves its suffix.
+#[test]
+fn linearize_failed_tail_preserves_packet_and_retry_suffix() {
+    let pool = pool();
+    pool.guest_memory().write_at(0x20000, b"head").unwrap();
+    pool.guest_memory().write_at(0x21000, b"tail").unwrap();
+    pool.guest_memory().write_at(0x22000, b"next").unwrap();
+    let mut segments = [
+        TxSegment {
+            gpa: 0x20000,
+            len: 4,
+            ty: TxSegmentType::Head(TxMetadata {
+                segment_count: 2,
+                len: 8,
+                ..Default::default()
+            }),
+        },
+        TxSegment {
+            gpa: 0x100000,
+            len: 4,
+            ty: TxSegmentType::Tail,
+        },
+        packet(0x22000, 4),
+    ];
+    let mut remaining = &segments[..];
+    assert!(linearize(&pool, &mut remaining).is_err());
+    assert!(std::ptr::eq(remaining, &segments[..]));
+    segments[1].gpa = 0x21000;
+    let mut remaining = &segments[..];
+    assert_eq!(linearize(&pool, &mut remaining).unwrap(), b"headtail");
+    assert!(std::ptr::eq(remaining, &segments[2..]));
+    assert_eq!(linearize(&pool, &mut remaining).unwrap(), b"next");
+    assert!(remaining.is_empty());
+}
+
+// Test: Cancel pending action waits before a link event and after disconnect's
+//       restart acknowledgement, then reconnect a different backend.
+// Expected: Cancellation does not lose events or lock out later waits;
+//       disconnect returns the original live backend only after acknowledgement,
+//       and the replacement advertises its own capabilities.
+#[test]
+fn cancelled_action_waits_preserve_events_and_disconnect_ownership() {
+    futures::executor::block_on(async {
+        let (mut endpoint, mut control) = DisconnectableEndpoint::new();
+        let (backend, events, stops) = scripted(true);
+        control.connect(Box::new(backend)).unwrap();
+        assert_eq!(
+            endpoint.wait_for_endpoint_action().await,
+            EndpointAction::RestartRequired
+        );
+        endpoint.set_data_path_to_guest_vf(true).await.unwrap();
+        {
+            let mut action = std::pin::pin!(endpoint.wait_for_endpoint_action());
+            assert!(futures::poll!(action.as_mut()).is_pending());
+        }
+        events.send(EndpointAction::LinkStatusNotify(false));
+        assert_eq!(
+            endpoint.wait_for_endpoint_action().await,
+            EndpointAction::LinkStatusNotify(false)
+        );
+        let mut old = {
+            let mut disconnect = std::pin::pin!(control.disconnect());
+            assert!(futures::poll!(disconnect.as_mut()).is_pending());
+            assert_eq!(
+                endpoint.wait_for_endpoint_action().await,
+                EndpointAction::RestartRequired
+            );
+            assert!(futures::poll!(disconnect.as_mut()).is_pending());
+            {
+                let mut action = std::pin::pin!(endpoint.wait_for_endpoint_action());
+                assert!(futures::poll!(action.as_mut()).is_pending());
+            }
+            disconnect.await.unwrap().unwrap()
+        };
+        assert_eq!(old.endpoint_type(), "scripted");
+        assert!(old.get_data_path_to_guest_vf().await.unwrap());
+        old.stop().await;
+        assert_eq!(stops.load(Ordering::SeqCst), 1);
+        assert_eq!(endpoint.endpoint_type(), "null");
+        assert!(endpoint.set_data_path_to_guest_vf(true).await.is_err());
+        control.connect(Box::new(LoopbackEndpoint::new())).unwrap();
+        assert_eq!(
+            endpoint.wait_for_endpoint_action().await,
+            EndpointAction::RestartRequired
+        );
+        assert_eq!(endpoint.endpoint_type(), "loopback");
+        assert!(endpoint.is_ordered());
+        assert!(!endpoint.tx_fast_completions());
+        assert_eq!(endpoint.link_speed(), 10_000_000_000);
+        assert_eq!(endpoint.multiqueue_support().indirection_table_size, 64);
+        let mut action = std::pin::pin!(endpoint.wait_for_endpoint_action());
+        assert!(futures::poll!(action.as_mut()).is_pending());
+    });
+}
+
+// Test: Recreate loopback queues after dropping outstanding RX credit and a
+//       completed packet, then send a fresh packet with fresh receive credit.
+// Expected: Old completions and credits are not restored into the new queue;
+//       only the new buffer receives data, and old guest payload stays intact.
+#[pal_async::async_test]
+async fn loopback_recreated_queue_requires_fresh_receive_credit(driver: DefaultDriver) {
+    let mut endpoint = LoopbackEndpoint::new();
+    let mut queues = Vec::new();
+    endpoint
+        .get_queues(configs(&driver, 1), None, &mut queues)
+        .await
+        .unwrap();
+    let mut pool = pool();
+    pool.guest_memory().write_at(0x20000, b"old!").unwrap();
+    pool.guest_memory().write_at(0x21000, b"new!").unwrap();
+    queues[0].rx_avail(&mut pool, &[RxId(1), RxId(2)]);
+    assert_eq!(
+        queues[0]
+            .tx_avail(&mut pool, &[packet(0x20000, 4)])
+            .unwrap(),
+        (true, 1)
+    );
+    assert!(queues[0].poll_ready(&mut context(), &mut pool).is_ready());
+    drop(queues);
+    endpoint.stop().await;
+    let mut queues = Vec::new();
+    endpoint
+        .get_queues(configs(&driver, 1), None, &mut queues)
+        .await
+        .unwrap();
+    let queue = &mut queues[0];
+    let mut done = [RxId(99); 2];
+    assert!(queue.poll_ready(&mut context(), &mut pool).is_pending());
+    assert_eq!(queue.rx_poll(&mut pool, &mut done).unwrap(), 0);
+    assert_eq!(done.map(|id| id.0), [99, 99]);
+    assert_eq!(
+        queue.tx_avail(&mut pool, &[packet(0x21000, 4)]).unwrap(),
+        (true, 0)
+    );
+    queue.rx_avail(&mut pool, &[RxId(3)]);
+    assert_eq!(
+        queue.tx_avail(&mut pool, &[packet(0x21000, 4)]).unwrap(),
+        (true, 1)
+    );
+    assert_eq!(queue.rx_poll(&mut pool, &mut done).unwrap(), 1);
+    assert_eq!(done.map(|id| id.0), [3, 99]);
+    received(&pool, RxId(3), b"new!");
+    received(&pool, RxId(1), b"old!");
+    assert!(pool.rx_metadata(RxId(2)).is_none());
+    assert_eq!(queue.rx_poll(&mut pool, &mut done).unwrap(), 0);
+    assert!(queue.poll_ready(&mut context(), &mut pool).is_pending());
+    drop(queues);
+    endpoint.stop().await;
 }

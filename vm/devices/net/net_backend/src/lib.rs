@@ -564,6 +564,9 @@ mod disconnectable_endpoint_tests {
         }
     }
 
+    // Test: Attach an unordered backend after advertising ordered completion,
+    //       and separately allow ordered completion after an unordered backend.
+    // Expected: Only the ordering downgrade is rejected with an explicit error.
     #[test]
     fn connect_pins_endpoint_ordering() {
         let (_endpoint, mut control) = DisconnectableEndpoint::new();
