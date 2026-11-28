@@ -5,6 +5,7 @@ extern crate std;
 
 use super::*;
 use std::format;
+use test_with_tracing::test;
 
 // Test: Decode data-abort syndromes and convert them to the ESR register format.
 // Expected: Fault codes, direction and every ISS bit survive conversion without
@@ -49,13 +50,22 @@ fn instruction_abort_conversion_preserves_fault_metadata() {
 
 // Test: Translate trapped system-register operands into instruction encodings.
 // Expected: Register identity is independent of transfer direction and Rt, and
-//       the resulting encoding matches the instruction's architectural fields.
+//       known and unknown encodings retain all architectural operand fields.
 #[test]
 fn trapped_system_registers_reconstruct_instruction_operands() {
     for (op0, op1, crn, crm, op2, expected) in [
         (3, 0, 4, 0, 0, SystemReg::SPSR_EL1),
         (3, 4, 4, 0, 1, SystemReg::ELR_EL2),
         (3, 0, 12, 12, 0, SystemReg::ICC_IAR1_EL1),
+        (0, 0, 0, 0, 0, SystemReg(SystemRegEncoding::from(0u32))),
+        (
+            3,
+            7,
+            15,
+            15,
+            7,
+            SystemReg(SystemRegEncoding::from(0x001f_ffe0u32)),
+        ),
     ] {
         let encoding = SystemRegEncoding::make(op0, op1, crn, crm, op2);
         assert_eq!(SystemReg(encoding), expected);
@@ -68,21 +78,26 @@ fn trapped_system_registers_reconstruct_instruction_operands() {
                 | (u32::from(op2) << 5)
         );
         for direction in [false, true] {
-            let raw = (u32::from(op0) << 20)
-                | (u32::from(op2) << 17)
-                | (u32::from(op1) << 14)
-                | (u32::from(crn) << 10)
-                | (31 << 5)
-                | (u32::from(crm) << 1)
-                | u32::from(direction);
-            assert_eq!(IssSystem::from(raw).system_reg(), expected);
+            for rt in [0, 1, 15, 30, 31] {
+                let raw = (u32::from(op0) << 20)
+                    | (u32::from(op2) << 17)
+                    | (u32::from(op1) << 14)
+                    | (u32::from(crn) << 10)
+                    | (rt << 5)
+                    | (u32::from(crm) << 1)
+                    | u32::from(direction);
+                let syndrome = IssSystem::from(raw);
+                assert_eq!(syndrome.system_reg(), expected);
+                assert_eq!(syndrome.rt(), rt as u8);
+                assert_eq!(syndrome.direction(), direction);
+            }
         }
     }
 }
 
 // Test: Decode translation controls for every supported physical address width.
 // Expected: Width selection accepts only architectural sizes, TTBR address bits
-//       follow TnSZ, and granule fields retain their distinct TTBR encodings.
+//       follow TnSZ, and granule updates preserve neighboring translation policy.
 #[test]
 fn translation_controls_decode_address_widths_and_granules() {
     let widths = [32, 36, 40, 42, 44, 48, 52, 56];
@@ -114,6 +129,24 @@ fn translation_controls_decode_address_widths_and_granules() {
             assert_eq!(
                 changed.into_bits(),
                 size0 | (size1 << 16) | (1 << 14) | (2 << 30) | (5 << 32)
+            );
+            // Preserve walk-disable, cacheability, shareability and tag policy.
+            let neighbors = (1 << 7)
+                | (1 << 8)
+                | (3 << 12)
+                | (1 << 23)
+                | (1 << 24)
+                | (3 << 28)
+                | (1 << 37)
+                | (1 << 38)
+                | (1 << 59);
+            let changed_with_policy = TranslationControlEl1::from(raw | neighbors)
+                .with_tg0(TranslationGranule0::TG_64KB)
+                .with_tg1(TranslationGranule1::TG_4KB)
+                .with_ips(IntermPhysAddrSize::IPA_48_BITS_256_TB);
+            assert_eq!(
+                changed_with_policy.into_bits(),
+                size0 | (size1 << 16) | (1 << 14) | (2 << 30) | (5 << 32) | neighbors
             );
             let mmfr = MmFeatures0El1::from(index as u64);
             assert_eq!(mmfr.pa_range().0, index as u64);
