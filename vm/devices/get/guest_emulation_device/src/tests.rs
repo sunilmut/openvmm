@@ -3,7 +3,7 @@
 
 use super::{GedChannel, GuestConfig, GuestEmulationDevice, GuestFirmwareConfig};
 use disk_backend::Disk;
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use get_protocol as wire;
 use get_resources::ged::{FirmwareEvent, GuestEmulationRequest, GuestServicingFlags, IpmiSelEvent};
 use guestmem::GuestMemory;
@@ -12,6 +12,7 @@ use pal_async::task::{Spawn, Task};
 use pal_async::{DefaultDriver, async_test};
 use power_resources::PowerRequest;
 use task_control::StopTask;
+use test_with_tracing::test;
 use vmbus_async::async_dgram::{AsyncRecvExt, AsyncSendExt};
 use vmbus_async::pipe::{MessagePipe, connected_message_pipes};
 use vmbus_ring::FlatRingMem;
@@ -196,18 +197,30 @@ async fn basic_requests_use_real_pipe_responses(driver: DefaultDriver) {
 
 // Test: Request platform settings for UEFI and PCAT guests with distinct identities.
 // Expected: The JSON delivered on the wire preserves firmware choices and SMBIOS
-//       overrides, and uses the revision-one response header.
+//       all system identity overrides and secure boot templates, with a complete
+//       revision-one response header.
 #[async_test]
 async fn platform_settings_forward_configuration(driver: DefaultDriver) {
-    for template in [
-        wire::SecureBootTemplateType::SECURE_BOOT_DISABLED,
-        wire::SecureBootTemplateType::MICROSOFT_WINDOWS,
-        wire::SecureBootTemplateType::MICROSOFT_UEFI_CERTIFICATE_AUTHORITY,
+    for (template, expected_template) in [
+        (wire::SecureBootTemplateType::SECURE_BOOT_DISABLED, "None"),
+        (
+            wire::SecureBootTemplateType::MICROSOFT_WINDOWS,
+            "MicrosoftWindows",
+        ),
+        (
+            wire::SecureBootTemplateType::MICROSOFT_UEFI_CERTIFICATE_AUTHORITY,
+            "MicrosoftUEFICertificateAuthority",
+        ),
     ] {
         let mut cfg = config();
         cfg.secure_boot_template = template;
         cfg.smbios.system.manufacturer = Some("maker".into());
         cfg.smbios.system.serial_number = Some("serial".into());
+        cfg.smbios.system.product_name = Some("product".into());
+        cfg.smbios.system.version = Some("version".into());
+        cfg.smbios.system.sku_number = Some("sku".into());
+        cfg.smbios.system.family = Some("family".into());
+        cfg.smbios.system.uuid = guid::guid!("00112233-4455-6677-8899-aabbccddeeff");
         let mut h = Harness::new(&driver, cfg, None);
         h.connect().await;
         h.pipe
@@ -222,12 +235,25 @@ async fn platform_settings_forward_configuration(driver: DefaultDriver) {
             wire::HostRequests::DEVICE_PLATFORM_SETTINGS_V2_REV1
         );
         assert_eq!(header.size as usize, json.len());
+        assert_eq!(header.payload_state, wire::LargePayloadState::END);
         let settings: wire::dps_json::DevicePlatformSettingsV2Json =
             serde_json::from_slice(json).unwrap();
         assert!(settings.v1.com1.enable_port);
         assert!(!settings.v1.com2.enable_port);
         assert_eq!(settings.v1.serial_number, "serial");
         assert_eq!(settings.v2.r#static.smbios.system_manufacturer, "maker");
+        assert_eq!(settings.v2.r#static.smbios.system_product_name, "product");
+        assert_eq!(settings.v2.r#static.smbios.system_version, "version");
+        assert_eq!(settings.v2.r#static.smbios.system_sku_number, "sku");
+        assert_eq!(settings.v2.r#static.smbios.system_family, "family");
+        assert_eq!(
+            settings.v1.bios_guid,
+            guid::guid!("00112233-4455-6677-8899-aabbccddeeff")
+        );
+        assert_eq!(
+            serde_json::to_value(settings.v1.secure_boot_template_id).unwrap(),
+            expected_template
+        );
         assert!(settings.v2.r#static.vpci_boot_enabled);
         assert!(settings.v2.r#static.force_dma_bounce_enabled);
         assert_eq!(settings.v2.r#static.vtl2_settings, Some(vec![1, 2, 3]));
@@ -260,7 +286,8 @@ async fn platform_settings_forward_configuration(driver: DefaultDriver) {
 
 // Test: Read, write and flush VMGS, including absent disks and invalid disk offsets.
 // Expected: Successful data roundtrips exactly; unavailable or out-of-range I/O
-//       returns DEVICE_ERROR without terminating the channel.
+//       returns DEVICE_ERROR without terminating the channel or changing adjacent
+//       sectors; a subsequent valid read retains the previously written data.
 #[async_test]
 async fn vmgs_roundtrip_and_device_errors(driver: DefaultDriver) {
     for present in [false, true] {
@@ -270,6 +297,10 @@ async fn vmgs_roundtrip_and_device_errors(driver: DefaultDriver) {
         let info: wire::VmgsGetDeviceInfoResponse = h
             .request(wire::VmgsGetDeviceInfoRequest::new().as_bytes())
             .await;
+        assert_eq!(
+            info.message_header.message_id(),
+            wire::HostRequests::VMGS_GET_DEVICE_INFO
+        );
         assert_eq!(
             info.status,
             if present {
@@ -305,6 +336,20 @@ async fn vmgs_roundtrip_and_device_errors(driver: DefaultDriver) {
             );
             let response: wire::VmgsWriteResponse = h.request(&write).await;
             assert_eq!(response.status, wire::VmgsIoStatus::DEVICE_ERROR);
+            h.pipe
+                .send(wire::VmgsReadRequest::new(wire::VmgsReadFlags::NONE, 0, 3).as_bytes())
+                .await
+                .unwrap();
+            let bytes = h.receive().await;
+            let (response, data) = wire::VmgsReadResponse::read_from_prefix(&bytes).unwrap();
+            assert_eq!(
+                response.message_header.message_id(),
+                wire::HostRequests::VMGS_READ
+            );
+            assert_eq!(response.status, wire::VmgsIoStatus::SUCCESS);
+            let mut expected = vec![0; 1536];
+            expected[512..1024].fill(0x5a);
+            assert_eq!(data, expected);
         }
     }
 }
@@ -401,7 +446,16 @@ async fn settings_modifications_complete_and_reject_overlap(driver: DefaultDrive
         GuestEmulationRequest::ModifyVtl2Settings,
         b"settings".to_vec(),
     );
-    h.pipe.recv(&mut [0; wire::MAX_MESSAGE_SIZE]).await.unwrap();
+    let bytes = h.receive().await;
+    let (header, payload) =
+        wire::ModifyVtl2SettingsRev1Notification::read_from_prefix(&bytes).unwrap();
+    assert_eq!(
+        header.message_header.message_id(),
+        wire::GuestNotifications::MODIFY_VTL2_SETTINGS_REV1
+    );
+    assert_eq!(header.size, 8);
+    assert_eq!(header.payload_state, wire::LargePayloadState::END);
+    assert_eq!(payload, b"settings");
     let duplicate = h
         .requests
         .call(GuestEmulationRequest::ModifyVtl2Settings, vec![])
@@ -442,6 +496,7 @@ async fn settings_modifications_complete_and_reject_overlap(driver: DefaultDrive
     let (header, payload) =
         wire::ModifyVtl2SettingsRev1Notification::read_from_prefix(&bytes).unwrap();
     assert_eq!(header.size, 6);
+    assert_eq!(header.payload_state, wire::LargePayloadState::END);
     assert_eq!(payload, b"second");
     let mut response = wire::ModifyVtl2SettingsCompleteNotification::new(
         wire::ModifyVtl2SettingsStatus::FAILURE,
@@ -500,7 +555,7 @@ async fn vtl0_start_waiters_observe_success_and_failure(driver: DefaultDriver) {
 
 // Test: Save VTL2 state in multiple chunks and restore it over the guest protocol.
 // Expected: Overlapping saves fail, capability flags survive, and restore emits
-//       the original bytes with MORE_DATA followed by SUCCESS.
+//       the original bytes with MORE_DATA followed by SUCCESS and exact chunk sizes.
 #[async_test]
 async fn save_restore_streams_bytes_and_rejects_overlapping_saves(driver: DefaultDriver) {
     let mut h = Harness::new(&driver, config(), None);
@@ -553,21 +608,32 @@ async fn save_restore_streams_bytes_and_rejects_overlapping_saves(driver: Defaul
     save.await.unwrap().unwrap();
     h.pipe
         .send(
-            wire::RestoreGuestVtl2StateRequest::new(wire::GuestVtl2SaveRestoreStatus::SUCCESS)
+            wire::RestoreGuestVtl2StateRequest::new(wire::GuestVtl2SaveRestoreStatus::REQUEST_DATA)
                 .as_bytes(),
         )
         .await
         .unwrap();
     let mut restored = Vec::new();
-    for expected in [
-        wire::GuestVtl2SaveRestoreStatus::MORE_DATA,
-        wire::GuestVtl2SaveRestoreStatus::SUCCESS,
+    for (expected, expected_data) in [
+        (
+            wire::GuestVtl2SaveRestoreStatus::MORE_DATA,
+            &bytes[..wire::MAX_PAYLOAD_SIZE],
+        ),
+        (
+            wire::GuestVtl2SaveRestoreStatus::SUCCESS,
+            &bytes[wire::MAX_PAYLOAD_SIZE..],
+        ),
     ] {
         let packet = h.receive().await;
         let (header, data) =
             wire::RestoreGuestVtl2StateResponse::read_from_prefix(&packet).unwrap();
         assert_eq!({ header.restore_status }, expected);
+        assert_eq!(
+            header.message_header.message_id(),
+            wire::HostRequests::RESTORE_GUEST_VTL2_STATE
+        );
         assert_eq!(header.data_length as usize, data.len());
+        assert_eq!(data, expected_data);
         restored.extend_from_slice(data);
     }
     assert_eq!(restored, bytes);
@@ -839,13 +905,10 @@ async fn malformed_inputs_fail_without_acknowledgement(driver: DefaultDriver) {
         let mut h = Harness::new(&driver, config(), None);
         h.connect().await;
         h.pipe.send(&bytes).await.unwrap();
-        let mut timer = pal_async::timer::PolledTimer::new(&driver);
-        futures::select! {
-            result = h._task.fuse() => assert!(result.is_err()),
-            _ = timer.sleep(std::time::Duration::from_secs(2)).fuse() => {
-                panic!("malformed packet was not rejected: {bytes:?}");
-            }
-        }
+        assert!(
+            h._task.await.is_err(),
+            "malformed packet accepted: {bytes:?}"
+        );
         assert!(futures::poll!(h.pipe.recv(&mut [0; 16])).is_pending());
     }
 }
@@ -962,7 +1025,7 @@ async fn failed_chunked_save_does_not_contaminate_the_next_save(driver: DefaultD
     retry.await.unwrap().unwrap();
     h.pipe
         .send(
-            wire::RestoreGuestVtl2StateRequest::new(wire::GuestVtl2SaveRestoreStatus::SUCCESS)
+            wire::RestoreGuestVtl2StateRequest::new(wire::GuestVtl2SaveRestoreStatus::REQUEST_DATA)
                 .as_bytes(),
         )
         .await
@@ -976,4 +1039,197 @@ async fn failed_chunked_save_does_not_contaminate_the_next_save(driver: DefaultD
     assert_eq!(header.data_length as usize, b"fresh-state".len());
     assert_eq!(bytes, b"fresh-state");
     h.barrier().await;
+}
+
+// Test: Run settings modification and state save together, completing them in
+//       both orders and reusing the channel with opposite keepalive capabilities.
+// Expected: Each completion resolves only its own RPC; full notifications and
+//       restored payloads retain the requested flags and bytes without leftovers.
+#[async_test]
+async fn settings_and_save_completions_remain_independent(driver: DefaultDriver) {
+    let mut h = Harness::new(&driver, config(), None);
+    h.connect().await;
+    for nvme in [true, false] {
+        let settings = if nvme {
+            &b"first-settings"[..]
+        } else {
+            &b"second-settings"[..]
+        };
+        let state = if nvme {
+            &b"first-state"[..]
+        } else {
+            &b"second-state"[..]
+        };
+        let mut modify = Box::pin(
+            h.requests
+                .call(GuestEmulationRequest::ModifyVtl2Settings, settings.to_vec()),
+        );
+        let bytes = h.receive().await;
+        let (header, payload) =
+            wire::ModifyVtl2SettingsRev1Notification::read_from_prefix(&bytes).unwrap();
+        assert_eq!(
+            header.message_header.message_id(),
+            wire::GuestNotifications::MODIFY_VTL2_SETTINGS_REV1
+        );
+        assert_eq!(header.payload_state, wire::LargePayloadState::END);
+        assert_eq!(header.size as usize, settings.len());
+        assert_eq!(payload, settings);
+        let mut save = Box::pin(h.requests.call(
+            GuestEmulationRequest::SaveGuestVtl2State,
+            GuestServicingFlags {
+                nvme_keepalive: nvme,
+                mana_keepalive: !nvme,
+            },
+        ));
+        let notification: wire::SaveGuestVtl2StateNotification = h.response().await;
+        assert_eq!(
+            notification.message_header.message_id(),
+            wire::GuestNotifications::SAVE_GUEST_VTL2_STATE
+        );
+        assert_eq!({ notification.correlation_id }, guid::Guid::ZERO);
+        assert_eq!({ notification.timeout_hint_secs }, 60);
+        let expected_flags = if nvme {
+            [1, 0, 0, 0, 0, 0, 0, 0]
+        } else {
+            [2, 0, 0, 0, 0, 0, 0, 0]
+        };
+        let flags = notification.capabilities_flags;
+        assert_eq!(flags.as_bytes(), expected_flags);
+        assert!(futures::poll!(&mut modify).is_pending());
+        assert!(futures::poll!(&mut save).is_pending());
+        if nvme {
+            h.pipe
+                .send(
+                    wire::ModifyVtl2SettingsCompleteNotification::new(
+                        wire::ModifyVtl2SettingsStatus::SUCCESS,
+                        0,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            (&mut modify).await.unwrap().unwrap();
+            assert!(futures::poll!(&mut save).is_pending());
+        }
+        let mut packet =
+            wire::SaveGuestVtl2StateRequest::new(wire::GuestVtl2SaveRestoreStatus::SUCCESS)
+                .as_bytes()
+                .to_vec();
+        packet.extend_from_slice(state);
+        h.pipe.send(&packet).await.unwrap();
+        let response: wire::SaveGuestVtl2StateResponse = h.response().await;
+        assert_eq!(
+            response.message_header.message_id(),
+            wire::HostRequests::SAVE_GUEST_VTL2_STATE
+        );
+        assert_eq!(
+            response.save_status,
+            wire::GuestVtl2SaveRestoreStatus::SUCCESS
+        );
+        save.await.unwrap().unwrap();
+        if !nvme {
+            assert!(futures::poll!(&mut modify).is_pending());
+            h.pipe
+                .send(
+                    wire::ModifyVtl2SettingsCompleteNotification::new(
+                        wire::ModifyVtl2SettingsStatus::SUCCESS,
+                        0,
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            modify.await.unwrap().unwrap();
+        }
+        h.pipe
+            .send(
+                wire::RestoreGuestVtl2StateRequest::new(
+                    wire::GuestVtl2SaveRestoreStatus::REQUEST_DATA,
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let packet = h.receive().await;
+        let (header, payload) =
+            wire::RestoreGuestVtl2StateResponse::read_from_prefix(&packet).unwrap();
+        assert_eq!(
+            header.message_header.message_id(),
+            wire::HostRequests::RESTORE_GUEST_VTL2_STATE
+        );
+        assert_eq!(
+            { header.restore_status },
+            wire::GuestVtl2SaveRestoreStatus::SUCCESS
+        );
+        assert_eq!(header.data_length as usize, state.len());
+        assert_eq!(payload, state);
+        h.barrier().await;
+        assert!(futures::poll!(h.pipe.recv(&mut [0; wire::MAX_MESSAGE_SIZE])).is_pending());
+    }
+}
+
+// Test: Reject an invalid settings completion while settings and save RPCs are
+//       pending on one device, leaving a separate device connected.
+// Expected: The rejected channel closes both RPC replies without an acknowledgement;
+//       the other device still services requests and forwards its own power event.
+#[async_test]
+async fn invalid_completion_closes_only_its_device_requests(driver: DefaultDriver) {
+    let mut h = Harness::new(&driver, config(), None);
+    let mut peer = Harness::new(&driver, config(), None);
+    h.connect().await;
+    peer.connect().await;
+    let mut modify = Box::pin(h.requests.call(
+        GuestEmulationRequest::ModifyVtl2Settings,
+        b"pending-settings".to_vec(),
+    ));
+    let packet = h.receive().await;
+    let (header, payload) =
+        wire::ModifyVtl2SettingsRev1Notification::read_from_prefix(&packet).unwrap();
+    assert_eq!(
+        header.message_header.message_id(),
+        wire::GuestNotifications::MODIFY_VTL2_SETTINGS_REV1
+    );
+    assert_eq!(header.size, 16);
+    assert_eq!(header.payload_state, wire::LargePayloadState::END);
+    assert_eq!(payload, b"pending-settings");
+    let mut save = Box::pin(h.requests.call(
+        GuestEmulationRequest::SaveGuestVtl2State,
+        GuestServicingFlags::default(),
+    ));
+    let _: wire::SaveGuestVtl2StateNotification = h.response().await;
+    assert!(futures::poll!(&mut modify).is_pending());
+    assert!(futures::poll!(&mut save).is_pending());
+    h.pipe
+        .send(
+            wire::ModifyVtl2SettingsCompleteNotification::new(
+                wire::ModifyVtl2SettingsStatus(0xffff),
+                0,
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        h._task.await,
+        Err(super::Error::InvalidFieldValue)
+    ));
+    assert!(modify.await.is_err());
+    assert!(save.await.is_err());
+    assert!(futures::poll!(h.pipe.recv(&mut [0; wire::MAX_MESSAGE_SIZE])).is_pending());
+    let response: wire::LoadFirmwareResponse = peer
+        .request(wire::LoadFirmwareRequest::new(7).as_bytes())
+        .await;
+    assert_eq!(
+        response.message_header.message_id(),
+        wire::HostRequests::LOAD_FIRMWARE
+    );
+    assert_eq!(response.status, wire::LoadFirmwareStatus::SUCCESS);
+    assert_eq!(response.entry_point_image_offset, 0);
+    peer.pipe
+        .send(wire::ResetNotification::new().as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(peer.power.next().await, Some(PowerRequest::Reset));
+    peer.barrier().await;
+    assert!(futures::poll!(peer.power.next()).is_pending());
 }
