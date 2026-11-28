@@ -9427,6 +9427,7 @@ dependencies = [
  "pal_async",
  "socket2",
  "tempfile",
+ "test_with_tracing",
  "thiserror 2.0.16",
  "tracing",
 ]

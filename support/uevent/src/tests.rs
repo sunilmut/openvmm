@@ -7,6 +7,7 @@ use pal_async::task::Spawn;
 use std::os::unix::net::UnixDatagram;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use test_with_tracing::test;
 
 fn fixture(driver: &DefaultDriver) -> (UeventListener, UnixDatagram) {
     let (receive, peer) = UnixDatagram::pair().unwrap();
@@ -303,24 +304,59 @@ async fn invalid_utf8_terminates_delivery_without_partial_notification(driver: D
     listener._task.await;
 }
 
-// Test: Drop all listener request senders without sending a device event.
-// Expected: The worker stops when its request channel closes.
+// Test: Drop the listener owner with and without a surviving callback handle.
+// Expected: An idle worker stops; a retained handle keeps delivery alive until
+//       its removal closes the callback stream and allows the worker to stop.
 #[pal_async::async_test]
 async fn listener_worker_stops_when_its_owner_is_dropped(driver: DefaultDriver) {
     let (listener, _peer) = fixture(&driver);
     let UeventListener { _task, send } = listener;
     drop(send);
     _task.await;
+
+    let (listener, peer) = fixture(&driver);
+    let (send, mut receive) = mesh::channel();
+    let handle = listener
+        .add_custom_callback(move |Notification::Event(event)| {
+            send.send(event.header().to_owned());
+        })
+        .await;
+    let UeventListener { _task, send } = listener;
+    drop(send);
+    emit(&peer, b"change@/devices/retained\0");
+    assert_eq!(receive.next().await.unwrap(), "change@/devices/retained");
+    drop(handle);
+    assert!(receive.next().await.is_none());
+    _task.await;
 }
 
 // Test: Construct the public listener on its real read-only netlink source.
-// Expected: Callback registration and removal succeed without injecting kernel
-//       events or changing any host device.
+// Expected: Removing one callback releases its captured sender but preserves
+//       its peer's resources, without injecting events or changing devices.
 #[pal_async::async_test]
 async fn real_listener_registers_and_removes_callbacks(driver: DefaultDriver) {
     let listener = UeventListener::new(&driver).unwrap();
-    drop(listener.add_custom_callback(|_| {}).await);
+    // Unsent oneshots report when the callbacks release their captured resources.
+    let (send, receive) = mesh::oneshot::<()>();
+    let handle = listener
+        .add_custom_callback(move |_| {
+            let _ = &send;
+        })
+        .await;
+    let (peer_send, peer_receive) = mesh::oneshot::<()>();
+    let peer_handle = listener
+        .add_custom_callback(move |_| {
+            let _ = &peer_send;
+        })
+        .await;
+    drop(handle);
     barrier(&listener).await;
+    assert!(receive.await.is_err());
+    let mut peer_receive = std::pin::pin!(peer_receive);
+    assert!(futures::poll!(peer_receive.as_mut()).is_pending());
+    drop(peer_handle);
+    barrier(&listener).await;
+    assert!(peer_receive.await.is_err());
 }
 
 // Test: Lose the listener to an invalid datagram while waiting for a sysfs child.
@@ -417,4 +453,84 @@ async fn resize_subscriptions_stay_independent_during_removal(driver: DefaultDri
         counts.each_ref().map(|count| count.load(Ordering::SeqCst)),
         [2, 4]
     );
+}
+
+// Test: Deliver differently sized datagrams containing device properties.
+// Expected: Each callback receives its own complete header and field values;
+//       Unicode, empty values and embedded equals signs survive decoding.
+#[pal_async::async_test]
+async fn datagram_payloads_do_not_leak_into_following_events(driver: DefaultDriver) {
+    let (listener, peer) = fixture(&driver);
+    let (send, mut receive) = mesh::channel();
+    let _handle = listener
+        .add_custom_callback(move |Notification::Event(event)| {
+            send.send((
+                event.header().to_owned(),
+                ["ACTION", "DEVPATH", "DRIVER", "SEQNUM", "VALUE"]
+                    .map(|key| event.get(key).map(str::to_owned)),
+            ));
+        })
+        .await;
+    for (bytes, header, fields) in [
+        (
+            "add@/devices/example\0VALUE=left=右\0SEQNUM=18446744073709551615\0DRIVER=\0DEVPATH=/devices/example\0ACTION=add\0",
+            "add@/devices/example",
+            [
+                Some("add"),
+                Some("/devices/example"),
+                Some(""),
+                Some("18446744073709551615"),
+                Some("left=右"),
+            ],
+        ),
+        (
+            "remove@/devices/example\0ACTION=remove\0DEVPATH=/devices/example",
+            "remove@/devices/example",
+            [Some("remove"), Some("/devices/example"), None, None, None],
+        ),
+        ("rescan\0RESCAN=true\0", "rescan", [None; 5]),
+    ] {
+        emit(&peer, bytes.as_bytes());
+        assert_eq!(
+            receive.next().await.unwrap(),
+            (
+                header.to_owned(),
+                fields.map(|value| value.map(str::to_owned))
+            )
+        );
+    }
+}
+
+// Test: Cancel one registered devpath waiter while another is still pending.
+// Expected: Cancellation leaves the listener usable, and a later add event
+//       completes the surviving waiter with its own path.
+#[pal_async::async_test]
+async fn cancelled_devpath_waiter_preserves_peer_progress(driver: DefaultDriver) {
+    let (listener, peer) = fixture(&driver);
+    let directory = tempfile::tempdir().unwrap();
+    let cancelled_path = directory.path().join("cancelled");
+    let surviving_path = directory.path().join("surviving");
+    let mut cancelled = Box::pin(listener.wait_for_devpath(&cancelled_path));
+    let mut surviving = Box::pin(listener.wait_for_devpath(&surviving_path));
+    assert!(futures::poll!(cancelled.as_mut()).is_pending());
+    assert!(futures::poll!(surviving.as_mut()).is_pending());
+    barrier(&listener).await;
+    assert!(futures::poll!(cancelled.as_mut()).is_pending());
+    assert!(futures::poll!(surviving.as_mut()).is_pending());
+    drop(cancelled);
+    barrier(&listener).await;
+    let (send, mut receive) = mesh::channel();
+    let _observer = listener
+        .add_custom_callback(move |Notification::Event(event)| {
+            send.send(event.header().to_owned());
+        })
+        .await;
+    std::fs::write(&cancelled_path, []).unwrap();
+    emit(&peer, b"add@/devices/cancelled\0ACTION=add\0");
+    assert_eq!(receive.next().await.unwrap(), "add@/devices/cancelled");
+    assert!(futures::poll!(surviving.as_mut()).is_pending());
+    std::fs::write(&surviving_path, []).unwrap();
+    emit(&peer, b"add@/devices/surviving\0ACTION=add\0");
+    surviving.await.unwrap();
+    assert_eq!(receive.next().await.unwrap(), "add@/devices/surviving");
 }
