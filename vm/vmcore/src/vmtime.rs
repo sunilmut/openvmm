@@ -974,9 +974,13 @@ mod tests {
     use pal_async::async_test;
     use pal_async::timer::PolledTimer;
     use std::future::poll_fn;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
     use std::time::Duration;
     use test_with_tracing::test;
 
+    // Test: Convert 100-nanosecond guest units, including the largest u64 value.
+    // Expected: Conversion preserves the full duration without multiplication overflow.
     #[test]
     fn test_duration_from_100ns() {
         for n in [0, 1, 9_999_999, 10_000_000, u64::MAX] {
@@ -985,6 +989,17 @@ mod tests {
         }
     }
 
+    struct TimeoutWake(mesh::Sender<()>);
+
+    impl Wake for TimeoutWake {
+        fn wake(self: Arc<Self>) {
+            self.0.send(());
+        }
+    }
+
+    // Test: Shorten an already registered timeout on a running guest clock.
+    // Expected: The waiter wakes for the new deadline without being repolled,
+    //       expiry reports later guest time and consumes the timeout.
     #[async_test]
     async fn test_vmtime(driver: DefaultDriver) {
         let mut keeper = VmTimeKeeper::new(&driver, VmTime::from_100ns(0));
@@ -996,50 +1011,38 @@ mod tests {
             .access("test");
         keeper.start().await;
 
-        // Test long timeout.
+        let (wake, mut wakes) = mesh::channel();
+        let waker = Waker::from(Arc::new(TimeoutWake(wake)));
         access.set_timeout(access.now().wrapping_add(Duration::from_secs(1000)));
+        assert_eq!(
+            access.poll_timeout(&mut Context::from_waker(&waker)),
+            Poll::Pending
+        );
+
+        let deadline = access.now().wrapping_add(Duration::from_millis(20));
+        access.set_timeout(deadline);
         let mut timer = PolledTimer::new(&driver);
         futures::select! {
-            _ = timer.sleep(Duration::from_millis(50)).fuse() => {}
-            _ = poll_fn(|cx| access.poll_timeout(cx)).fuse() => panic!("unexpected wait completion"),
+            _ = timer.sleep(Duration::from_secs(30)).fuse() => panic!("shortened timeout did not wake"),
+            wake = wakes.recv().fuse() => wake.unwrap(),
         }
-
-        // Test short timeout.
-        let deadline = access.now().wrapping_add(Duration::from_millis(10));
-        access.set_timeout(deadline);
-        futures::select! {
-            _ = timer.sleep(Duration::from_millis(1000)).fuse() => panic!("unexpected timeout"),
-            now = poll_fn(|cx| access.poll_timeout(cx)).fuse() => {
-                assert!(now.is_after(deadline));
-            }
-        }
-        // Timeout should be cleared by the successful poll.
+        let Poll::Ready(now) = access.poll_timeout(&mut Context::from_waker(&waker)) else {
+            panic!("deadline wake did not expire the shortened timeout");
+        };
+        assert!(now.is_after(deadline));
+        assert_eq!(access.get_timeout(), None);
         assert!(
             poll_fn(|cx| access.poll_timeout(cx))
                 .now_or_never()
                 .is_none()
         );
 
-        // Test changing timeout.
-        let now = access.now();
-        let deadline = now.wrapping_add(Duration::from_millis(2000));
-        access.set_timeout(deadline);
-        futures::select! {
-            _ = timer.sleep(Duration::from_millis(30)).fuse() => {
-                let deadline = now.wrapping_add(Duration::from_millis(50));
-                access.set_timeout(deadline);
-                futures::select! {
-                    _ = timer.sleep(Duration::from_millis(1000)).fuse() => panic!("unexpected timeout"),
-                    now = poll_fn(|cx| access.poll_timeout(cx)).fuse() => {
-                        assert!(now.is_after(deadline));
-                    }
-                }
-            }
-            _ = poll_fn(|cx| access.poll_timeout(cx)).fuse() => panic!("unexpected wait completion"),
-        }
         keeper.stop().await;
     }
 
+    // Test: Build a second time source while the shared guest clock is running.
+    // Expected: Time does not regress between sources; stopping synchronizes
+    //       them and resetting returns both to zero.
     #[async_test]
     async fn test_multi_vmtime(driver: DefaultDriver) {
         let mut keeper = VmTimeKeeper::new(&driver, VmTime::from_100ns(0));

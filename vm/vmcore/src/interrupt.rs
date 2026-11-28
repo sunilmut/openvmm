@@ -290,15 +290,24 @@ mod tests {
     use pal_event::Event;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use test_with_tracing::test;
 
+    // Test: Deliver through an event-backed interrupt and its exposed event.
+    // Expected: Both handles observe the same signal, consumed once per delivery.
     #[test]
     fn test_interrupt_event() {
         let event = Event::new();
         let interrupt = Interrupt::from_event(event.clone());
         interrupt.deliver();
         assert!(event.try_wait());
+        assert!(!event.try_wait());
+        interrupt.deliver();
+        assert!(interrupt.event().unwrap().try_wait());
+        assert!(!event.try_wait());
     }
 
+    // Test: Deliver twice through a callback-backed interrupt.
+    // Expected: The callback runs twice and no direct event is exposed.
     #[test]
     fn test_interrupt_fn() {
         let count = Arc::new(AtomicUsize::new(0));
@@ -306,49 +315,42 @@ mod tests {
         let interrupt = Interrupt::from_fn(move || {
             count2.fetch_add(1, Ordering::SeqCst);
         });
+        assert!(interrupt.event().is_none());
         interrupt.deliver();
         interrupt.deliver();
         assert_eq!(count.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn test_interrupt_null_does_not_signal() {
-        let interrupt = Interrupt::null();
-        // deliver() should not panic on a null interrupt.
-        interrupt.deliver();
-    }
-
-    #[test]
-    fn test_event_backed_has_event() {
-        let event = Event::new();
-        let interrupt = Interrupt::from_event(event.clone());
-        assert!(interrupt.event().is_some());
-    }
-
-    #[test]
-    fn test_fn_backed_has_no_event() {
-        let interrupt = Interrupt::from_fn(|| {});
         assert!(interrupt.event().is_none());
     }
 
+    // Test: Deliver through a null interrupt with its lazy event allocated.
+    // Expected: Neither the interrupt nor its clone signals that event.
     #[test]
-    fn test_null_has_event() {
+    fn test_interrupt_null_does_not_signal() {
         let interrupt = Interrupt::null();
-        // Null interrupts lazily provide an event for APIs that require one.
-        assert!(interrupt.event().is_some());
+        let event = interrupt.event().unwrap();
+        interrupt.deliver();
+        assert!(!event.try_wait());
+        interrupt.clone().deliver();
+        assert!(!event.try_wait());
     }
 
+    // Test: Request a null interrupt's event repeatedly and through a clone.
+    // Expected: Each request shares one signal identity, not separate events.
     #[test]
     fn test_null_event_is_stable() {
         let interrupt = Interrupt::null();
-        let e1 = std::ptr::from_ref::<Event>(interrupt.event().unwrap());
-        let e2 = std::ptr::from_ref::<Event>(interrupt.event().unwrap());
-        assert_eq!(
-            e1, e2,
-            "event() should return the same event on repeated calls"
-        );
+        let cloned = interrupt.clone();
+        let first = interrupt.event().unwrap();
+        first.signal();
+        assert!(interrupt.event().unwrap().try_wait());
+        assert!(!first.try_wait());
+        first.signal();
+        assert!(cloned.event().unwrap().try_wait());
+        assert!(!first.try_wait());
     }
 
+    // Test: Deliver through a custom callback-only target.
+    // Expected: The target receives one delivery and cannot expose a direct event.
     #[test]
     fn test_from_target() {
         struct TestTarget {
@@ -368,6 +370,8 @@ mod tests {
         assert!(interrupt.event().is_none());
     }
 
+    // Test: Deliver through a custom target that also exposes its event.
+    // Expected: Delivery and the exposed handle share the original event.
     #[test]
     fn test_from_target_with_event() {
         struct TestTarget(Arc<Event>);
@@ -384,8 +388,13 @@ mod tests {
         assert!(interrupt.event().is_some());
         interrupt.deliver();
         assert!(event.try_wait());
+        interrupt.deliver();
+        assert!(interrupt.event().unwrap().try_wait());
+        assert!(!event.try_wait());
     }
 
+    // Test: Deliver through an interrupt and a clone.
+    // Expected: Both deliveries reach the same callback.
     #[test]
     fn test_clone_shares_state() {
         let count = Arc::new(AtomicUsize::new(0));
@@ -399,57 +408,48 @@ mod tests {
         assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 
+    // Test: Deliver through the default interrupt after obtaining its event.
+    // Expected: It behaves as a null interrupt and leaves the event unsignaled.
     #[test]
     fn test_default_is_null() {
         let interrupt = Interrupt::default();
-        // Should behave like null: deliver doesn't panic, event is available.
+        let event = interrupt.event().unwrap();
         interrupt.deliver();
-        assert!(interrupt.event().is_some());
+        assert!(!event.try_wait());
     }
 
-    #[test]
-    fn test_mesh_round_trip_event_backed() {
-        let event = Event::new();
-        let interrupt = Interrupt::from_event(event);
-        let msg = mesh::payload::SerializedMessage::from_message(interrupt);
-        let decoded: Interrupt = msg.into_message().unwrap();
-        // The decoded interrupt should be event-backed.
-        assert!(decoded.event().is_some());
-        decoded.deliver();
-    }
-
+    // Test: Obtain an OS event for an event-backed interrupt.
+    // Expected: The returned event signals the original without a proxy.
     #[async_test]
     async fn test_event_or_proxy_event_backed(driver: DefaultDriver) {
         let orig_event = Event::new();
         let interrupt = Interrupt::from_event(orig_event.clone());
         let (event, proxy) = interrupt.event_or_proxy(&driver).unwrap();
-        // Event-backed interrupt should return the same event and no proxy.
         assert!(proxy.is_none());
         event.signal();
         assert!(orig_event.try_wait());
+        assert!(!orig_event.try_wait());
     }
 
+    // Test: Signal a callback interrupt through its automatically created proxy.
+    // Expected: Each acknowledged signal delivers once; dropping both owners
+    //       closes the callback channel without an extra delivery.
     #[async_test]
     async fn test_event_or_proxy_fn_backed(driver: DefaultDriver) {
-        let count = Arc::new(AtomicUsize::new(0));
-        let count2 = count.clone();
+        let (delivered, mut deliveries) = mesh::channel();
         let interrupt = Interrupt::from_fn(move || {
-            count2.fetch_add(1, Ordering::SeqCst);
+            delivered.send(());
         });
         let (event, proxy) = interrupt.event_or_proxy(&driver).unwrap();
-        // Fn-backed interrupt requires a proxy.
         assert!(proxy.is_some());
-        // Signal the proxy event and give the async task a moment to deliver.
-        event.signal();
-        // Poll until the proxy task delivers the interrupt.
-        for _ in 0..100 {
-            if count.load(Ordering::SeqCst) > 0 {
-                break;
-            }
-            pal_async::timer::PolledTimer::new(&driver)
-                .sleep(std::time::Duration::from_millis(10))
-                .await;
+        for _ in 0..2 {
+            event.signal();
+            deliveries.recv().await.unwrap();
         }
-        assert_eq!(count.load(Ordering::SeqCst), 1);
+        drop(interrupt);
+        drop(proxy);
+        assert!(deliveries.recv().await.is_err());
+        event.signal();
+        assert!(deliveries.recv().await.is_err());
     }
 }

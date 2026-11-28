@@ -645,9 +645,7 @@ pub mod thread {
 
     #[cfg(test)]
     mod tests {
-        use super::BuildVmTaskDriver;
-        use super::CURRENT_DRIVER;
-        use super::ThreadDriver;
+        use super::super::{VmTaskDriver, VmTaskDriverSource};
         use super::ThreadDriverBackend;
         use futures::task::ArcWake;
         use pal_async::DefaultPool;
@@ -659,8 +657,11 @@ pub mod thread {
         use std::sync::mpsc;
         use std::task::Context;
         use std::task::Poll;
+        use std::time::Duration;
+        use test_with_tracing::test;
 
         const POOL_NAME: &str = "test-vp-pool";
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
         thread_local! {
             static EXIT_SIGNAL: RefCell<Option<SignalOnDrop>> = const { RefCell::new(None) };
@@ -677,71 +678,66 @@ pub mod thread {
 
         /// Builds a driver with its own dedicated pool thread, plus a receiver
         /// that fires when that thread exits.
-        fn dedicated_driver() -> (ThreadDriver, mpsc::Receiver<()>) {
+        fn dedicated_driver() -> (VmTaskDriver, VmTaskDriver, mpsc::Receiver<()>) {
             let default_pool = DefaultPool::new();
-            let backend = ThreadDriverBackend::new(default_pool.driver());
-            let driver = backend.build(POOL_NAME.into(), Some(0), false);
-            assert!(
-                driver.has_dedicated_thread,
-                "a target VP must get its own pool thread, else this test asserts nothing"
-            );
+            let source = VmTaskDriverSource::new(ThreadDriverBackend::new(default_pool.driver()));
+            let driver = source.builder().target_vp(0).build(POOL_NAME);
             // Park a sender in the pool thread's thread-local storage. Thread
             // locals are dropped when the thread exits, which happens only after
             // `run()` has returned and the pool has released its IO backend.
             let (send, exited) = mpsc::channel();
+            let (started, ready) = mpsc::channel();
             driver
-                .inner
                 .spawn("exit-signal", async move {
+                    assert_eq!(std::thread::current().name(), Some(POOL_NAME));
                     EXIT_SIGNAL.with(|slot| *slot.borrow_mut() = Some(SignalOnDrop(send)));
+                    started.send(()).unwrap();
                 })
                 .detach();
-            (driver, exited)
+            ready
+                .recv_timeout(PROBE_TIMEOUT)
+                .expect("dedicated thread did not start");
+            (driver, source.current(), exited)
         }
 
-        /// Blocks until the dedicated pool thread exits. If a regression keeps the
-        /// pool alive, this never returns and the test runner's timeout fails it.
+        /// Requires the dedicated thread to exit within a bounded watchdog.
         fn assert_thread_exits(exited: &mpsc::Receiver<()>) {
             exited
-                .recv()
-                .expect("the exit signal was dropped without being sent");
+                .recv_timeout(PROBE_TIMEOUT)
+                .expect("dedicated thread did not report exit");
         }
 
-        /// What code running on the pool thread sees of `CURRENT_DRIVER`.
-        #[derive(Debug, PartialEq)]
-        struct DriverView {
-            thread: Option<String>,
-            lent: bool,
-            upgraded: bool,
-        }
-
-        /// Takes the same weak upgrade `CurrentThreadDriver::with_driver` makes,
-        /// so a failed upgrade here is exactly the case where `with_driver`
-        /// falls back to the default driver.
-        fn driver_view() -> DriverView {
-            CURRENT_DRIVER.with(|cell| {
-                cell.borrow(|weak| DriverView {
-                    thread: std::thread::current().name().map(String::from),
-                    lent: weak.is_some(),
-                    upgraded: weak.and_then(|w| w.upgrade()).is_some(),
+        /// Observes where work spawned through the public current driver runs.
+        fn report_driver(driver: &VmTaskDriver, views: &mpsc::Sender<Option<String>>) {
+            let views = views.clone();
+            driver
+                .spawn("current-driver-probe", async move {
+                    let _ = views.send(std::thread::current().name().map(String::from));
                 })
-            })
+                .detach();
         }
 
-        /// Reports `driver_view()` when dropped.
-        struct ViewOnDrop(mpsc::Sender<DriverView>);
+        /// Starts a current-driver dispatch probe during destruction.
+        struct ViewOnDrop {
+            driver: VmTaskDriver,
+            views: mpsc::Sender<Option<String>>,
+        }
 
         impl Drop for ViewOnDrop {
             fn drop(&mut self) {
-                let _ = self.0.send(driver_view());
+                report_driver(&self.driver, &self.views);
             }
         }
 
-        /// Reports `driver_view()` when woken.
-        struct ViewOnWake(mpsc::Sender<DriverView>);
+        /// Starts a current-driver dispatch probe during a completion wake.
+        struct ViewOnWake {
+            driver: VmTaskDriver,
+            views: mpsc::Sender<Option<String>>,
+        }
 
         impl ArcWake for ViewOnWake {
             fn wake_by_ref(arc_self: &Arc<Self>) {
-                let _ = arc_self.0.send(driver_view());
+                report_driver(&arc_self.driver, &arc_self.views);
             }
         }
 
@@ -762,34 +758,25 @@ pub mod thread {
             }
         }
 
-        /// Asserts that the view was taken on the dedicated pool thread and
-        /// that the pool's driver was still reachable there.
-        fn assert_dedicated_driver(views: &mpsc::Receiver<DriverView>, path: &str) {
+        /// Requires nested current-driver work to run on the dedicated thread.
+        fn assert_dedicated_driver(views: &mpsc::Receiver<Option<String>>, path: &str) {
             let view = views
-                .recv()
+                .recv_timeout(PROBE_TIMEOUT)
                 .unwrap_or_else(|_| panic!("{path}: the probe was dropped without reporting"));
             assert_eq!(
-                view,
-                DriverView {
-                    thread: Some(POOL_NAME.into()),
-                    lent: true,
-                    upgraded: true,
-                },
+                view.as_deref(),
+                Some(POOL_NAME),
                 "{path}: the pool's driver must stay reachable while the task is \
                  torn down on its thread, else work started there falls back to \
                  the default driver"
             );
         }
 
-        /// Regression test for the guest-reset thread/fd leak, driving the
-        /// production path: `build` with a target VP spawns the dedicated pool
-        /// thread and lends that pool's own driver into `CURRENT_DRIVER` for the
-        /// whole of `run()`. That reference must be weak. While any strong driver
-        /// survives, `IoPool::run` cannot return, so the thread and its IO backend
-        /// fds are never reclaimed and every guest reset leaks another set.
+        // Test: Drop a device's driver after its dedicated thread starts.
+        // Expected: The thread exits instead of remaining alive after a guest reset.
         #[test]
         fn dedicated_pool_thread_exits_when_driver_dropped() {
-            let (driver, exited) = dedicated_driver();
+            let (driver, _current, exited) = dedicated_driver();
 
             // Drop the only strong driver the caller holds, as a device does when
             // the guest resets and its channel closes.
@@ -798,21 +785,23 @@ pub mod thread {
             assert_thread_exits(&exited);
         }
 
-        /// A completed task's future is dropped by `run` after it completes. Its
-        /// destructor runs on the pool thread and must still see the pool's driver,
-        /// even when the task held the last reference to the scheduler.
+        // Test: Spawn current-driver work from a completed future's destructor
+        //       after releasing the device's driver.
+        // Expected: Nested work runs on the dedicated thread, which then exits.
         #[test]
         fn driver_reachable_from_completed_future_destructor() {
-            let (driver, exited) = dedicated_driver();
+            let (driver, current, exited) = dedicated_driver();
             let (view_send, views) = mpsc::channel();
             let (go, go_recv) = mpsc::channel();
             driver
-                .inner
                 .spawn(
                     "probe",
                     CompleteOnSignal {
                         go: go_recv,
-                        _view: ViewOnDrop(view_send),
+                        _view: ViewOnDrop {
+                            driver: current,
+                            views: view_send,
+                        },
                     },
                 )
                 .detach();
@@ -823,14 +812,18 @@ pub mod thread {
             assert_thread_exits(&exited);
         }
 
-        /// Dropping a pending task's handle cancels it, and `run` drops the
-        /// future on the pool thread.
+        // Test: Cancel a pending task whose destructor spawns current-driver work
+        //       after releasing the device's driver.
+        // Expected: Nested work runs on the dedicated thread, which then exits.
         #[test]
         fn driver_reachable_from_cancelled_future_destructor() {
-            let (driver, exited) = dedicated_driver();
+            let (driver, current, exited) = dedicated_driver();
             let (view_send, views) = mpsc::channel();
-            let view = ViewOnDrop(view_send);
-            let task = driver.inner.spawn("probe", async move {
+            let view = ViewOnDrop {
+                driver: current,
+                views: view_send,
+            };
+            let task = driver.spawn("probe", async move {
                 let _view = view;
                 std::future::pending::<()>().await
             });
@@ -841,18 +834,21 @@ pub mod thread {
             assert_thread_exits(&exited);
         }
 
-        /// The output of a detached task is dropped by `run` after the future
-        /// itself is gone.
+        // Test: Spawn current-driver work while destroying a detached task's output
+        //       after releasing the device's driver.
+        // Expected: Nested work runs on the dedicated thread, which then exits.
         #[test]
         fn driver_reachable_from_detached_output_destructor() {
-            let (driver, exited) = dedicated_driver();
+            let (driver, current, exited) = dedicated_driver();
             let (view_send, views) = mpsc::channel();
             let (go, go_recv) = mpsc::channel::<()>();
             driver
-                .inner
                 .spawn("probe", async move {
                     go_recv.recv().unwrap();
-                    ViewOnDrop(view_send)
+                    ViewOnDrop {
+                        driver: current,
+                        views: view_send,
+                    }
                 })
                 .detach();
             drop(driver);
@@ -862,17 +858,21 @@ pub mod thread {
             assert_thread_exits(&exited);
         }
 
-        /// A task awaiting another task's handle is woken by `run` after the
-        /// awaited task's future is gone.
+        // Test: Spawn current-driver work from the completion waker of a task
+        //       after releasing the device's driver.
+        // Expected: Nested work runs on the dedicated thread, which then exits.
         #[test]
         fn driver_reachable_from_completion_wake() {
-            let (driver, exited) = dedicated_driver();
+            let (driver, current, exited) = dedicated_driver();
             let (view_send, views) = mpsc::channel();
             let (go, go_recv) = mpsc::channel::<()>();
-            let mut task = driver.inner.spawn("probe", async move {
+            let mut task = driver.spawn("probe", async move {
                 go_recv.recv().unwrap();
             });
-            let waker = futures::task::waker(Arc::new(ViewOnWake(view_send)));
+            let waker = futures::task::waker(Arc::new(ViewOnWake {
+                driver: current,
+                views: view_send,
+            }));
             assert!(
                 Pin::new(&mut task)
                     .poll(&mut Context::from_waker(&waker))

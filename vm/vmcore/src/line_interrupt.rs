@@ -495,7 +495,10 @@ mod behavior_tests;
 mod tests {
     use super::*;
     use crate::line_interrupt::test_helpers::TestLineInterruptTarget;
+    use test_with_tracing::test;
 
+    // Test: Assert and deassert two independently routed interrupt lines.
+    // Expected: Each transition changes only its own target vector.
     #[test]
     fn basic() {
         let intcon = TestLineInterruptTarget::new_arc();
@@ -505,15 +508,22 @@ mod tests {
 
         line0.set_level(true);
         assert!(intcon.is_high(0));
+        assert!(!intcon.is_high(1));
         line0.set_level(false);
         assert!(!intcon.is_high(0));
+        assert!(!intcon.is_high(1));
 
         line1.set_level(true);
+        assert!(!intcon.is_high(0));
         assert!(intcon.is_high(1));
         line1.set_level(false);
+        assert!(!intcon.is_high(0));
         assert!(!intcon.is_high(1));
     }
 
+    // Test: Attach a second target while a mapped source line is asserted.
+    // Expected: Both targets inherit the level at their offsets and deassert
+    //       together without changing neighboring vectors.
     #[test]
     fn multi_target() {
         let intcon1 = TestLineInterruptTarget::new_arc();
@@ -529,8 +539,17 @@ mod tests {
 
         assert!(intcon1.is_high(8));
         assert!(intcon2.is_high(3));
+        assert!(!intcon1.is_high(7));
+        assert!(!intcon1.is_high(9));
+        assert!(!intcon2.is_high(2));
+        assert!(!intcon2.is_high(4));
+        line.set_level(false);
+        assert!(!intcon1.is_high(8));
+        assert!(!intcon2.is_high(3));
     }
 
+    // Test: Assert and independently deassert two sharers of one source IRQ.
+    // Expected: The target stays high until the last assertion is removed.
     #[test]
     fn shared_line() {
         let intcon = TestLineInterruptTarget::new_arc();
@@ -551,6 +570,8 @@ mod tests {
         assert!(!intcon.is_high(0)); // finally low
     }
 
+    // Test: Drop an asserted sharer after the surviving sharer deasserts.
+    // Expected: Dropping the last assertion lowers the target.
     #[test]
     fn drop_impl() {
         let intcon = TestLineInterruptTarget::new_arc();
@@ -571,6 +592,9 @@ mod tests {
         assert!(!intcon.is_high(0)); // low, because line01 disappeared
     }
 
+    // Test: Repeatedly allocate, assert and drop a sharer beside a live root.
+    // Expected: Reused slots remain independent across wrapping generations,
+    //       and dropping each asserted sharer lowers the target.
     #[test]
     fn share_drop_loop() {
         let intcon = TestLineInterruptTarget::new_arc();

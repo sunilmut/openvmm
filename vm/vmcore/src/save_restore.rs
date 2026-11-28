@@ -360,6 +360,9 @@ mod tests {
         }
     }
 
+    // Test: Save legacy state and restore it through both protobuf adapters.
+    // Expected: Both encodings agree and each fresh destination saves the
+    //       restored value, rather than retaining its initial value.
     #[test]
     fn synchronous_state_is_compatible_with_async_adapter() {
         block_on(async {
@@ -374,11 +377,16 @@ mod tests {
             erased.restore(state).await.unwrap();
             let state = erased.save().await.unwrap();
             assert_eq!(state.parse::<State>().unwrap().value, 42);
-            ProtobufSaveRestore::restore(&mut device, state).unwrap();
-            assert_eq!(device.0, 42);
+            let mut legacy_restored = Device(19);
+            ProtobufSaveRestore::restore(&mut legacy_restored, state).unwrap();
+            let state = ProtobufSaveRestore::save(&mut legacy_restored).unwrap();
+            assert_eq!(state.parse::<State>().unwrap().value, 42);
         });
     }
 
+    // Test: Reject unsupported save, unsupported restore and mismatched state.
+    // Expected: The adapter preserves each error category and failed restores
+    //       leave each fresh destination's publicly saved state unchanged.
     #[test]
     fn async_adapter_preserves_errors() {
         block_on(async {
@@ -396,12 +404,17 @@ mod tests {
                 .await,
                 Err(RestoreError::SavedStateNotSupported)
             ));
+            let state = AsyncProtobufSaveRestore::save(&mut device).await.unwrap();
+            assert_eq!(state.parse::<State>().unwrap().value, 7);
+
+            let mut device = Device(7);
             assert!(matches!(
                 AsyncProtobufSaveRestore::restore(&mut device, SavedStateBlob::new(NoSavedState))
                     .await,
                 Err(RestoreError::ProtobufDecode(_))
             ));
-            assert_eq!(device.0, 7);
+            let state = AsyncProtobufSaveRestore::save(&mut device).await.unwrap();
+            assert_eq!(state.parse::<State>().unwrap().value, 7);
         });
     }
 }

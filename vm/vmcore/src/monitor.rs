@@ -222,61 +222,60 @@ mod behavior_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::offset_of;
+    use test_with_tracing::test;
 
+    // Test: Configure and then disable the monitor page.
+    // Expected: The active GPA and returned previous GPA track each transition.
     #[test]
     fn test_set_gpa() {
         let monitor = MonitorPage::new();
+        assert_eq!(monitor.gpa(), None);
         assert!(monitor.set_gpa(Some(0x123f000)).is_none());
+        assert_eq!(monitor.gpa(), Some(0x123f000));
         assert_eq!(monitor.set_gpa(None), Some(0x123f000));
+        assert_eq!(monitor.gpa(), None);
         assert!(monitor.set_gpa(None).is_none());
     }
 
+    // Test: Write full and partial monitor trigger words using the wire layout.
+    // Expected: Only registered pending bits signal their connection IDs;
+    //       off-page writes and unrelated data do not deliver interrupts.
     #[test]
     fn test_write() {
         let monitor = MonitorPage::new();
         monitor.set_gpa(Some(HV_PAGE_SIZE));
-        let _reg1 = monitor.register_monitor(MonitorId(5), 42);
-        let _reg1 = monitor.register_monitor(MonitorId(7), 47);
-        let _reg1 = monitor.register_monitor(MonitorId(9), 49);
-        let _reg2 = monitor.register_monitor(MonitorId(127), 500);
-        let mut page = HvMonitorPageSmall::new_zeroed();
-        page.trigger_group[0].pending = 1 << 5;
+        let _registrations = [
+            monitor.register_monitor(MonitorId(5), 42),
+            monitor.register_monitor(MonitorId(7), 47),
+            monitor.register_monitor(MonitorId(9), 49),
+            monitor.register_monitor(MonitorId(127), 500),
+        ];
+        // Pending words start at byte 8, with an 8-byte stride per group.
+        let mut page = [0u8; 40];
+        page[8..12].copy_from_slice(&(1u32 << 5).to_le_bytes());
 
         // Write outside of monitor page.
-        assert!(
-            !monitor.check_write(HV_PAGE_SIZE * 2, page.as_bytes(), |_| panic!(
-                "Should not be called."
-            ))
-        );
+        assert!(!monitor.check_write(HV_PAGE_SIZE * 2, &page, |_| panic!("Should not be called.")));
 
-        assert!(
-            !monitor.check_write(HV_PAGE_SIZE - 1, page.as_bytes(), |_| panic!(
-                "Should not be called."
-            ))
-        );
+        assert!(!monitor.check_write(HV_PAGE_SIZE - 1, &page, |_| panic!("Should not be called.")));
 
         // Write to monitor page.
         let mut triggered = Vec::new();
-        assert!(monitor.check_write(HV_PAGE_SIZE, page.as_bytes(), |id| triggered.push(id)));
+        assert!(monitor.check_write(HV_PAGE_SIZE, &page, |id| triggered.push(id)));
         assert_eq!(triggered, vec![42]);
 
         // Write multiple IDs, no call for unknown ID, other data ignored.
-        page.trigger_state.set_group_enable(2);
-        page.trigger_group[0].pending = (1 << 5) | (1 << 6) | (1 << 7);
-        page.trigger_group[3].pending = 1 << 31;
+        page[..4].copy_from_slice(&2u32.to_le_bytes());
+        page[8..12].copy_from_slice(&((1u32 << 5) | (1 << 6) | (1 << 7)).to_le_bytes());
+        page[32..36].copy_from_slice(&(1u32 << 31).to_le_bytes());
         triggered.clear();
-        assert!(monitor.check_write(HV_PAGE_SIZE, page.as_bytes(), |id| triggered.push(id)));
+        assert!(monitor.check_write(HV_PAGE_SIZE, &page, |id| triggered.push(id)));
         assert_eq!(triggered, vec![42, 47, 500]);
 
         // Partial write
-        let pending = 1 << 9;
+        let pending = (1u32 << 9).to_le_bytes();
         triggered.clear();
-        assert!(monitor.check_write(
-            HV_PAGE_SIZE + offset_of!(HvMonitorPageSmall, trigger_group) as u64,
-            pending.as_bytes(),
-            |id| triggered.push(id),
-        ));
+        assert!(monitor.check_write(HV_PAGE_SIZE + 8, &pending, |id| triggered.push(id),));
 
         assert_eq!(triggered, vec![49]);
     }
