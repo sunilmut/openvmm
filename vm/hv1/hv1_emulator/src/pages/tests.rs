@@ -34,18 +34,15 @@ fn overlay_remap_and_unmap_preserve_guest_written_bytes() {
     protection.memory.read_at(4 * 4096, &mut actual).unwrap();
     assert_eq!(actual, initial);
     assert_eq!(
-        protection
-            .requested
-            .iter()
-            .map(|request| request.0)
-            .collect::<Vec<_>>(),
-        [2, 3, 4]
+        protection.requested,
+        [2, 3, 4].map(|gpn| {
+            (
+                gpn,
+                HvMapGpaFlags::new().with_readable(true).with_writable(true),
+                None,
+            )
+        })
     );
-    for (_, checked, changed) in &protection.requested {
-        assert!(checked.readable());
-        assert!(checked.writable());
-        assert!(changed.is_none());
-    }
     assert_eq!(protection.unlocked, [2, 3]);
     overlay.reset(&mut protection);
     assert_eq!(overlay.save_page(), [0; 4096]);

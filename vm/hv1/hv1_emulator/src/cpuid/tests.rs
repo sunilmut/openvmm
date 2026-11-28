@@ -140,11 +140,15 @@ fn isolation_hiding_filters_only_hypervisor_extensions_and_isolation_privilege()
             0,
             &[0; 4],
         );
-        let expected = make_hv_cpuid_leaves(
-            if hide { SUPPORTED_FEATURES } else { features },
-            HvEnlightenmentInformation::new(),
-            4,
+        let expected = if hide { SUPPORTED_FEATURES } else { features }.into_bits();
+        assert_eq!(
+            actual,
+            [
+                expected as u32,
+                (expected >> 32) as u32,
+                (expected >> 64) as u32,
+                (expected >> 96) as u32,
+            ]
         );
-        assert_eq!(actual, registers(expected[0].1));
     }
 }

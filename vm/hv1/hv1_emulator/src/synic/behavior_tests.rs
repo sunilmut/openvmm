@@ -5,7 +5,6 @@ use super::*;
 use crate::test_support::RecordingProtection;
 use hvdef::HvSynicSint;
 use test_with_tracing::test;
-use zerocopy::FromBytes;
 
 // Test: Post intercepts without a prior readiness scan, fill the slot, then acknowledge it in guest memory.
 // Expected: The dedicated intercept slot carries exact bytes, full slots reject overwrites, guest acknowledgment permits another delivery, and polling suppresses local interrupts.
@@ -215,17 +214,9 @@ fn message_slot_backpressure_and_guest_acknowledgment_preserve_payloads() {
         .memory
         .read_at(0x3000 + 2 * HV_MESSAGE_SIZE as u64, &mut bytes)
         .unwrap();
-    assert!(
-        HvMessageHeader::read_from_prefix(&bytes)
-            .unwrap()
-            .0
-            .flags
-            .message_pending()
-    );
-    assert_eq!(
-        &bytes[size_of::<HvMessageHeader>()..],
-        &message.as_bytes()[size_of::<HvMessageHeader>()..]
-    );
+    let mut pending = message;
+    pending.header.flags.set_message_pending(true);
+    assert_eq!(bytes.as_slice(), pending.as_bytes());
     protection
         .memory
         .write_at(0x3000 + 2 * HV_MESSAGE_SIZE as u64, &[0; HV_MESSAGE_SIZE])
@@ -378,15 +369,15 @@ fn message_timer_delivers_architectural_expiration_payload() {
         .memory
         .read_at(0x3000 + 2 * HV_MESSAGE_SIZE as u64, &mut bytes)
         .unwrap();
-    let header = HvMessageHeader::read_from_prefix(&bytes).unwrap().0;
-    assert_eq!(header.typ, HvMessageType::HvMessageTypeTimerExpired);
-    let payload = TimerMessagePayload::read_from_prefix(&bytes[size_of::<HvMessageHeader>()..])
-        .unwrap()
-        .0;
-    assert_eq!(payload.timer_index, 1);
-    assert_eq!(payload.reserved, 0);
-    assert_eq!(payload.expiration_time, 1000);
-    assert_eq!(payload.delivery_time, 1007);
+    let payload = [
+        1u32.to_le_bytes().as_slice(),
+        0u32.to_le_bytes().as_slice(),
+        1000u64.to_le_bytes().as_slice(),
+        1007u64.to_le_bytes().as_slice(),
+    ]
+    .concat();
+    let expected = HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 0, &payload);
+    assert_eq!(bytes.as_slice(), expected.as_bytes());
     assert_eq!(interrupts, [(0x65, false)]);
     assert!(!HvSynicStimerConfig::from(processor.stimer_config(1)).enabled());
 }

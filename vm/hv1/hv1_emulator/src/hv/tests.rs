@@ -117,24 +117,28 @@ fn hypercall_pages_publish_vendor_stubs_permissions_offsets_and_locking() {
         assert_eq!(protection.requested.len(), 1);
         let mut bytes = [0; 4096];
         protection.memory.read_at(0x2000, &mut bytes).unwrap();
-        for offset in [0, 11, 23, 34, 46] {
-            assert_eq!(bytes[offset..offset + 3], instruction);
-        }
-        for offset in [3, 14, 26, 37, 49] {
-            assert_eq!(bytes[offset], 0xc3);
-        }
-        assert_eq!(&bytes[4..11], &[0x89, 0xc1, 0xb8, 0x11, 0, 0, 0]);
-        assert_eq!(&bytes[15..23], &[0x48, 0x89, 0xc8, 0xb9, 0x11, 0, 0, 0]);
-        assert!(bytes[50..].iter().all(|byte| *byte == 0xcc));
+        let [hc0, hc1, hc2] = instruction;
+        // Normal entry, 32/64-bit VTL calls, then 32/64-bit VTL returns.
+        let code = [
+            hc0, hc1, hc2, 0xc3, 0x89, 0xc1, 0xb8, 0x11, 0, 0, 0, hc0, hc1, hc2, 0xc3, 0x48, 0x89,
+            0xc8, 0xb9, 0x11, 0, 0, 0, hc0, hc1, hc2, 0xc3, 0x89, 0xc1, 0xb8, 0x12, 0, 0, 0, hc0,
+            hc1, hc2, 0xc3, 0x48, 0x89, 0xc8, 0xb9, 0x12, 0, 0, 0, hc0, hc1, hc2, 0xc3,
+        ];
+        let mut expected = [0xcc; 4096];
+        expected[..code.len()].copy_from_slice(&code);
+        assert_eq!(bytes, expected);
         assert_eq!(processor.vsm_code_page_offsets(false).call_offset(), 4);
         assert_eq!(processor.vsm_code_page_offsets(false).return_offset(), 27);
         assert_eq!(processor.vsm_code_page_offsets(true).call_offset(), 15);
         assert_eq!(processor.vsm_code_page_offsets(true).return_offset(), 38);
-        let (_, checked, changed) = protection.requested[0];
-        assert!(checked.readable() && checked.writable());
-        let changed = changed.unwrap();
-        assert!(changed.readable() && !changed.writable());
-        assert!(changed.user_executable() && changed.kernel_executable());
+        let checked = HvMapGpaFlags::new().with_readable(true).with_writable(true);
+        let changed = Some(
+            HvMapGpaFlags::new()
+                .with_readable(true)
+                .with_user_executable(true)
+                .with_kernel_executable(true),
+        );
+        assert_eq!(protection.requested, [(2, checked, changed)]);
         assert!(matches!(
             processor.msr_write(hvdef::HV_X64_MSR_HYPERCALL, 0x2005, &mut protection),
             Err(MsrError::InvalidAccess)
@@ -142,6 +146,12 @@ fn hypercall_pages_publish_vendor_stubs_permissions_offsets_and_locking() {
         processor
             .msr_write(hvdef::HV_X64_MSR_HYPERCALL, 0x3003, &mut protection)
             .unwrap();
+        protection.memory.read_at(0x3000, &mut bytes).unwrap();
+        assert_eq!(bytes, expected);
+        assert_eq!(
+            protection.requested,
+            [(2, checked, changed), (3, checked, changed)]
+        );
         assert_eq!(protection.unlocked, [2]);
         assert!(matches!(
             processor.msr_write(hvdef::HV_X64_MSR_HYPERCALL, 0, &mut protection),
@@ -161,8 +171,11 @@ fn hypercall_pages_publish_vendor_stubs_permissions_offsets_and_locking() {
     }
 }
 
-// Test: Publish a reference-TSC page for a 20-MHz clock, repeat its register, move it, and disable it, with/without TSC backing.
-// Expected: Backed time scales by exactly one half with advancing nonzero sequence; unbacked time advertises an invalid sequence; mappings are read-only and nonexecutable.
+// Test: Publish reference-TSC pages over stale guest data, repeat and move
+//       their mappings, and disable them with and without TSC backing.
+// Expected: Backed pages have complete wire data for a half-scale clock;
+//       unbacked pages advertise an invalid sequence despite stale data.
+//       Mappings are read-only/nonexecutable and survive failed replacements.
 #[test]
 fn reference_tsc_page_sequence_scale_and_permissions_match_clock_backing() {
     for backed in [false, true] {
@@ -171,38 +184,39 @@ fn reference_tsc_page_sequence_scale_and_permissions_match_clock_backing() {
         let mut protection = RecordingProtection::new();
         for (gpn, sequence) in [(2, 1u32), (3, 2)] {
             let register = (gpn << 12) | 1;
-            processor
-                .msr_write(hvdef::HV_X64_MSR_REFERENCE_TSC, register, &mut protection)
+            protection
+                .memory
+                .write_at(gpn << 12, &[0xa5; 4096])
                 .unwrap();
             processor
                 .msr_write(hvdef::HV_X64_MSR_REFERENCE_TSC, register, &mut protection)
                 .unwrap();
-            let mut bytes = [0; 24];
+            processor
+                .msr_write(hvdef::HV_X64_MSR_REFERENCE_TSC, register, &mut protection)
+                .unwrap();
+            let mut bytes = [0; 4096];
             protection.memory.read_at(gpn << 12, &mut bytes).unwrap();
-            assert_eq!(
-                u32::from_le_bytes(bytes[..4].try_into().unwrap()),
-                if backed {
-                    sequence
-                } else {
-                    HV_REFERENCE_TSC_SEQUENCE_INVALID
-                }
-            );
-            assert_eq!(
-                u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-                if backed { 1 << 63 } else { 0 }
-            );
-            assert_eq!(u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 0);
+            if backed {
+                let mut expected = [0; 4096];
+                expected[..4].copy_from_slice(&sequence.to_le_bytes());
+                expected[8..16].copy_from_slice(&(1u64 << 63).to_le_bytes());
+                assert_eq!(bytes, expected);
+            } else {
+                assert_eq!(u32::from_le_bytes(bytes[..4].try_into().unwrap()), 0);
+            }
             assert_eq!(
                 processor.msr_read(hvdef::HV_X64_MSR_REFERENCE_TSC).unwrap(),
                 register
             );
         }
-        assert_eq!(protection.requested.len(), 2);
-        for (_, _, changed) in &protection.requested {
-            let changed = changed.unwrap();
-            assert!(changed.readable() && !changed.writable());
-            assert!(!changed.user_executable() && !changed.kernel_executable());
-        }
+        assert_eq!(
+            protection.requested,
+            [2, 3].map(|gpn| (
+                gpn,
+                HvMapGpaFlags::new().with_readable(true).with_writable(true),
+                Some(HvMapGpaFlags::new().with_readable(true)),
+            ))
+        );
         assert!(matches!(
             processor.msr_write(hvdef::HV_X64_MSR_REFERENCE_TSC, 0x3003, &mut protection),
             Err(MsrError::InvalidAccess)
@@ -215,6 +229,7 @@ fn reference_tsc_page_sequence_scale_and_permissions_match_clock_backing() {
             processor.msr_read(hvdef::HV_X64_MSR_REFERENCE_TSC).unwrap(),
             0x3001
         );
+        assert_eq!(protection.unlocked, [2]);
         processor
             .msr_write(hvdef::HV_X64_MSR_REFERENCE_TSC, 0, &mut protection)
             .unwrap();

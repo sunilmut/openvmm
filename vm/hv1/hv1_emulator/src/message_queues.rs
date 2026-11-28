@@ -146,6 +146,7 @@ mod tests {
     use hvdef::HvMessage;
     use hvdef::HvMessageType;
     use test_with_tracing::test;
+    use zerocopy::IntoBytes;
 
     // Test: Clear several nonempty SINT queues, then enqueue a fresh message.
     // Expected: Pending bits and all stale payloads disappear; fresh enqueue transitions to pending and delivers only the new payload.
@@ -168,15 +169,12 @@ mod tests {
         let mut delivered = Vec::new();
         assert_eq!(
             queues.post_pending_messages(u16::MAX, |sint, message| {
-                delivered.push((sint, zerocopy::IntoBytes::as_bytes(message).to_vec()));
+                delivered.push((sint, message.as_bytes().to_vec()));
                 Ok(())
             }),
             0
         );
-        assert_eq!(
-            delivered,
-            [(7, zerocopy::IntoBytes::as_bytes(&fresh).to_vec())]
-        );
+        assert_eq!(delivered, [(7, fresh.as_bytes().to_vec())]);
     }
 
     // Test: Fail one queued delivery terminally, succeed the next, and leave an unrelated busy SINT for retry.
@@ -193,7 +191,7 @@ mod tests {
         assert_eq!(
             queues.post_pending_messages(1 << 2, |sint, message| {
                 assert_eq!(sint, 2);
-                attempted.push(zerocopy::IntoBytes::as_bytes(message).to_vec());
+                attempted.push(message.as_bytes().to_vec());
                 if attempted.len() == 1 {
                     Err(HvError::InvalidSynicState)
                 } else {
@@ -204,18 +202,12 @@ mod tests {
         );
         assert_eq!(
             attempted,
-            [
-                zerocopy::IntoBytes::as_bytes(&first).to_vec(),
-                zerocopy::IntoBytes::as_bytes(&second).to_vec()
-            ]
+            [first.as_bytes().to_vec(), second.as_bytes().to_vec()]
         );
         assert_eq!(
             queues.post_pending_messages(1 << 5, |sint, message| {
                 assert_eq!(sint, 5);
-                assert_eq!(
-                    zerocopy::IntoBytes::as_bytes(message),
-                    zerocopy::IntoBytes::as_bytes(&first)
-                );
+                assert_eq!(message.as_bytes(), first.as_bytes());
                 Err(HvError::ObjectInUse)
             }),
             1 << 5
@@ -224,10 +216,7 @@ mod tests {
         assert_eq!(
             queues.post_pending_messages(1 << 5, |sint, message| {
                 assert_eq!(sint, 5);
-                assert_eq!(
-                    zerocopy::IntoBytes::as_bytes(message),
-                    zerocopy::IntoBytes::as_bytes(&first)
-                );
+                assert_eq!(message.as_bytes(), first.as_bytes());
                 delivered += 1;
                 Ok(())
             }),
@@ -236,48 +225,111 @@ mod tests {
         assert_eq!(delivered, 1);
     }
 
+    // Test: Drain selected SINT queues while one slot becomes busy.
+    // Expected: FIFO bytes are exact; busy and unselected messages survive
+    //       for a later successful drain.
     #[test]
     fn test_message_queues() {
         let queues = MessageQueues::new();
-
-        let message = HvMessage::new(HvMessageType(0), 0, &[]);
-
-        queues.enqueue_message(0, &message);
-        queues.enqueue_message(2, &message);
-        queues.enqueue_message(4, &message);
-        queues.enqueue_message(4, &message);
+        let messages = [
+            HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 1, b"unselected"),
+            HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 2, b"selected"),
+            HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 3, b"first"),
+            HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 4, b"second"),
+        ];
+        for (sint, message) in [0, 2, 4, 4].into_iter().zip(&messages) {
+            queues.enqueue_message(sint, message);
+        }
         assert_eq!(queues.pending_sints(), 0b10101);
 
         let mut sints = 0;
-        queues.post_pending_messages(!1, |sint, _message| {
-            if sints & (1 << sint) == 0 {
-                sints |= 1 << sint;
-                Ok(())
-            } else {
-                Err(HvError::ObjectInUse)
-            }
-        });
-
+        let mut attempted = Vec::new();
+        assert_eq!(
+            queues.post_pending_messages(!1, |sint, message| {
+                attempted.push((sint, message.as_bytes().to_vec()));
+                if sints & (1 << sint) == 0 {
+                    sints |= 1 << sint;
+                    Ok(())
+                } else {
+                    Err(HvError::ObjectInUse)
+                }
+            }),
+            0b10001
+        );
+        assert_eq!(
+            attempted,
+            [
+                (2, messages[1].as_bytes().to_vec()),
+                (4, messages[2].as_bytes().to_vec()),
+                (4, messages[3].as_bytes().to_vec()),
+            ]
+        );
         assert_eq!(queues.pending_sints(), 0b10001);
         assert_eq!(sints, 0b10100);
+        let mut delivered = Vec::new();
+        assert_eq!(
+            queues.post_pending_messages(u16::MAX, |sint, message| {
+                delivered.push((sint, message.as_bytes().to_vec()));
+                Ok(())
+            }),
+            0
+        );
+        assert_eq!(
+            delivered,
+            [
+                (0, messages[0].as_bytes().to_vec()),
+                (4, messages[3].as_bytes().to_vec()),
+            ]
+        );
+        assert_eq!(queues.pending_sints(), 0);
     }
 
-    /// Restoring a non-empty saved queue must repopulate `pending_sints` so
-    /// that consumers can detect there are messages to flush. `restore`
-    /// populates the queues directly rather than via `enqueue_message`, so the
-    /// `pending` bitmap is the only signal a consumer has that the restored
-    /// queue is non-empty and needs flushing.
+    // Test: Restore distinct saved messages over stale queues, then drain
+    //       one SINT before the others.
+    // Expected: Pending bits are rebuilt, stale messages disappear, and
+    //       complete saved messages are delivered in their original order.
     #[test]
     fn restore_repopulates_pending_sints() {
         let queues = MessageQueues::new();
-        let message = HvMessage::new(HvMessageType(0), 0, &[]);
-        queues.enqueue_message(2, &message);
-        queues.enqueue_message(5, &message);
+        let first = HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 1, b"first");
+        let second = HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 2, b"second");
+        let peer = HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 3, b"peer");
+        queues.enqueue_message(2, &first);
+        queues.enqueue_message(2, &second);
+        queues.enqueue_message(5, &peer);
         let saved = queues.save();
 
         let restored = MessageQueues::new();
-        assert_eq!(restored.pending_sints(), 0);
+        let stale = HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 4, b"stale");
+        restored.enqueue_message(2, &stale);
+        restored.enqueue_message(9, &stale);
         restored.restore(&saved);
         assert_eq!(restored.pending_sints(), 0b100100);
+        let mut delivered = Vec::new();
+        assert_eq!(
+            restored.post_pending_messages(1 << 2, |sint, message| {
+                delivered.push((sint, message.as_bytes().to_vec()));
+                Ok(())
+            }),
+            1 << 5
+        );
+        assert_eq!(
+            delivered,
+            [
+                (2, first.as_bytes().to_vec()),
+                (2, second.as_bytes().to_vec()),
+            ]
+        );
+        assert_eq!(restored.pending_sints(), 1 << 5);
+        delivered.clear();
+        assert_eq!(
+            restored.post_pending_messages(u16::MAX, |sint, message| {
+                delivered.push((sint, message.as_bytes().to_vec()));
+                Ok(())
+            }),
+            0
+        );
+        assert_eq!(delivered, [(5, peer.as_bytes().to_vec())]);
+        assert_eq!(restored.pending_sints(), 0);
     }
 }

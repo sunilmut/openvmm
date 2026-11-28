@@ -5,7 +5,6 @@ use super::*;
 use crate::test_support::RecordingProtection;
 use hvdef::HvSynicSint;
 use test_with_tracing::test;
-use zerocopy::FromBytes;
 
 // Test: Acknowledge one of two occupied SINT slots by clearing only its message type.
 // Expected: Stale pending flags/payload do not block reuse or release the other slot.
@@ -25,9 +24,10 @@ fn type_only_acknowledgment_releases_only_the_acknowledged_sint() {
     assert_eq!(processor.scan(0, &mut interrupt), (mask, None));
     let first = HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 17, &[0x5a; 24]);
     let second = HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 29, &[0xa5; 8]);
-    for sint in [2, 5] {
+    let peer = HvMessage::new(HvMessageType::HvMessageTypeTimerExpired, 41, b"peer");
+    for (sint, message) in [(2, &first), (5, &peer)] {
         processor
-            .post_message(sint, &first, &mut interrupt)
+            .post_message(sint, message, &mut interrupt)
             .unwrap();
     }
     processor.request_sint_readiness(mask);
@@ -36,18 +36,17 @@ fn type_only_acknowledgment_releases_only_the_acknowledged_sint() {
     let other_address = 0x3000 + 5 * HV_MESSAGE_SIZE as u64;
     let mut occupied = [0; HV_MESSAGE_SIZE];
     protection.memory.read_at(address, &mut occupied).unwrap();
-    assert!(
-        HvMessageHeader::read_from_prefix(&occupied)
-            .unwrap()
-            .0
-            .flags
-            .message_pending()
-    );
+    let mut pending = first;
+    pending.header.flags.set_message_pending(true);
+    assert_eq!(occupied.as_slice(), pending.as_bytes());
     let mut other = [0; HV_MESSAGE_SIZE];
     protection
         .memory
         .read_at(other_address, &mut other)
         .unwrap();
+    let mut pending_peer = peer;
+    pending_peer.header.flags.set_message_pending(true);
+    assert_eq!(other.as_slice(), pending_peer.as_bytes());
     protection
         .memory
         .write_at(address, &0u32.to_le_bytes())

@@ -765,55 +765,110 @@ mod reference_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
 
+    // Test: Reprogram a periodic timer with an explicit original reference
+    //       time and poll just before and at its deadline.
+    // Expected: The first poll does not rebase the deadline; expiration
+    //       delivers the configured interrupt and schedules the next period.
     #[test]
     fn restored_periodic_timer_preserves_program_time() {
-        let mut timer = Timer {
-            config: HvSynicStimerConfig::new()
+        let global = GlobalSynic::new(1);
+        let mut processor = global.add_vp(VpIndex::new(0));
+        processor.set_stimer_config(
+            0,
+            HvSynicStimerConfig::new()
                 .with_periodic(true)
-                .with_auto_enable(true),
-            ..Default::default()
-        };
-
-        timer.set_count_at(100, 1000);
-
-        assert!(timer.config.enabled());
-        assert_eq!(timer.due_time, Some(1100));
-        assert!(!timer.reevaluate);
-    }
-
-    #[test]
-    fn restored_oneshot_timer_preserves_absolute_deadline() {
-        let mut timer = Timer {
-            config: HvSynicStimerConfig::new().with_auto_enable(true),
-            ..Default::default()
-        };
-
-        timer.set_count_at(2000, 1000);
-
-        assert!(timer.config.enabled());
-        assert_eq!(timer.due_time, Some(2000));
-        assert!(!timer.reevaluate);
-    }
-
-    #[test]
-    fn restored_expired_timer_is_evaluated() {
-        let mut timer = Timer {
-            config: HvSynicStimerConfig::new()
                 .with_auto_enable(true)
                 .with_direct_mode(true)
-                .with_apic_vector(0x40),
-            ..Default::default()
-        };
-        let mut sints = SintState::default();
-        let mut requested = None;
-        let mut interrupt = |vector, auto_eoi| requested = Some((vector, auto_eoi));
+                .with_apic_vector(0x40)
+                .into(),
+        );
+        processor.set_stimer_count_at(0, 100, 1000);
+        let mut requested = Vec::new();
+        assert_eq!(
+            processor.scan(1099, &mut |vector, auto_eoi| requested
+                .push((vector, auto_eoi))),
+            (0, Some(1100))
+        );
+        assert!(requested.is_empty());
+        assert_eq!(
+            processor.scan(1100, &mut |vector, auto_eoi| requested
+                .push((vector, auto_eoi))),
+            (0, Some(1200))
+        );
+        assert_eq!(requested, [(0x40, false)]);
+        assert!(HvSynicStimerConfig::from(processor.stimer_config(0)).enabled());
+    }
 
-        timer.set_count_at(1000, 900);
-        timer.evaluate(0, &mut sints, 1001, &mut interrupt);
+    // Test: Reprogram a one-shot timer with an absolute deadline and an
+    //       earlier reference time, then scan before and after expiration.
+    // Expected: The deadline remains absolute; only its expiration delivers
+    //       an interrupt, and the timer disables itself.
+    #[test]
+    fn restored_oneshot_timer_preserves_absolute_deadline() {
+        let global = GlobalSynic::new(1);
+        let mut processor = global.add_vp(VpIndex::new(0));
+        processor.set_stimer_config(
+            0,
+            HvSynicStimerConfig::new()
+                .with_auto_enable(true)
+                .with_direct_mode(true)
+                .with_apic_vector(0x40)
+                .into(),
+        );
+        processor.set_stimer_count_at(0, 2000, 1000);
+        let mut requested = Vec::new();
+        assert_eq!(
+            processor.scan(1999, &mut |vector, auto_eoi| requested
+                .push((vector, auto_eoi))),
+            (0, Some(2000))
+        );
+        assert!(requested.is_empty());
+        assert_eq!(
+            processor.scan(2000, &mut |vector, auto_eoi| requested
+                .push((vector, auto_eoi))),
+            (0, None)
+        );
+        assert_eq!(requested, [(0x40, false)]);
+        assert_eq!(
+            processor.scan(2100, &mut |vector, auto_eoi| requested
+                .push((vector, auto_eoi))),
+            (0, None)
+        );
+        assert_eq!(requested, [(0x40, false)]);
+        assert!(!HvSynicStimerConfig::from(processor.stimer_config(0)).enabled());
+    }
 
-        assert_eq!(requested, Some((0x40, false)));
-        assert!(!timer.config.enabled());
-        assert_eq!(timer.due_time, None);
+    // Test: Reprogram an already-expired one-shot timer and scan twice.
+    // Expected: The first scan delivers its vector without a new deadline;
+    //       subsequent scans do not redeliver the disabled timer.
+    #[test]
+    fn restored_expired_timer_is_evaluated() {
+        let global = GlobalSynic::new(1);
+        let mut processor = global.add_vp(VpIndex::new(0));
+        processor.set_stimer_config(
+            0,
+            HvSynicStimerConfig::new()
+                .with_auto_enable(true)
+                .with_direct_mode(true)
+                .with_apic_vector(0x40)
+                .into(),
+        );
+        processor.set_stimer_count_at(0, 1000, 900);
+        let mut requested = Vec::new();
+        assert_eq!(
+            processor.scan(1001, &mut |vector, auto_eoi| requested
+                .push((vector, auto_eoi))),
+            (0, None)
+        );
+        assert_eq!(requested, [(0x40, false)]);
+        assert_eq!(
+            processor.scan(2000, &mut |vector, auto_eoi| requested
+                .push((vector, auto_eoi))),
+            (0, None)
+        );
+        assert_eq!(requested, [(0x40, false)]);
+        assert!(!HvSynicStimerConfig::from(processor.stimer_config(0)).enabled());
     }
 }
