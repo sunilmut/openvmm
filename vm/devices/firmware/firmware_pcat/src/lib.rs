@@ -1171,7 +1171,6 @@ mod save_restore {
             Ok(())
         }
     }
-
 }
 
 #[cfg(test)]
