@@ -31,6 +31,7 @@ use tdisp_proto::TdispReportType;
 use tdisp_proto::TdispTdiState;
 use tdisp_proto::guest_to_host_command::Command;
 use tdisp_proto::guest_to_host_response::Response;
+use test_with_tracing::test;
 
 // ── Dispatch helpers ──────────────────────────────────────────────────────────
 
@@ -41,8 +42,9 @@ fn dispatch(
     cmd: GuestToHostCommand,
 ) -> tdisp_proto::GuestToHostResponse {
     let bytes = serialize_command(&cmd);
-    let cmd = deserialize_command(&bytes).unwrap();
-    emulator.tdisp_handle_guest_command(cmd).unwrap()
+    let decoded = deserialize_command(&bytes).unwrap();
+    assert_eq!(decoded, cmd);
+    emulator.tdisp_handle_guest_command(decoded).unwrap()
 }
 
 /// Like [`dispatch`], but also round-trips the response through
@@ -53,7 +55,9 @@ fn dispatch_roundtrip(
 ) -> tdisp_proto::GuestToHostResponse {
     let resp = dispatch(emulator, cmd);
     let bytes = serialize_response(&resp);
-    deserialize_response(&bytes).unwrap()
+    let decoded = deserialize_response(&bytes).unwrap();
+    assert_eq!(decoded, resp);
+    decoded
 }
 
 // ── Command builders ──────────────────────────────────────────────────────────
@@ -136,8 +140,8 @@ fn modify_mmio_range_cmd(
 
 // ── Protocol negotiation ──────────────────────────────────────────────────────
 
-/// A valid protocol type is accepted, the host interface is consulted, and the
-/// negotiated protocol info is returned in the response.
+// Test: Negotiate a supported protocol through serialized guest commands.
+// Expected: The complete host capabilities are returned without changing state.
 #[test]
 fn test_negotiate_protocol_succeeds_with_valid_protocol() {
     let mut mock = new_emulator();
@@ -152,11 +156,13 @@ fn test_negotiate_protocol_succeeds_with_valid_protocol() {
     };
     let info = r.interface_info.unwrap();
     assert_eq!(info.guest_protocol_type, TDISP_MOCK_GUEST_PROTOCOL as i32);
+    assert_eq!(info.supported_features, 0xDEAD);
+    assert_eq!(info.tdisp_device_id, 99);
     assert_eq!(*mock.last_call.lock(), Some(LastCall::NegotiateProtocol));
 }
 
-/// An unrecognized protocol type integer is rejected before the host interface
-/// is consulted, so the state remains Unlocked and no host call is recorded.
+// Test: Negotiate the explicitly Invalid protocol through a serialized command.
+// Expected: The request is rejected without calling the host or changing state.
 #[test]
 fn test_negotiate_protocol_fails_with_invalid_protocol() {
     let mut mock = new_emulator();
@@ -182,9 +188,8 @@ fn test_negotiate_protocol_fails_with_invalid_protocol() {
 
 // ── Full lifecycle ────────────────────────────────────────────────────────────
 
-/// Full lifecycle via serialized commands: Unlocked -> Locked -> Run -> Unlocked.
-/// Each step is verified against expected state transitions, result codes, response
-/// variants, and host-interface calls.
+// Test: Bind, start and unbind through serialized guest commands.
+// Expected: Responses, state transitions and host actions follow the lifecycle.
 #[test]
 fn test_full_lifecycle_via_serialized_commands() {
     let mut mock = new_emulator();
@@ -221,8 +226,8 @@ fn test_full_lifecycle_via_serialized_commands() {
     assert_eq!(*mock.last_call.lock(), Some(LastCall::UnbindDevice));
 }
 
-/// GetDeviceInterfaceInfo negotiates the protocol with the host interface and
-/// returns the device capabilities. It does not change state.
+// Test: Request device interface information through the guest command protocol.
+// Expected: All host capabilities are returned without changing device state.
 #[test]
 fn test_get_device_interface_info_command() {
     let mut mock = new_emulator();
@@ -237,13 +242,15 @@ fn test_get_device_interface_info_command() {
     };
     let info = r.interface_info.unwrap();
     assert_eq!(info.guest_protocol_type, TDISP_MOCK_GUEST_PROTOCOL as i32);
+    assert_eq!(info.supported_features, 0xDEAD);
+    assert_eq!(info.tdisp_device_id, 99);
 
     // GetDeviceInterfaceInfo delegates to the host interface for negotiation.
     assert_eq!(*mock.last_call.lock(), Some(LastCall::NegotiateProtocol));
 }
 
-/// GetTdiReport succeeds in the Locked state and returns the report from the
-/// host without changing state.
+// Test: Request an interface report through the wire protocol while locked.
+// Expected: The complete host report and type are returned without a transition.
 #[test]
 fn test_get_tdi_report_in_locked_state() {
     let mut mock = new_emulator();
@@ -273,7 +280,8 @@ fn test_get_tdi_report_in_locked_state() {
     );
 }
 
-/// GetTdiReport also succeeds in the Run state without changing state.
+// Test: Request an interface report through the wire protocol while running.
+// Expected: The complete host report and type are returned without a transition.
 #[test]
 fn test_get_tdi_report_in_run_state() {
     let mut mock = new_emulator();
@@ -304,9 +312,8 @@ fn test_get_tdi_report_in_run_state() {
     )
 }
 
-/// Sending a Bind command while already Locked returns an error and the
-/// internal unbind_all resets the device to Unlocked. A subsequent Bind
-/// then succeeds.
+// Test: Send a second serialized bind while already locked, then bind again.
+// Expected: The state error unbinds the device and the subsequent bind succeeds.
 #[test]
 fn test_bind_from_locked_returns_error_and_resets_to_unlocked() {
     let mut mock = new_emulator();
@@ -331,7 +338,8 @@ fn test_bind_from_locked_returns_error_and_resets_to_unlocked() {
     assert_eq!(*mock.last_call.lock(), Some(LastCall::BindDevice));
 }
 
-/// StartTdi from the Unlocked state returns an error and resets to Unlocked.
+// Test: Start an unlocked device through the wire protocol.
+// Expected: InvalidDeviceState is returned and the host is asked to unbind.
 #[test]
 fn test_start_tdi_from_unlocked_returns_error() {
     let mut mock = new_emulator();
@@ -347,8 +355,8 @@ fn test_start_tdi_from_unlocked_returns_error() {
     assert_eq!(*mock.last_call.lock(), Some(LastCall::UnbindDevice));
 }
 
-/// Unbind from the Unlocked state is explicitly permitted and leaves the
-/// device in Unlocked.
+// Test: Send a graceful unbind for an already unlocked device.
+// Expected: The host unbinds successfully and the wire state remains Unlocked.
 #[test]
 fn test_unbind_from_unlocked_is_allowed() {
     let mut mock = new_emulator();
@@ -365,8 +373,8 @@ fn test_unbind_from_unlocked_is_allowed() {
     assert_eq!(*mock.last_call.lock(), Some(LastCall::UnbindDevice));
 }
 
-/// After a full Unlocked -> Locked -> Run -> Unlocked cycle the device can
-/// be bound and started again from scratch.
+// Test: Perform a complete serialized lifecycle and then bind/start again.
+// Expected: The second lifecycle returns the same successful host transitions.
 #[test]
 fn test_rebind_after_full_lifecycle() {
     let mut mock = new_emulator();
@@ -397,8 +405,8 @@ fn test_rebind_after_full_lifecycle() {
 
 // ── ModifyMmioRange ────────────────────────────────────────────────────
 
-/// The command is accepted in Locked, forwards the guest's values to the host
-/// interface unchanged, and does not transition the TDI.
+// Test: Unblock an MMIO range through a serialized command while locked.
+// Expected: The host receives the exact range payload and state stays Locked.
 #[test]
 fn test_modify_mmio_range_succeeds_in_locked() {
     let mut mock = new_emulator();
@@ -432,7 +440,8 @@ fn test_modify_mmio_range_succeeds_in_locked() {
     );
 }
 
-/// The command is equally valid in Run, and again leaves the state alone.
+// Test: Block an MMIO range with a length exceeding 32 bits while running.
+// Expected: The host receives the complete payload and state stays Run.
 #[test]
 fn test_modify_mmio_range_succeeds_in_run() {
     let mut mock = new_emulator();
@@ -468,9 +477,8 @@ fn test_modify_mmio_range_succeeds_in_run() {
     );
 }
 
-/// In Unlocked the command is rejected with InvalidDeviceState. Unlike
-/// StartTdi and GetTdiReport, this must NOT tear the TDI down: the state is
-/// still Unlocked afterwards and the host interface was never called.
+// Test: Modify an MMIO range while unlocked, then bind the device.
+// Expected: The state error makes no host call and binding remains usable.
 #[test]
 fn test_modify_mmio_range_fails_in_unlocked_without_teardown() {
     let mut mock = new_emulator();
@@ -505,8 +513,8 @@ fn test_modify_mmio_range_fails_in_unlocked_without_teardown() {
     assert_eq!(resp.tdi_state_after, TdispTdiState::Locked as i32);
 }
 
-/// A range_id that does not fit in a u16 is rejected before the state machine
-/// is consulted, since the wire type is wider than the BAR index it carries.
+// Test: Send a serialized MMIO request with a range ID wider than 16 bits.
+// Expected: The command error preserves Locked state and never calls the host.
 #[test]
 fn test_modify_mmio_range_rejects_oversized_range_id() {
     let mut mock = new_emulator();
@@ -533,8 +541,8 @@ fn test_modify_mmio_range_rejects_oversized_range_id() {
     assert_eq!(*mock.last_call.lock(), Some(LastCall::BindDevice));
 }
 
-/// The Invalid action is rejected in a valid state, so the guest cannot use a
-/// zero-valued action to reach the host interface.
+// Test: Send an MMIO request with the explicitly Invalid action while locked.
+// Expected: The command error preserves Locked state and never calls the host.
 #[test]
 fn test_modify_mmio_range_rejects_invalid_action() {
     let mut mock = new_emulator();

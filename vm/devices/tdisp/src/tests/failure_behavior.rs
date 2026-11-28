@@ -9,6 +9,7 @@ use crate::test_helpers::TDISP_MOCK_DEVICE_ID;
 use crate::test_helpers::new_null_tdisp_interface;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use test_with_tracing::test;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Operation {
@@ -122,9 +123,16 @@ fn null_provider_supports_repeated_guest_lifecycles_and_reports() {
             &mut emulator,
             get_tdi_report_cmd(99, TdispReportType::GuestDeviceId),
         );
+        check(
+            &identity,
+            TdispGuestOperationErrorCode::Success,
+            TdispTdiState::Unlocked,
+            TdispTdiState::Unlocked,
+        );
         let Some(Response::GetTdiReport(identity)) = identity.response else {
             panic!("missing device identity")
         };
+        assert_eq!(identity.report_type, TdispReportType::GuestDeviceId as i32);
         assert_eq!(identity.report_buffer, TDISP_MOCK_DEVICE_ID.to_le_bytes());
         check(
             &dispatch_roundtrip(&mut emulator, bind_cmd(99)),
@@ -136,10 +144,22 @@ fn null_provider_supports_repeated_guest_lifecycles_and_reports() {
             &mut emulator,
             get_tdi_report_cmd(99, TdispReportType::InterfaceReport),
         );
+        check(
+            &report,
+            TdispGuestOperationErrorCode::Success,
+            TdispTdiState::Locked,
+            TdispTdiState::Locked,
+        );
         let Some(Response::GetTdiReport(report)) = report.response else {
             panic!("missing report")
         };
+        assert_eq!(report.report_type, TdispReportType::InterfaceReport as i32);
+        assert_eq!(report.report_buffer, [0; 16]);
         let parsed = deserialize_tdi_report(&report.report_buffer).unwrap();
+        assert_eq!(parsed.interface_info.into_bits(), 0);
+        assert_eq!(parsed.msi_x_message_control, 0);
+        assert_eq!(parsed.lnr_control, 0);
+        assert_eq!(parsed.tph_control, 0);
         assert!(parsed.mmio_interface_info.is_empty());
         assert!(parsed.device_specific_info.is_empty());
         check(
@@ -190,6 +210,7 @@ fn backend_failures_remain_visible_and_allow_guest_retry() {
             dispatch_roundtrip(&mut emulator, bind_cmd(1));
         }
         host.lock().fail = Some(operation);
+        let calls_before = host.lock().calls.clone();
         let command = match operation {
             Operation::Negotiate => negotiate_cmd(1),
             Operation::Bind => bind_cmd(1),
@@ -217,11 +238,49 @@ fn backend_failures_remain_visible_and_allow_guest_retry() {
             before,
             after,
         );
-        assert_eq!(host.lock().calls.last(), Some(&operation));
+        let mut expected_calls = calls_before;
+        expected_calls.push(operation);
+        assert_eq!(host.lock().calls, expected_calls);
+        if operation == Operation::Unbind {
+            assert!(matches!(response.response, Some(Response::Unbind(_))));
+        } else {
+            assert!(response.response.is_none());
+        }
         host.lock().fail = None;
         let retry = dispatch_roundtrip(&mut emulator, command);
-        assert_eq!(retry.result, TdispGuestOperationErrorCode::Success as i32);
-        assert_eq!(retry.tdi_state_before, after as i32);
+        let retry_after = match operation {
+            Operation::Bind => TdispTdiState::Locked,
+            Operation::Start => TdispTdiState::Run,
+            _ => after,
+        };
+        check(
+            &retry,
+            TdispGuestOperationErrorCode::Success,
+            after,
+            retry_after,
+        );
+        expected_calls.push(operation);
+        assert_eq!(host.lock().calls, expected_calls);
+        match (operation, retry.response) {
+            (Operation::Negotiate, Some(Response::GetDeviceInterfaceInfo(response))) => {
+                let info = response.interface_info.unwrap();
+                assert_eq!(info.guest_protocol_type, TDISP_MOCK_GUEST_PROTOCOL as i32);
+                assert_eq!(info.supported_features, 0xDEAD);
+                assert_eq!(info.tdisp_device_id, 99);
+            }
+            (Operation::Report, Some(Response::GetTdiReport(response))) => {
+                assert_eq!(
+                    response.report_type,
+                    TdispReportType::InterfaceReport as i32
+                );
+                assert_eq!(response.report_buffer, [0; 16]);
+            }
+            (Operation::Bind, Some(Response::Bind(_)))
+            | (Operation::Start, Some(Response::StartTdi(_)))
+            | (Operation::Unbind, Some(Response::Unbind(_)))
+            | (Operation::Mmio, Some(Response::ModifyMmioRange(_))) => {}
+            (operation, response) => panic!("wrong retry payload for {operation:?}: {response:?}"),
+        }
     }
 }
 
@@ -390,7 +449,11 @@ fn device_failures_do_not_interrupt_another_devices_lifecycle() {
     let Some(Response::GetTdiReport(report)) = response.response else {
         panic!("missing running device report")
     };
-    assert!(deserialize_tdi_report(&report.report_buffer).is_ok());
+    assert_eq!(report.report_type, TdispReportType::InterfaceReport as i32);
+    assert_eq!(report.report_buffer, [0; 16]);
+    let parsed = deserialize_tdi_report(&report.report_buffer).unwrap();
+    assert!(parsed.mmio_interface_info.is_empty());
+    assert!(parsed.device_specific_info.is_empty());
 
     first_host.lock().fail = None;
     check(

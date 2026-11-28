@@ -32,6 +32,7 @@ use tdisp_proto::TdispReportType;
 use tdisp_proto::TdispTdiState;
 use tdisp_proto::guest_to_host_command::Command;
 use tdisp_proto::guest_to_host_response::Response;
+use test_with_tracing::test;
 
 /// Build a well-formed response wrapper around the given `Response` variant.
 fn make_response(response: Response) -> GuestToHostResponse {
@@ -45,6 +46,8 @@ fn make_response(response: Response) -> GuestToHostResponse {
 
 // ── Command round-trip tests ──────────────────────────────────────────────────
 
+// Test: Round-trip a protocol negotiation command.
+// Expected: The device ID, command variant and requested protocol all survive.
 #[test]
 fn test_command_get_device_interface_info_roundtrip() {
     let cmd = GuestToHostCommand {
@@ -57,6 +60,7 @@ fn test_command_get_device_interface_info_roundtrip() {
     };
     let bytes = serialize_command(&cmd);
     let got = deserialize_command(&bytes).unwrap();
+    assert_eq!(got, cmd);
     assert_eq!(got.device_id, 42);
     assert!(matches!(
         got.command,
@@ -64,6 +68,8 @@ fn test_command_get_device_interface_info_roundtrip() {
     ));
 }
 
+// Test: Round-trip a bind command.
+// Expected: The device ID and bind variant are preserved.
 #[test]
 fn test_command_bind_roundtrip() {
     let cmd = GuestToHostCommand {
@@ -72,10 +78,13 @@ fn test_command_bind_roundtrip() {
     };
     let bytes = serialize_command(&cmd);
     let got = deserialize_command(&bytes).unwrap();
+    assert_eq!(got, cmd);
     assert_eq!(got.device_id, 1);
     assert!(matches!(got.command, Some(Command::Bind(_))));
 }
 
+// Test: Round-trip a start command.
+// Expected: The device ID and start variant are preserved.
 #[test]
 fn test_command_start_tdi_roundtrip() {
     let cmd = GuestToHostCommand {
@@ -84,10 +93,13 @@ fn test_command_start_tdi_roundtrip() {
     };
     let bytes = serialize_command(&cmd);
     let got = deserialize_command(&bytes).unwrap();
+    assert_eq!(got, cmd);
     assert_eq!(got.device_id, 7);
     assert!(matches!(got.command, Some(Command::StartTdi(_))));
 }
 
+// Test: Round-trip a guest identity report request.
+// Expected: The device ID and report selector are preserved.
 #[test]
 fn test_command_get_tdi_report_roundtrip() {
     let cmd = GuestToHostCommand {
@@ -98,6 +110,7 @@ fn test_command_get_tdi_report_roundtrip() {
     };
     let bytes = serialize_command(&cmd);
     let got = deserialize_command(&bytes).unwrap();
+    assert_eq!(got, cmd);
     assert_eq!(got.device_id, 100);
     let Some(Command::GetTdiReport(req)) = got.command else {
         panic!("expected GetTdiReport command");
@@ -105,6 +118,8 @@ fn test_command_get_tdi_report_roundtrip() {
     assert_eq!(req.report_type, TdispReportType::GuestDeviceId as i32);
 }
 
+// Test: Round-trip a graceful unbind request.
+// Expected: The device ID and unbind reason are preserved.
 #[test]
 fn test_command_unbind_roundtrip() {
     let cmd = GuestToHostCommand {
@@ -115,6 +130,7 @@ fn test_command_unbind_roundtrip() {
     };
     let bytes = serialize_command(&cmd);
     let got = deserialize_command(&bytes).unwrap();
+    assert_eq!(got, cmd);
     assert_eq!(got.device_id, 5);
     let Some(Command::Unbind(req)) = got.command else {
         panic!("expected Unbind command");
@@ -122,6 +138,8 @@ fn test_command_unbind_roundtrip() {
     assert_eq!(req.unbind_reason, TdispGuestUnbindReason::Graceful as i32);
 }
 
+// Test: Round-trip both MMIO actions with a range length exceeding 32 bits.
+// Expected: The complete command payload survives without narrowing.
 #[test]
 fn test_command_modify_mmio_range_roundtrip() {
     for action in [
@@ -141,6 +159,7 @@ fn test_command_modify_mmio_range_roundtrip() {
         };
         let bytes = serialize_command(&cmd);
         let got = deserialize_command(&bytes).unwrap();
+        assert_eq!(got, cmd);
         assert_eq!(got.device_id, 42);
         let Some(Command::ModifyMmioRange(req)) = got.command else {
             panic!("expected ModifyMmioRange command");
@@ -153,6 +172,8 @@ fn test_command_modify_mmio_range_roundtrip() {
     }
 }
 
+// Test: Decode an MMIO command with an unknown action discriminant.
+// Expected: Validation rejects the command rather than accepting the payload.
 #[test]
 fn test_deserialize_command_rejects_invalid_mmio_range_action() {
     // An action integer outside the enum must fail validation, matching the
@@ -173,6 +194,8 @@ fn test_deserialize_command_rejects_invalid_mmio_range_action() {
 }
 
 // ── Command validation-failure tests ─────────────────────────────────────────
+// Test: Decode a command wrapper with no command variant.
+// Expected: Validation rejects the incomplete command.
 #[test]
 fn test_deserialize_command_rejects_missing_command_field() {
     // A GuestToHostCommand with no oneof variant set must be rejected.
@@ -184,6 +207,8 @@ fn test_deserialize_command_rejects_missing_command_field() {
     assert!(deserialize_command(&bytes).is_err());
 }
 
+// Test: Decode a command containing a truncated protobuf varint.
+// Expected: Decoding fails instead of returning a partial command.
 #[test]
 fn test_deserialize_command_rejects_malformed_bytes() {
     // 0x80 is the start of an incomplete varint; prost must reject it.
@@ -192,33 +217,44 @@ fn test_deserialize_command_rejects_malformed_bytes() {
 
 // ── Response round-trip tests ─────────────────────────────────────────────────
 
+// Test: Round-trip a successful bind response.
+// Expected: The result, both states and bind payload are preserved.
 #[test]
 fn test_response_bind_roundtrip() {
     let resp = make_response(Response::Bind(TdispCommandResponseBind {}));
     let bytes = serialize_response(&resp);
     let got = deserialize_response(&bytes).unwrap();
+    assert_eq!(got, resp);
     assert_eq!(got.result, TdispGuestOperationErrorCode::Success as i32);
     assert_eq!(got.tdi_state_before, TdispTdiState::Unlocked as i32);
     assert_eq!(got.tdi_state_after, TdispTdiState::Locked as i32);
     assert!(matches!(got.response, Some(Response::Bind(_))));
 }
 
+// Test: Round-trip a successful start response.
+// Expected: The result, both states and start payload are preserved.
 #[test]
 fn test_response_start_tdi_roundtrip() {
     let resp = make_response(Response::StartTdi(TdispCommandResponseStartTdi {}));
     let bytes = serialize_response(&resp);
     let got = deserialize_response(&bytes).unwrap();
+    assert_eq!(got, resp);
     assert!(matches!(got.response, Some(Response::StartTdi(_))));
 }
 
+// Test: Round-trip a successful unbind response.
+// Expected: The result, both states and unbind payload are preserved.
 #[test]
 fn test_response_unbind_roundtrip() {
     let resp = make_response(Response::Unbind(TdispCommandResponseUnbind {}));
     let bytes = serialize_response(&resp);
     let got = deserialize_response(&bytes).unwrap();
+    assert_eq!(got, resp);
     assert!(matches!(got.response, Some(Response::Unbind(_))));
 }
 
+// Test: Round-trip a successful MMIO modification response.
+// Expected: The result, both states and modification payload are preserved.
 #[test]
 fn test_response_modify_mmio_range_roundtrip() {
     let resp = make_response(Response::ModifyMmioRange(
@@ -226,9 +262,12 @@ fn test_response_modify_mmio_range_roundtrip() {
     ));
     let bytes = serialize_response(&resp);
     let got = deserialize_response(&bytes).unwrap();
+    assert_eq!(got, resp);
     assert!(matches!(got.response, Some(Response::ModifyMmioRange(_))));
 }
 
+// Test: Round-trip interface information containing nonzero capabilities and ID.
+// Expected: All wrapper and interface payload fields survive.
 #[test]
 fn test_response_get_device_interface_info_roundtrip() {
     let resp = make_response(Response::GetDeviceInterfaceInfo(
@@ -242,6 +281,7 @@ fn test_response_get_device_interface_info_roundtrip() {
     ));
     let bytes = serialize_response(&resp);
     let got = deserialize_response(&bytes).unwrap();
+    assert_eq!(got, resp);
     let Some(Response::GetDeviceInterfaceInfo(r)) = got.response else {
         panic!("expected GetDeviceInterfaceInfo response");
     };
@@ -251,6 +291,8 @@ fn test_response_get_device_interface_info_roundtrip() {
     assert_eq!(info.tdisp_device_id, 99);
 }
 
+// Test: Round-trip an interface report response containing binary report bytes.
+// Expected: All wrapper fields, the report selector and exact bytes survive.
 #[test]
 fn test_response_get_tdi_report_roundtrip() {
     let report_data = vec![0xDE, 0xAD, 0xBE, 0xEF];
@@ -260,6 +302,7 @@ fn test_response_get_tdi_report_roundtrip() {
     }));
     let bytes = serialize_response(&resp);
     let got = deserialize_response(&bytes).unwrap();
+    assert_eq!(got, resp);
     let Some(Response::GetTdiReport(r)) = got.response else {
         panic!("expected GetTdiReport response");
     };
@@ -269,6 +312,8 @@ fn test_response_get_tdi_report_roundtrip() {
 
 // ── Response validation-failure tests ────────────────────────────────────────
 
+// Test: Decode a successful response with no response variant.
+// Expected: Validation rejects the incomplete success response.
 #[test]
 fn test_deserialize_response_rejects_missing_response_field() {
     let resp = GuestToHostResponse {
@@ -281,6 +326,8 @@ fn test_deserialize_response_rejects_missing_response_field() {
     assert!(deserialize_response(&bytes).is_err());
 }
 
+// Test: Decode a successful report response containing an empty report.
+// Expected: Validation rejects the missing report data.
 #[test]
 fn test_deserialize_response_rejects_empty_report_buffer() {
     // GetTdiReport with an empty report_buffer must be rejected by validation.
@@ -292,6 +339,8 @@ fn test_deserialize_response_rejects_empty_report_buffer() {
     assert!(deserialize_response(&bytes).is_err());
 }
 
+// Test: Decode a successful interface-info response with no interface information.
+// Expected: Validation rejects the incomplete nested payload.
 #[test]
 fn test_deserialize_response_rejects_missing_interface_info() {
     // GetDeviceInterfaceInfo response with interface_info = None must be rejected.
@@ -304,7 +353,45 @@ fn test_deserialize_response_rejects_missing_interface_info() {
     assert!(deserialize_response(&bytes).is_err());
 }
 
+// Test: Decode a response containing a truncated protobuf varint.
+// Expected: Decoding fails instead of returning a partial response.
 #[test]
 fn test_deserialize_response_rejects_malformed_bytes() {
     assert!(deserialize_response(&[0x80]).is_err());
+}
+
+// Test: Decode otherwise valid responses with unknown result or state values.
+// Expected: Each malformed metadata field is rejected for success and error
+//       responses, while the corresponding valid response is preserved.
+#[test]
+fn unknown_response_metadata_is_rejected_even_without_a_success_payload() {
+    for response in [
+        make_response(Response::Bind(TdispCommandResponseBind {})),
+        GuestToHostResponse {
+            result: TdispGuestOperationErrorCode::HostFailedToProcessCommand as i32,
+            tdi_state_before: TdispTdiState::Locked as i32,
+            tdi_state_after: TdispTdiState::Unlocked as i32,
+            response: None,
+        },
+    ] {
+        assert_eq!(
+            deserialize_response(&serialize_response(&response)).unwrap(),
+            response
+        );
+        for invalid in [-1, i32::MAX] {
+            for field in 0..3 {
+                let mut malformed = response.clone();
+                match field {
+                    0 => malformed.result = invalid,
+                    1 => malformed.tdi_state_before = invalid,
+                    2 => malformed.tdi_state_after = invalid,
+                    _ => unreachable!(),
+                }
+                assert!(
+                    deserialize_response(&serialize_response(&malformed)).is_err(),
+                    "accepted invalid metadata field {field}: {invalid}"
+                );
+            }
+        }
+    }
 }

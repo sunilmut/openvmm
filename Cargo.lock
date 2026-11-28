@@ -8694,6 +8694,7 @@ dependencies = [
  "prost",
  "static_assertions",
  "tdisp_proto",
+ "test_with_tracing",
  "tracing",
  "zerocopy",
 ]
