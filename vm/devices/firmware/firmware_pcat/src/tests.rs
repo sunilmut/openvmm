@@ -10,6 +10,7 @@ use parking_lot::Mutex;
 use std::future::poll_fn;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use test_with_tracing::test;
 use vm_topology::memory::MemoryRangeWithNode;
 use vm_topology::processor::TopologyBuilder;
 use vmcore::line_interrupt::LineInterrupt;
@@ -83,6 +84,7 @@ struct Observer {
     events: Mutex<Vec<&'static str>>,
     replays: AtomicUsize,
     rom_maps: Mutex<Vec<(u64, u64, u64)>>,
+    rom_unmaps: Mutex<Vec<u64>>,
 }
 
 struct Logger(Arc<Observer>);
@@ -205,7 +207,10 @@ async fn configuration_queries_report_machine_topology(driver: DefaultDriver) {
 // Expected: Each selection restarts its FIFO and strings pad missing bytes with spaces.
 #[async_test]
 async fn configuration_strings_are_chunked_padded_and_repeatable(driver: DefaultDriver) {
-    let mut f = Fixture::new(&driver).await;
+    let mut c = config();
+    c.smbios.bios_guid =
+        guid::Guid::from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+    let mut f = Fixture::with_config(&driver, c, None).await.unwrap();
     for (address, text) in [
         (PcatAddress::BIOS_SYSTEM_SERIAL_NUMBER, b"serial".as_slice()),
         (PcatAddress::BIOS_BASE_SERIAL_NUMBER, b"board".as_slice()),
@@ -227,9 +232,17 @@ async fn configuration_strings_are_chunked_padded_and_repeatable(driver: Default
         assert_eq!(f.next().to_le_bytes(), expected[..4]);
     }
     f.select(PcatAddress::BIOS_GUID);
-    for _ in 0..5 {
-        assert_eq!(f.next(), 0x1212_1212);
-    }
+    assert_eq!(
+        [f.next(), f.next(), f.next(), f.next(), f.next()],
+        [
+            0x0302_0100,
+            0x0706_0504,
+            0x0b0a_0908,
+            0x0f0e_0d0c,
+            0x0302_0100
+        ]
+    );
+    assert_eq!(f.read(PcatAddress::BIOS_GUID), 0x0302_0100);
     let mut address = [0; 4];
     f.device.io_read(0x28, &mut address).unwrap();
     assert_eq!(u32::from_le_bytes(address), PcatAddress::BIOS_GUID.0);
@@ -249,12 +262,17 @@ async fn srat_fifo_offsets_and_guest_memory_delivery(driver: DefaultDriver) {
     f.write(PcatAddress::SRAT_SIZE, 1);
     f.write(PcatAddress::SRAT_OFFSET, 99);
     assert_eq!(f.read(PcatAddress::SRAT_DATA), 0);
+    f.gm.write_at(0xffc, &[0xa5; 20]).unwrap();
     f.write(PcatAddress::SRAT_DATA, 0x1000);
     assert_eq!(
         f.gm.read_plain::<[u8; 12]>(0x1000).unwrap(),
         [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     );
+    assert_eq!(f.gm.read_plain::<[u8; 4]>(0xffc).unwrap(), [0xa5; 4]);
+    assert_eq!(f.gm.read_plain::<[u8; 4]>(0x100c).unwrap(), [0xa5; 4]);
+    let before = f.gm.read_plain::<[u8; 20]>(0xffc).unwrap();
     f.write(PcatAddress::SRAT_DATA, u32::MAX);
+    assert_eq!(f.gm.read_plain::<[u8; 20]>(0xffc).unwrap(), before);
     f.write(PcatAddress(0xffff), 0);
     f.write(PcatAddress::BOOT_FINALIZE, 0);
     assert_eq!(f.observer.replays.load(Ordering::SeqCst), 1);
@@ -293,15 +311,26 @@ async fn e820_fifo_reports_extra_memory_ranges(driver: DefaultDriver) {
 }
 
 // Test: Deliver CPU SMBIOS records with explicit and missing processor information.
-// Expected: Guest bytes contain the configured formatted fields and terminated strings.
+// Expected: Complete records include formatted fields, string padding and terminators;
+//       adjacent RAM is untouched and absent CPU information uses unknown defaults.
 #[async_test]
 async fn processor_tables_are_written_in_the_guest_smbios_format(driver: DefaultDriver) {
     let mut f = Fixture::new(&driver).await;
+    f.gm.write_at(0x1ffc, &[0xa5; 131]).unwrap();
     f.write(PcatAddress::PROCESSOR_DMTF_TABLE, 0x2000);
     let bytes = f.gm.read_plain::<[u8; 123]>(0x2000).unwrap();
-    assert_eq!(&bytes[..8], &[4, 35, 0, 0, 1, 3, 0xb3, 2]);
-    assert_eq!(&bytes[18..24], &[100, 0, 0x80, 0x0c, 0xf0, 0x0a]);
-    assert_eq!(&bytes[35..54], b"None\0Maker\0Version\0");
+    let mut expected = [b' '; 123];
+    expected[..35].copy_from_slice(&[
+        4, 35, 0, 0, 1, 3, 0xb3, 2, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0x81, 100, 0, 0x80, 0x0c, 0xf0,
+        0x0a, 0x41, 6, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 1, 1, 1,
+    ]);
+    expected[35..54].copy_from_slice(b"None\0Maker\0Version\0");
+    expected[121..].fill(0);
+    assert_eq!(bytes, expected);
+    assert_eq!(f.gm.read_plain::<[u8; 4]>(0x1ffc).unwrap(), [0xa5; 4]);
+    assert_eq!(f.gm.read_plain::<[u8; 4]>(0x207b).unwrap(), [0xa5; 4]);
+    f.write(PcatAddress::PROCESSOR_DMTF_TABLE, u32::MAX);
+    assert_eq!(f.gm.read_plain::<[u8; 123]>(0x2000).unwrap(), expected);
     let mut c = config();
     c.smbios.cpu_info_bundle = None;
     c.smbios.processor_manufacturer.clear();
@@ -309,8 +338,12 @@ async fn processor_tables_are_written_in_the_guest_smbios_format(driver: Default
     let mut f = Fixture::with_config(&driver, c, None).await.unwrap();
     f.write(PcatAddress::PROCESSOR_DMTF_TABLE, 0);
     let bytes = f.gm.read_plain::<[u8; 123]>(0).unwrap();
-    assert_eq!(bytes[6], 2);
-    assert_eq!(&bytes[35..50], b"None\0None\0None\0");
+    expected[6] = 2;
+    expected[17] = 1;
+    expected[18..24].fill(0);
+    expected[35..121].fill(b' ');
+    expected[35..50].copy_from_slice(b"None\0None\0None\0");
+    assert_eq!(bytes, expected);
 }
 
 // Test: Write the entropy table twice and set the generation-ID pointer in two halves.
@@ -426,10 +459,16 @@ async fn bus_interfaces_reject_bad_ports_and_tolerate_rom_accesses(driver: Defau
     assert!(f.device.supports_pio().is_some());
     assert!(f.device.supports_mmio().is_some());
     assert!(f.device.supports_poll_device().is_some());
-    assert_eq!(PortIoIntercept::get_static_regions(&mut f.device).len(), 2);
     assert_eq!(
-        MmioIntercept::get_static_regions(&mut f.device)[0].1,
-        0xf0000..=0xfffff
+        PortIoIntercept::get_static_regions(&mut f.device),
+        &[("pcat_bios", 0x28..=0x2d), ("post", 0x80..=0x80)]
+    );
+    assert_eq!(
+        MmioIntercept::get_static_regions(&mut f.device),
+        &[
+            ("rom-low", 0xf0000..=0xfffff),
+            ("rom-high", 0xfffc_0000..=0xffff_ffff),
+        ]
     );
     assert!(matches!(
         f.device.io_read(0x28, &mut [0; 2]),
@@ -453,18 +492,22 @@ async fn bus_interfaces_reject_bad_ports_and_tolerate_rom_accesses(driver: Defau
     for addr in [0xf5bea, 0xf5bfa, 0xf0000] {
         f.device.mmio_write(addr, &[0]).unwrap();
     }
-    f.device.start();
-    f.device.stop().await;
-    let mut cx = Context::from_waker(std::task::Waker::noop());
-    f.device.poll_device(&mut cx);
 }
 
 struct Rom {
     len: u64,
-    fail: bool,
+    fail_at: Option<u64>,
     observer: Arc<Observer>,
 }
-struct Mapping;
+struct Mapping {
+    gpa: u64,
+    observer: Arc<Observer>,
+}
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        self.observer.rom_unmaps.lock().push(self.gpa);
+    }
+}
 impl UnmapRom for Mapping {
     fn unmap_rom(self) {}
 }
@@ -473,11 +516,14 @@ impl MapRom for Rom {
         self.len
     }
     fn map_rom(&self, gpa: u64, offset: u64, len: u64) -> std::io::Result<Box<dyn UnmapRom>> {
-        if self.fail {
+        if self.fail_at == Some(gpa) {
             return Err(std::io::Error::other("test ROM mapping failure"));
         }
         self.observer.rom_maps.lock().push((gpa, offset, len));
-        Ok(Box::new(Mapping))
+        Ok(Box::new(Mapping {
+            gpa,
+            observer: self.observer.clone(),
+        }))
     }
 }
 
@@ -489,7 +535,11 @@ async fn construction_validates_configuration_and_maps_rom_aliases(driver: Defau
     c.smbios.system_serial_number = vec![b'x'; 33];
     assert!(matches!(
         Fixture::with_config(&driver, c, None).await,
-        Err(PcatBiosDeviceInitError::SmbiosStringTooLong { .. })
+        Err(PcatBiosDeviceInitError::SmbiosStringTooLong {
+            field: "system serial number",
+            len: 33,
+            max: 32,
+        })
     ));
     let mut c = config();
     c.chipset_low_mmio = MemoryRange::new(0..0);
@@ -500,7 +550,7 @@ async fn construction_validates_configuration_and_maps_rom_aliases(driver: Defau
     for (len, fail) in [(1, false), (0x40000, true)] {
         let rom = Rom {
             len,
-            fail,
+            fail_at: fail.then_some(0xfffc0000),
             observer: Arc::default(),
         };
         let result = Fixture::with_config(&driver, config(), Some(Box::new(rom))).await;
@@ -513,19 +563,113 @@ async fn construction_validates_configuration_and_maps_rom_aliases(driver: Defau
             ));
         }
     }
+    let mut c = config();
+    c.smbios.system_serial_number = b"0123456789abcdefghijklmnopqrstuv".to_vec();
     let observer = Arc::new(Observer::default());
     let rom = Rom {
         len: 0x40000,
-        fail: false,
+        fail_at: None,
         observer: observer.clone(),
     };
-    let _f = Fixture::with_config(&driver, config(), Some(Box::new(rom)))
+    let mut f = Fixture::with_config(&driver, c, Some(Box::new(rom)))
         .await
         .unwrap();
     assert_eq!(
         *observer.rom_maps.lock(),
         [(0xfffc0000, 0, 0x40000), (0xf0000, 0x30000, 0x10000)]
     );
+    assert!(observer.rom_unmaps.lock().is_empty());
+    f.select(PcatAddress::BIOS_SYSTEM_SERIAL_NUMBER);
+    let mut serial = Vec::new();
+    for _ in 0..8 {
+        serial.extend_from_slice(&f.next().to_le_bytes());
+    }
+    assert_eq!(serial, b"0123456789abcdefghijklmnopqrstuv");
+    drop(f);
+    let mut unmapped = observer.rom_unmaps.lock().clone();
+    unmapped.sort_unstable();
+    assert_eq!(unmapped, [0xf0000, 0xfffc0000]);
+}
+
+// Test: Fail the second ROM alias mapping while another BIOS device remains live.
+// Expected: The first alias is released on failure, preserving the original error
+//       and the peer's live mappings until the peer itself is dropped.
+#[async_test]
+async fn rom_mapping_failure_releases_only_its_own_alias(driver: DefaultDriver) {
+    let peer_observer = Arc::new(Observer::default());
+    let peer = Fixture::with_config(
+        &driver,
+        config(),
+        Some(Box::new(Rom {
+            len: 0x40000,
+            fail_at: None,
+            observer: peer_observer.clone(),
+        })),
+    )
+    .await
+    .unwrap();
+    let observer = Arc::new(Observer::default());
+    let result = Fixture::with_config(
+        &driver,
+        config(),
+        Some(Box::new(Rom {
+            len: 0x40000,
+            fail_at: Some(0xf0000),
+            observer: observer.clone(),
+        })),
+    )
+    .await;
+    let Err(PcatBiosDeviceInitError::Rom(error)) = result else {
+        panic!("second ROM mapping must fail");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert_eq!(error.to_string(), "test ROM mapping failure");
+    assert_eq!(*observer.rom_maps.lock(), [(0xfffc0000, 0, 0x40000)]);
+    assert_eq!(*observer.rom_unmaps.lock(), [0xfffc0000]);
+    assert!(peer_observer.rom_unmaps.lock().is_empty());
+    drop(peer);
+    let mut unmapped = peer_observer.rom_unmaps.lock().clone();
+    unmapped.sort_unstable();
+    assert_eq!(unmapped, [0xf0000, 0xfffc0000]);
+}
+
+// Test: Save entropy after a failed destination write, then restore into fresh RAM.
+// Expected: The restored device delivers the source bytes once, preserves neighboring
+//       RAM and cannot write another entropy table after saving the placed state.
+#[async_test]
+async fn entropy_retry_and_migration_preserve_guest_delivery(driver: DefaultDriver) {
+    let mut source = Fixture::new(&driver).await;
+    source.write(PcatAddress::ENTROPY_TABLE, u32::MAX);
+    let saved = source.device.save().unwrap();
+    source.write(PcatAddress::ENTROPY_TABLE, 0x1000);
+    let entropy = source.gm.read_plain::<[u8; 64]>(0x1000).unwrap();
+
+    let mut restored = Fixture::new(&driver).await;
+    restored.gm.write_at(0x1ffc, &[0xa5; 72]).unwrap();
+    restored.device.restore(saved).unwrap();
+    restored.write(PcatAddress::ENTROPY_TABLE, 0x2000);
+    assert_eq!(restored.gm.read_plain::<[u8; 64]>(0x2000).unwrap(), entropy);
+    assert_eq!(
+        restored.gm.read_plain::<[u8; 4]>(0x1ffc).unwrap(),
+        [0xa5; 4]
+    );
+    assert_eq!(
+        restored.gm.read_plain::<[u8; 4]>(0x2040).unwrap(),
+        [0xa5; 4]
+    );
+    assert_eq!(source.gm.read_plain::<[u8; 64]>(0x1000).unwrap(), entropy);
+    assert_eq!(source.gm.read_plain::<[u8; 64]>(0x2000).unwrap(), [0; 64]);
+
+    let placed = restored.device.save().unwrap();
+    let mut destination = Fixture::new(&driver).await;
+    destination.gm.write_at(0x3000, &[0x77; 64]).unwrap();
+    destination.device.restore(placed).unwrap();
+    destination.write(PcatAddress::ENTROPY_TABLE, 0x3000);
+    assert_eq!(
+        destination.gm.read_plain::<[u8; 64]>(0x3000).unwrap(),
+        [0x77; 64]
+    );
+    assert_eq!(restored.gm.read_plain::<[u8; 64]>(0x2000).unwrap(), entropy);
 }
 
 // Test: Save and restore after reading part of a nonzero E820 descriptor.
@@ -550,7 +694,7 @@ async fn e820_descriptor_continuation_survives_save_restore(driver: DefaultDrive
 }
 
 // IGNORED: Adding one to the eight-bit E820 index overflows before the missing
-//         range can be rejected; checked builds panic on a guest port read.
+//       range can be rejected; checked builds panic on a guest port read.
 //
 // Test: Select the maximum E820 descriptor index through the BIOS ports.
 // Expected: The missing entry returns zero rather than wrapping or panicking.

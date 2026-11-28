@@ -729,7 +729,11 @@ pub fn default_cmos_values(mem_layout: &MemoryLayout) -> [u8; 256] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
 
+    // Test: Initialize CMOS for discontiguous RAM including memory above 4 GiB.
+    // Expected: The complete BIOS image, memory sizing and checksums match
+    //       the independently recorded default image.
     #[test]
     fn test_default_cmos_values() {
         use memory_range::MemoryRange;

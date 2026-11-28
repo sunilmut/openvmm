@@ -96,6 +96,7 @@ pub fn bios_boot_order(boot_order: &[BootDeviceStatus]) -> u32 {
 mod tests {
     use super::*;
     use crate::config::BootDevice;
+    use test_with_tracing::test;
 
     macro_rules! assert_eq_hex {
         ($left:expr, $right:expr) => {
@@ -103,6 +104,8 @@ mod tests {
         };
     }
 
+    // Test: Encode the default order with all four devices attached.
+    // Expected: The BIOS receives each priority in its device-category nibble.
     #[test]
     fn all_connected() {
         let boot_order = [
@@ -126,6 +129,8 @@ mod tests {
         assert_eq_hex!(bios_boot_order(&boot_order), 0x76543210);
     }
 
+    // Test: Put network first with optical and hard-drive devices unattached.
+    // Expected: Only network and floppy occupy the first two priorities.
     #[test]
     fn some_missing() {
         let boot_order = [
@@ -149,6 +154,8 @@ mod tests {
         assert_eq_hex!(bios_boot_order(&boot_order), 0x76543201);
     }
 
+    // Test: Put network first with only the hard drive unattached.
+    // Expected: Network, floppy and optical priorities have no missing-drive gap.
     #[test]
     fn no_hdd() {
         let boot_order = [
