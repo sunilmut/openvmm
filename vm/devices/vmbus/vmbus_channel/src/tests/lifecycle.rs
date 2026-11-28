@@ -23,6 +23,7 @@ enum Action {
     Start,
     Stop,
     Open(u16),
+    RejectedOpen(u16),
     Close(u16),
     Target(u16, u32),
     Restore(usize),
@@ -35,6 +36,8 @@ struct TestDevice {
     #[inspect(skip)]
     resources: Arc<Mutex<Option<DeviceResources>>>,
     #[inspect(skip)]
+    restored: Arc<Mutex<Vec<Option<OpenRequest>>>>,
+    #[inspect(skip)]
     open: Vec<bool>,
 }
 
@@ -44,6 +47,7 @@ impl TestDevice {
         Self {
             actions: Default::default(),
             resources: Default::default(),
+            restored: Default::default(),
             open: vec![false; 3],
         }
     }
@@ -71,6 +75,7 @@ impl VmbusDevice for TestDevice {
 
     async fn open(&mut self, index: u16, request: &OpenRequest) -> Result<(), ChannelOpenError> {
         if request.open_data.target_vp == Some(u32::MAX) {
+            self.actions.lock().push(Action::RejectedOpen(index));
             anyhow::bail!("test device rejects the requested target");
         }
         self.open[usize::from(index)] = true;
@@ -119,6 +124,7 @@ impl SaveRestoreVmbusDevice for TestDevice {
         self.actions
             .lock()
             .push(Action::Restore(requests.iter().flatten().count()));
+        *self.restored.lock() = requests;
         Ok(())
     }
 }
@@ -245,7 +251,9 @@ fn rejected_opens_can_be_retried_without_closing_a_nonexistent_channel() {
     let driver = pool.driver();
     pool.run_until(with_timeout(&driver, async {
         let (bus, mut offers) = TestBus::new(Notification::SlimEvent);
-        let handle = offer_generic_channel(&driver, &bus, Box::new(TestDevice::new()))
+        let device = TestDevice::new();
+        let actions = device.actions.clone();
+        let handle = offer_generic_channel(&driver, &bus, Box::new(device))
             .await
             .unwrap();
         let child = offers.recv().await.unwrap();
@@ -258,6 +266,10 @@ fn rejected_opens_can_be_retried_without_closing_a_nonexistent_channel() {
                 .await
                 .unwrap()
         );
+        assert_eq!(
+            *actions.lock(),
+            [Action::Install(3), Action::RejectedOpen(0)]
+        );
         assert!(
             child
                 .request_send
@@ -267,6 +279,15 @@ fn rejected_opens_can_be_retried_without_closing_a_nonexistent_channel() {
         );
         let (device, ()) = futures::join!(handle.revoke(), finish_revoke(child));
         assert!(device.is_some());
+        assert_eq!(
+            *actions.lock(),
+            [
+                Action::Install(3),
+                Action::RejectedOpen(0),
+                Action::Open(0),
+                Action::Close(0)
+            ]
+        );
     }));
 }
 
@@ -342,7 +363,8 @@ fn primary_close_revokes_subchannels_and_releases_their_gpadls() {
 }
 
 // Test: Save, restore an open primary and its GPADL, then save it again.
-// Expected: Restore passes the server's open request through and preserves open state.
+// Expected: Restore preserves the server's non-default request, interrupt, GPADL
+//       pages and open state without an ordinary open callback.
 #[test]
 fn restored_open_channels_recover_gpadls_and_save_their_open_state() {
     let mut pool = pal_async::DefaultPool::new();
@@ -352,12 +374,15 @@ fn restored_open_channels_recover_gpadls_and_save_their_open_state() {
         let device = TestDevice::new();
         let resources = device.resources.clone();
         let actions = device.actions.clone();
+        let restored = device.restored.clone();
         let handle = offer_channel(&driver, &bus, device).await.unwrap();
         let mut child = offers.recv().await.unwrap();
         handle.stop().await;
         let saved: State = handle.save().await.unwrap().unwrap().parse().unwrap();
         assert_eq!(saved.open, [false; 3]);
         let restore = handle.restore(SavedStateBlob::new(State { open: vec![true] }));
+        let delivered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = delivered.clone();
         let response = async {
             let ChannelServerRequest::Restore(rpc) =
                 child.server_request_recv.recv().await.unwrap()
@@ -365,26 +390,68 @@ fn restored_open_channels_recover_gpadls_and_save_their_open_state() {
                 panic!("expected restore")
             };
             assert!(*rpc.input());
+            let mut request = open_request();
+            request.open_data.target_vp = Some(11);
+            request.open_data.ring_gpadl_id = GpadlId(19);
+            request.open_data.ring_offset = 3;
+            request.open_data.event_flag = 29;
+            request.open_data.connection_id = 0x1234;
+            request.open_data.user_data.fill(0x6d);
+            let request = OpenRequest::new(
+                request.open_data,
+                Interrupt::from_fn(move || {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                }),
+                protocol::FeatureFlags::new()
+                    .with_confidential_channels(true)
+                    .with_gpa_pinning(true),
+                protocol::OfferFlags::new()
+                    .with_confidential_ring_buffer(true)
+                    .with_confidential_external_memory(true)
+                    .with_require_pinned_external_memory(true),
+            );
             rpc.complete(Ok(RestoreResult {
-                open_request: Some(open_request()),
+                open_request: Some(request),
                 gpadls: vec![RestoredGpadl {
-                    request: ring_gpadl(),
+                    request: GpadlRequest {
+                        id: GpadlId(19),
+                        count: 1,
+                        buf: vec![5 * 4096, 9, 5, 2, 7, 11],
+                    },
                     accepted: true,
                 }],
             }));
         };
         let (result, ()) = futures::join!(restore, response);
         result.unwrap();
-        assert_eq!(actions.lock().last(), Some(&Action::Restore(1)));
-        assert!(
-            resources
-                .lock()
-                .as_ref()
-                .unwrap()
-                .gpadl_map
-                .map(GpadlId(7))
-                .is_ok()
+        assert_eq!(
+            *actions.lock(),
+            [Action::Install(3), Action::Stop, Action::Restore(1)]
         );
+        {
+            let restored = restored.lock();
+            assert_eq!(restored.len(), 1);
+            let request = restored[0].as_ref().unwrap();
+            assert_eq!(request.open_data.target_vp, Some(11));
+            assert_eq!(request.open_data.ring_gpadl_id, GpadlId(19));
+            assert_eq!(request.open_data.ring_offset, 3);
+            assert_eq!(request.open_data.event_flag, 29);
+            assert_eq!(request.open_data.connection_id, 0x1234);
+            assert_eq!(*request.open_data.user_data, [0x6d; 120]);
+            assert!(request.use_confidential_ring);
+            assert!(request.use_confidential_external_memory);
+            assert!(request.is_external_memory_pinned);
+            request.interrupt.deliver();
+        }
+        assert_eq!(delivered.load(Ordering::SeqCst), 1);
+        let mapper = resources.lock().as_ref().unwrap().gpadl_map.clone();
+        {
+            let view = mapper.map(GpadlId(19)).unwrap();
+            assert_eq!(view.range_count(), 1);
+            assert_eq!(view.first().unwrap().len(), 5 * 4096);
+            assert_eq!(view.first().unwrap().gpns(), [9, 5, 2, 7, 11]);
+        }
+        assert!(mapper.map(GpadlId(7)).is_err());
         let saved: State = handle.save().await.unwrap().unwrap().parse().unwrap();
         assert_eq!(saved.open, [true]);
         let (device, ()) = futures::join!(handle.revoke(), finish_revoke(child));

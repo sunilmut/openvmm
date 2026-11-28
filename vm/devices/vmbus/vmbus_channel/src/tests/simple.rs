@@ -109,8 +109,10 @@ impl SaveRestoreSimpleVmbusDevice for CounterDevice {
     }
 }
 
-// Test: Run a simple device, save its progress, close, restore, and resume it.
-// Expected: Progress survives restore and runners drop before each close callback.
+// Test: Save non-default progress and restore it into a fresh stopped device,
+//       then save and restore the closed destination.
+// Expected: Progress survives transfer, closed restore creates no runner, and
+//       runners drop before each close callback.
 #[test]
 fn simple_device_restores_progress_and_drops_runner_before_close() {
     let mut pool = pal_async::DefaultPool::new();
@@ -132,7 +134,7 @@ fn simple_device_restores_progress_and_drops_runner_before_close() {
         )
         .await
         .unwrap();
-        let mut child = offers.recv().await.unwrap();
+        let child = offers.recv().await.unwrap();
         assert!(
             child
                 .request_send
@@ -147,8 +149,10 @@ fn simple_device_restores_progress_and_drops_runner_before_close() {
                 .await
                 .unwrap()
         );
-        child.event.deliver();
-        assert_eq!(observed.recv().await.unwrap(), 1);
+        for expected in 1..=3 {
+            child.event.deliver();
+            assert_eq!(observed.recv().await.unwrap(), expected);
+        }
         assert_eq!(
             child
                 .request_send
@@ -168,6 +172,25 @@ fn simple_device_restores_progress_and_drops_runner_before_close() {
             .await
             .unwrap();
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        let (device, ()) = futures::join!(handle.revoke(), finish_revoke(child));
+        assert_eq!(device.unwrap().closes, 1);
+
+        // A new wrapper cannot recover progress from the source's old runner.
+        let (completed, mut observed) = mesh::channel();
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handle = offer_simple_device(
+            &source,
+            &bus,
+            CounterDevice {
+                completed,
+                dropped: dropped.clone(),
+                closes: 0,
+            },
+            InitialDeviceState::Stopped,
+        )
+        .await
+        .unwrap();
+        let mut child = offers.recv().await.unwrap();
         let restore = handle.restore(saved);
         let response = async {
             let ChannelServerRequest::Restore(rpc) =
@@ -186,16 +209,17 @@ fn simple_device_restores_progress_and_drops_runner_before_close() {
         };
         let (result, ()) = futures::join!(restore, response);
         result.unwrap();
-        handle.start();
         child.event.deliver();
-        assert_eq!(observed.recv().await.unwrap(), 2);
+        assert!(observed.recv().now_or_never().is_none());
+        handle.start();
+        assert_eq!(observed.recv().await.unwrap(), 4);
         handle.stop().await;
         child
             .request_send
             .call(ChannelRequest::Close, ())
             .await
             .unwrap();
-        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
         let saved = handle.save().await.unwrap().unwrap();
         let restore = handle.restore(saved);
         let response = async {
@@ -212,8 +236,13 @@ fn simple_device_restores_progress_and_drops_runner_before_close() {
         };
         let (result, ()) = futures::join!(restore, response);
         result.unwrap();
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        handle.start();
+        handle.stop().await;
+        assert!(observed.recv().now_or_never().is_none());
         handle.reset().await;
         let (device, ()) = futures::join!(handle.revoke(), finish_revoke(child));
-        assert_eq!(device.unwrap().closes, 2);
+        assert_eq!(device.unwrap().closes, 1);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }));
 }

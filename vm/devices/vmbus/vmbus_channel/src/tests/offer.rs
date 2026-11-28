@@ -87,6 +87,8 @@ fn offer_acceptance_interrupts_and_close_follow_the_guest_protocol() {
                 .unwrap(),
             0
         );
+        // Offer currently drops the close RPC; endpoint closure, not its reply,
+        // is the observable contract of this abstraction.
         let _closed = child.request_send.call(ChannelRequest::Close, ()).await;
         assert!(
             poll_fn(|cx| channel.channel.signal.poll_for_signal(cx))

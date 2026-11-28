@@ -91,6 +91,8 @@ fn ring_gpadl() -> GpadlRequest {
 }
 
 // Finish the server side of an offer's revocation, then close its request stream.
+// Sender closure is also valid: primary revoke and primary close use it instead
+// of an explicit Revoke RPC.
 async fn finish_revoke(mut child: OfferInput) {
     if let Ok(request) = child.server_request_recv.recv().await {
         match request {
