@@ -18,7 +18,8 @@ fn configured_disk(
     behavior: UnmapBehavior,
     fail: bool,
 ) -> (SimpleScsiDisk, Arc<Mutex<TestDiskStorageState>>) {
-    let (mut backing, state) = TestDisk::new(512, 4096, sectors, read_only, false);
+    let (mut backing, state) =
+        TestDisk::new(512, 4096, sectors, read_only, /* storage: */ false);
     backing.unmap_behavior = behavior;
     backing.fail_unmap = fail;
     (
@@ -259,7 +260,13 @@ async fn high_lba_unmap_chunking_preserves_sector_units_and_capacity_boundary() 
         let chunk = u32::MAX / sector_size;
         let count = chunk + 3;
         let capacity = start + u64::from(count) + 8;
-        let (mut backing, state) = TestDisk::new(sector_size, 4096, capacity, false, false);
+        let (mut backing, state) = TestDisk::new(
+            sector_size,
+            4096,
+            capacity,
+            /* read_only: */ false,
+            /* storage: */ false,
+        );
         backing.unmap_behavior = UnmapBehavior::Unspecified;
         let disk = SimpleScsiDisk::new(
             Disk::new(backing).unwrap(),

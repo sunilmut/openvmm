@@ -124,7 +124,10 @@ async fn dvd_request_sense_respects_allocation_and_fixed_response_size() {
     }
 }
 
-// Test: Known product bug: request more standard DVD INQUIRY bytes than its declared 36-byte identity.
+// IGNORED: DVD INQUIRY currently transfers more than its declared 36-byte identity.
+//       Keep this regression pending a separate production fix.
+//
+// Test: Request more standard DVD INQUIRY bytes than its declared 36-byte identity.
 // Expected: Transfer stops at additional-length plus five and leaves the rest of the response buffer untouched.
 #[async_test]
 #[ignore = "known product bug: DVD INQUIRY transfers 104 bytes while declaring a 36-byte identity"]

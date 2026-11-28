@@ -115,7 +115,10 @@ async fn short_configuration_allocations_return_only_the_available_header_prefix
     }
 }
 
-// Test: Known product bug: inspect the configuration header's data length for one power-management feature.
+// IGNORED: GET CONFIGURATION currently counts its own four-byte length field.
+//       Keep this regression pending a separate production fix.
+//
+// Test: Read the configuration header's data length for one power-management feature.
 // Expected: The reported available length excludes the four-byte data-length field itself.
 #[async_test]
 #[ignore = "known product bug: GET CONFIGURATION data length includes its own four-byte field"]

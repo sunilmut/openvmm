@@ -15,5 +15,5 @@ mod dvd_mode_tests;
 mod inquiry_tests;
 mod lba_status_tests;
 mod pr_tests;
-mod test_helpers;
+pub(super) mod test_helpers;
 mod unmap_tests;

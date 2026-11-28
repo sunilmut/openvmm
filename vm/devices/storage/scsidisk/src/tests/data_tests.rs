@@ -57,7 +57,10 @@ async fn read_write_variants_transfer_exact_ranges_and_forward_fua() {
             if size == 6 && fua {
                 continue;
             }
-            let (disk, state) = new_scsi_disk(512, 4096, 16, false, true, false);
+            let (disk, state) = new_scsi_disk(
+                512, 4096, 16, /* read_only: */ false, /* storage: */ true,
+                /* pr: */ false,
+            );
             state.lock().storage.fill(0x5c);
             let payload: Vec<u8> = (0..1536).map(|index| (index % 251) as u8).collect();
             let memory = GuestMemory::allocate(4096);
@@ -100,7 +103,10 @@ async fn invalid_transfer_ranges_preserve_guest_and_backing_memory() {
     for size in [6, 10, 12, 16] {
         for write in [false, true] {
             for (start, count, buffer_len) in [(16, 1, 512), (15, 2, 1024), (0, 2, 512)] {
-                let (disk, state) = new_scsi_disk(512, 4096, 16, false, true, false);
+                let (disk, state) = new_scsi_disk(
+                    512, 4096, 16, /* read_only: */ false, /* storage: */ true,
+                    /* pr: */ false,
+                );
                 state.lock().storage.fill(0x5c);
                 let memory = GuestMemory::allocate(4096);
                 memory.write_at(0, &[0xa5; 4096]).unwrap();
@@ -134,7 +140,10 @@ async fn invalid_transfer_ranges_preserve_guest_and_backing_memory() {
 async fn relative_transfer_addresses_are_rejected() {
     for size in [10, 12] {
         for write in [false, true] {
-            let (disk, state) = new_scsi_disk(512, 4096, 16, false, true, false);
+            let (disk, state) = new_scsi_disk(
+                512, 4096, 16, /* read_only: */ false, /* storage: */ true,
+                /* pr: */ false,
+            );
             let memory = GuestMemory::allocate(4096);
             let buffers = OwnedRequestBuffers::linear(0, 512, !write);
             let mut request = request(size, write, 0, 1, false);
@@ -156,7 +165,10 @@ async fn relative_transfer_addresses_are_rejected() {
 #[async_test]
 async fn write_variants_respect_read_only_media() {
     for size in [6, 10, 12, 16] {
-        let (disk, state) = new_scsi_disk(512, 4096, 16, true, true, false);
+        let (disk, state) = new_scsi_disk(
+            512, 4096, 16, /* read_only: */ true, /* storage: */ true,
+            /* pr: */ false,
+        );
         let memory = GuestMemory::allocate(4096);
         memory.write_at(0, &[0xa5; 512]).unwrap();
         let buffers = OwnedRequestBuffers::linear(0, 512, false);
@@ -180,7 +192,10 @@ async fn write_variants_respect_read_only_media() {
 #[async_test]
 async fn transfer_memory_faults_return_scsi_errors_without_storage_corruption() {
     for write in [false, true] {
-        let (disk, state) = new_scsi_disk(512, 4096, 16, false, true, false);
+        let (disk, state) = new_scsi_disk(
+            512, 4096, 16, /* read_only: */ false, /* storage: */ true,
+            /* pr: */ false,
+        );
         let memory = GuestMemory::allocate(4096);
         let buffers = OwnedRequestBuffers::linear(8192, 512, !write);
         let result = disk
@@ -199,7 +214,10 @@ async fn transfer_memory_faults_return_scsi_errors_without_storage_corruption() 
 async fn write_same_repeats_only_the_first_sector_and_preserves_neighbors() {
     for size in [10, 16] {
         for fua in [false, true] {
-            let (disk, state) = new_scsi_disk(512, 4096, 16, false, true, false);
+            let (disk, state) = new_scsi_disk(
+                512, 4096, 16, /* read_only: */ false, /* storage: */ true,
+                /* pr: */ false,
+            );
             state.lock().storage.fill(0x5c);
             let memory = GuestMemory::allocate(4096);
             memory.write_at(0, &[0xa5; 4096]).unwrap();
@@ -268,7 +286,9 @@ async fn write_same_invalid_ranges_sizes_and_parameters_preserve_storage() {
             if size == 16 && relative {
                 continue;
             }
-            let (backing, state) = TestDisk::new(512, 4096, 16, false, true);
+            let (backing, state) = TestDisk::new(
+                512, 4096, 16, /* read_only: */ false, /* storage: */ true,
+            );
             let disk = SimpleScsiDisk::new(
                 Disk::new(backing).unwrap(),
                 DiskParameters {
@@ -294,7 +314,9 @@ async fn write_same_invalid_ranges_sizes_and_parameters_preserve_storage() {
 // Expected: Each synchronization and ordinary stop flushes once; start/immediate rejection do not flush.
 #[async_test]
 async fn cache_sync_and_start_stop_have_distinct_flush_effects() {
-    let (disk, state) = new_scsi_disk(512, 4096, 16, false, false, false);
+    let (disk, state) = new_scsi_disk(
+        512, 4096, 16, /* read_only: */ false, /* storage: */ false, /* pr: */ false,
+    );
     let memory = GuestMemory::allocate(4096);
     let buffers = OwnedRequestBuffers::linear(0, 0, false);
     for (operation, immediate, start, expected_calls, success) in [
@@ -327,7 +349,9 @@ async fn cache_sync_and_start_stop_have_distinct_flush_effects() {
 // Expected: A failed flush is reported as a failed command rather than successful durable completion.
 #[async_test]
 async fn cache_flush_errors_are_propagated_to_the_initiator() {
-    let (mut backing, state) = TestDisk::new(512, 4096, 16, false, false);
+    let (mut backing, state) = TestDisk::new(
+        512, 4096, 16, /* read_only: */ false, /* storage: */ false,
+    );
     backing.fail_sync = true;
     let disk = SimpleScsiDisk::new(Disk::new(backing).unwrap(), Default::default());
     let memory = GuestMemory::allocate(4096);

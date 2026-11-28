@@ -11,7 +11,9 @@ use scsi_core::{AsyncScsiDisk, Request};
 use scsidisk_resources::DiskParameters;
 
 fn disk(sectors: u64, enabled: bool) -> SimpleScsiDisk {
-    let (backing, _) = TestDisk::new(512, 512, sectors, false, false);
+    let (backing, _) = TestDisk::new(
+        512, 512, sectors, /* read_only: */ false, /* storage: */ false,
+    );
     SimpleScsiDisk::new(
         Disk::new(backing).unwrap(),
         DiskParameters {

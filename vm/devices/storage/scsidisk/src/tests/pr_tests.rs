@@ -6,7 +6,7 @@
 use super::test_helpers::check_execute_scsi_failed_with_result;
 use super::test_helpers::check_execute_scsi_pass;
 use super::test_helpers::check_execute_scsi_pass_with_tx;
-use super::test_helpers::check_guest_memory;
+use super::test_helpers::check_response;
 use super::test_helpers::make_guest_memory;
 use super::test_helpers::new_scsi_disk;
 use crate::SimpleScsiDisk;
@@ -168,10 +168,6 @@ fn make_pr_out_request_with_service_action(
         cdb: data,
         srb_flags: 0,
     }
-}
-
-fn check_pr_result(guest_mem: &GuestMemory, buff: &Vec<u8>) {
-    check_guest_memory(guest_mem, 0, buff);
 }
 
 fn make_parameter_list_default_flags(
@@ -363,25 +359,38 @@ async fn validate_pr_result(
 
     // read reservations
     let request = make_pr_in_request(scsi::ServiceActionIn::READ_RESERVATIONS, allocation_length);
-    let external_data = OwnedRequestBuffers::new(&[0]);
-    let guest_mem = GuestMemory::allocate(allocation_length);
-    check_execute_scsi_pass(disk, &external_data.buffer(&guest_mem), &request).await;
     make_read_reservations_response(&mut read_reservations_response, generation, ty, key);
-    check_pr_result(&guest_mem, &read_reservations_response);
+    let length = if ty.is_some() {
+        read_reservations_response.len()
+    } else {
+        size_of::<scsi::PriReservationListHeader>()
+    };
+    check_response(
+        disk,
+        request.cdb,
+        allocation_length,
+        &read_reservations_response[..length],
+    )
+    .await;
 
     // read keys
     let request = make_pr_in_request(scsi::ServiceActionIn::READ_KEYS, allocation_length);
-    let external_data = OwnedRequestBuffers::new(&[0]);
-    let guest_mem = GuestMemory::allocate(allocation_length);
-    check_execute_scsi_pass(disk, &external_data.buffer(&guest_mem), &request).await;
     make_read_keys_response(&mut read_keys_response, generation, key);
-    check_pr_result(&guest_mem, &read_keys_response);
+    let length = if key != 0 {
+        read_keys_response.len()
+    } else {
+        size_of::<scsi::PriRegistrationListHeader>()
+    };
+    check_response(
+        disk,
+        request.cdb,
+        allocation_length,
+        &read_keys_response[..length],
+    )
+    .await;
 
     // read full status
     let request = make_pr_in_request(scsi::ServiceActionIn::READ_FULL_STATUS, allocation_length);
-    let external_data = OwnedRequestBuffers::new(&[0]);
-    let guest_mem = GuestMemory::allocate(allocation_length);
-    check_execute_scsi_pass(disk, &external_data.buffer(&guest_mem), &request).await;
     make_read_full_status_response(
         &mut read_full_status_response,
         generation,
@@ -389,23 +398,39 @@ async fn validate_pr_result(
         hold_reservation,
         ty,
     );
-    check_pr_result(&guest_mem, &read_full_status_response);
+    let length = if key != 0 {
+        read_full_status_response.len()
+    } else {
+        size_of::<scsi::PriFullStatusListHeader>()
+    };
+    check_response(
+        disk,
+        request.cdb,
+        allocation_length,
+        &read_full_status_response[..length],
+    )
+    .await;
 
     // report capabilities
     let request = make_pr_in_request(
         scsi::ServiceActionIn::REPORT_CAPABILITIES,
         allocation_length,
     );
-    let external_data = OwnedRequestBuffers::new(&[0]);
-    let guest_mem = GuestMemory::allocate(allocation_length);
-    check_execute_scsi_pass(disk, &external_data.buffer(&guest_mem), &request).await;
     make_report_capabilities_response(&mut report_capabilities_response, aptpl);
-    check_pr_result(&guest_mem, &report_capabilities_response);
+    check_response(
+        disk,
+        request.cdb,
+        allocation_length,
+        &report_capabilities_response,
+    )
+    .await;
 }
 
 // "PersistentResrvation" scenario in scsi compliance tests.
 async fn run_pr_scsi_compliance_with_reserve_type(ty: scsi::ReservationType) {
-    let (disk, _state) = new_scsi_disk(512, 4096, 1024, false, true, true);
+    let (disk, _state) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ true, /* pr: */ true,
+    );
 
     let mut generation = 0;
     let key0 = 0;
@@ -600,6 +625,8 @@ async fn run_pr_scsi_compliance_with_reserve_type(ty: scsi::ReservationType) {
     validate_pr_result(&disk, generation, key2, false, None, false).await;
 }
 
+// Test: Register, reserve, release, clear and preempt using each reservation type.
+// Expected: Keys, generations, holder/type fields and capabilities match every accepted transition.
 #[async_test]
 async fn validate_pr_scsi_compliance() {
     let supported_type = [
@@ -617,7 +644,9 @@ async fn validate_pr_scsi_compliance() {
 }
 
 async fn run_pr_invalid_reserve_type_scope(ty: u8) {
-    let (disk, _state) = new_scsi_disk(512, 4096, 1024, false, true, true);
+    let (disk, _state) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ true, /* pr: */ true,
+    );
 
     let mut generation = 0;
     let key0 = 0;
@@ -772,6 +801,8 @@ async fn run_pr_invalid_reserve_type_scope(ty: u8) {
     validate_pr_result(&disk, generation, key0, false, None, false).await;
 }
 
+// Test: Register keys with invalid type/scope values, then attempt reservation operations.
+// Expected: Registration/clear retain their permitted semantics; invalid reserve/release/preempt fail.
 #[async_test]
 async fn validate_pr_invalid_reserve_type_scope() {
     let invalid_ty = [
@@ -784,9 +815,13 @@ async fn validate_pr_invalid_reserve_type_scope() {
     }
 }
 
+// Test: Submit short, long and unrelated PR OUT parameter-list lengths.
+// Expected: PARAMETER LIST LENGTH rejects each request and leaves registration state unchanged.
 #[async_test]
 async fn validate_pr_out_parameter_list_length() {
-    let (disk, _state) = new_scsi_disk(512, 4096, 1024, false, true, true);
+    let (disk, _state) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ true, /* pr: */ true,
+    );
 
     let generation = 0;
     let key0 = 0;
@@ -864,9 +899,13 @@ async fn validate_pr_out_parameter_list_length() {
     validate_pr_result(&disk, generation, key0, false, None, false).await;
 }
 
+// Test: Provide PR OUT guest buffers one byte shorter or longer than the parameter list.
+// Expected: Short input fails unchanged; larger input accepts the declared list and registers the key.
 #[async_test]
 async fn validate_pr_out_external_data_length() {
-    let (disk, _state) = new_scsi_disk(512, 4096, 1024, false, true, true);
+    let (disk, _state) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ true, /* pr: */ true,
+    );
 
     let mut generation = 0;
     let key0 = 0;
@@ -908,9 +947,13 @@ async fn validate_pr_out_external_data_length() {
     validate_pr_result(&disk, generation, key1, false, None, false).await;
 }
 
+// Test: Set SPECIFY INITIATOR PORTS on a registration request.
+// Expected: INVALID FIELD IN PARAMETER LIST is returned without registering a key.
 #[async_test]
 async fn validate_pr_out_sip() {
-    let (disk, _state) = new_scsi_disk(512, 4096, 1024, false, true, true);
+    let (disk, _state) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ true, /* pr: */ true,
+    );
 
     let generation = 0;
     let key0 = 0;
@@ -948,9 +991,13 @@ async fn validate_pr_out_sip() {
     validate_pr_result(&disk, generation, key0, false, None, false).await;
 }
 
+// Test: Register and replace keys with persistence enabled, then register without persistence.
+// Expected: Capability replies track persistence activation and each accepted registration generation.
 #[async_test]
 async fn validate_pr_out_aptpl() {
-    let (disk, _state) = new_scsi_disk(512, 4096, 1024, false, true, true);
+    let (disk, _state) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ true, /* pr: */ true,
+    );
 
     let mut generation = 0;
     let key0 = 0;
@@ -1009,9 +1056,13 @@ async fn validate_pr_out_aptpl() {
     validate_pr_result(&disk, generation, key1, false, None, false).await;
 }
 
+// Test: Send reserved PR OUT service actions with an otherwise valid parameter list.
+// Expected: Each action returns INVALID CDB without changing reservation state.
 #[async_test]
 async fn validate_pr_out_invalid_service_action() {
-    let (disk, _state) = new_scsi_disk(512, 4096, 1024, false, true, true);
+    let (disk, _state) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ true, /* pr: */ true,
+    );
 
     let generation = 0;
     let key0 = 0;
@@ -1047,9 +1098,13 @@ async fn validate_pr_out_invalid_service_action() {
     validate_pr_result(&disk, generation, key0, false, None, false).await;
 }
 
+// Test: Register, replace and unregister keys through ordinary and ignore-existing actions.
+// Expected: The selected key and generation follow each accepted registration, including zero keys.
 #[async_test]
 async fn validate_pr_out_register() {
-    let (disk, _state) = new_scsi_disk(512, 4096, 1024, false, true, true);
+    let (disk, _state) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ true, /* pr: */ true,
+    );
 
     let mut generation = 0;
     let key0 = 0;
@@ -1117,9 +1172,13 @@ async fn validate_pr_out_register() {
     validate_pr_result(&disk, generation, key0, false, None, false).await;
 }
 
+// Test: Attempt registration and reservation operations with stale keys and conflicting types.
+// Expected: Conflicts report RESERVATION CONFLICT without sense or unintended state changes.
 #[async_test]
 async fn validate_pr_out_reserve_conflict() {
-    let (disk, _state) = new_scsi_disk(512, 4096, 1024, false, true, true);
+    let (disk, _state) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ true, /* pr: */ true,
+    );
 
     let mut generation = 0;
     let key0 = 0;
@@ -1345,9 +1404,13 @@ async fn validate_pr_out_reserve_conflict() {
     validate_pr_result(&disk, generation, key1, true, Some(ty), false).await;
 }
 
+// Test: Release/preempt a reservation with a mismatched type or service-action key.
+// Expected: Invalid requests preserve the reservation, while a valid clear removes it.
 #[async_test]
 async fn validate_pr_out_mismatch_type() {
-    let (disk, _state) = new_scsi_disk(512, 4096, 1024, false, true, true);
+    let (disk, _state) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ true, /* pr: */ true,
+    );
 
     let mut generation = 0;
     let key0 = 0;
@@ -1477,9 +1540,13 @@ async fn validate_pr_out_mismatch_type() {
     validate_pr_result(&disk, generation, key0, false, None, false).await;
 }
 
+// Test: Request reserved PR IN service actions.
+// Expected: INVALID CDB rejects every action with zero transfer.
 #[async_test]
 async fn validate_pr_in_invalid_service_action() {
-    let (disk, _state) = new_scsi_disk(512, 4096, 1024, false, true, true);
+    let (disk, _state) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ true, /* pr: */ true,
+    );
 
     let scsi_result = make_scsi_result(
         ScsiStatus::CHECK_CONDITION,
@@ -1504,9 +1571,13 @@ async fn validate_pr_in_invalid_service_action() {
     }
 }
 
+// Test: Request each PR IN reply with oversized allocation or a header-short allocation.
+// Expected: INVALID CDB rejects both mismatched guest buffers and incomplete reply headers.
 #[async_test]
 async fn validate_pr_in_data_buffer_too_small() {
-    let (disk, _state) = new_scsi_disk(512, 4096, 1024, false, true, true);
+    let (disk, _state) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ true, /* pr: */ true,
+    );
 
     let scsi_result = make_scsi_result(
         ScsiStatus::CHECK_CONDITION,
@@ -1651,7 +1722,7 @@ async fn run_pr_in_truncates_results(
         0u8;
         size_of::<scsi::PriFullStatusListHeader>()
             + size_of::<scsi::PriFullStatusDescriptorHeader>()
-            + 8
+            + 24
     ];
 
     // read reservations
@@ -1663,24 +1734,18 @@ async fn run_pr_in_truncates_results(
     for allocation_length in size_of::<scsi::PriReservationListHeader>()..tx {
         let request =
             make_pr_in_request(scsi::ServiceActionIn::READ_RESERVATIONS, allocation_length);
-        let external_data = OwnedRequestBuffers::new(&[0]);
-        let guest_mem = GuestMemory::allocate(allocation_length);
         println!(
             "read reservations truncated result with allocation_length {}",
             allocation_length
         );
-        check_execute_scsi_pass_with_tx(
+        make_read_reservations_response(&mut read_reservations_response, generation, ty, key);
+        check_response(
             disk,
-            &external_data.buffer(&guest_mem),
-            &request,
-            allocation_length,
+            request.cdb,
+            4096,
+            &read_reservations_response[..allocation_length],
         )
         .await;
-        make_read_reservations_response(&mut read_reservations_response, generation, ty, key);
-        check_pr_result(
-            &guest_mem,
-            &read_reservations_response[..allocation_length].to_vec(),
-        );
     }
 
     // read keys
@@ -1691,24 +1756,18 @@ async fn run_pr_in_truncates_results(
     };
     for allocation_length in size_of::<scsi::PriRegistrationListHeader>()..tx {
         let request = make_pr_in_request(scsi::ServiceActionIn::READ_KEYS, allocation_length);
-        let external_data = OwnedRequestBuffers::new(&[0]);
-        let guest_mem = GuestMemory::allocate(allocation_length);
         println!(
             "read keys truncated result with allocation_length {}",
             allocation_length
         );
-        check_execute_scsi_pass_with_tx(
+        make_read_keys_response(&mut read_keys_response, generation, key);
+        check_response(
             disk,
-            &external_data.buffer(&guest_mem),
-            &request,
-            allocation_length,
+            request.cdb,
+            4096,
+            &read_keys_response[..allocation_length],
         )
         .await;
-        make_read_keys_response(&mut read_keys_response, generation, key);
-        check_pr_result(
-            &guest_mem,
-            &read_keys_response[..allocation_length].to_vec(),
-        );
     }
 
     // read full status
@@ -1720,19 +1779,10 @@ async fn run_pr_in_truncates_results(
     for allocation_length in size_of::<scsi::PriFullStatusListHeader>()..tx {
         let request =
             make_pr_in_request(scsi::ServiceActionIn::READ_FULL_STATUS, allocation_length);
-        let external_data = OwnedRequestBuffers::new(&[0]);
-        let guest_mem = GuestMemory::allocate(allocation_length);
         println!(
             "read full status truncated result with allocation_length {}",
             allocation_length
         );
-        check_execute_scsi_pass_with_tx(
-            disk,
-            &external_data.buffer(&guest_mem),
-            &request,
-            allocation_length,
-        )
-        .await;
         make_read_full_status_response(
             &mut read_full_status_response,
             generation,
@@ -1740,16 +1790,23 @@ async fn run_pr_in_truncates_results(
             hold_reservation,
             ty,
         );
-        check_pr_result(
-            &guest_mem,
-            &read_full_status_response[..allocation_length].to_vec(),
-        );
+        check_response(
+            disk,
+            request.cdb,
+            4096,
+            &read_full_status_response[..allocation_length],
+        )
+        .await;
     }
 }
 
+// Test: Request every partial reservation/key/full-status reply after registration and reservation.
+// Expected: Transfers match allocation, include the correct wire prefix and preserve all guest guards.
 #[async_test]
 async fn validate_pr_in_truncates_results() {
-    let (disk, _state) = new_scsi_disk(512, 4096, 1024, false, true, true);
+    let (disk, _state) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ true, /* pr: */ true,
+    );
 
     let mut generation = 0;
     let key0 = 0;

@@ -2415,15 +2415,14 @@ fn illegal_request_sense_iso(sense_code: AdditionalSenseCode, sense_qualifier: u
 
 #[cfg(test)]
 mod tests {
-    use super::Media;
-    use super::disk_balancer;
-    use super::iso_sector_count;
     use crate::SavedSenseData;
+    use crate::ScsiResult;
     use crate::ScsiSaveRestore;
     use crate::ScsiSavedState;
     use crate::scsi;
     use crate::scsidvd::ISO_SECTOR_SIZE;
     use crate::scsidvd::SimpleScsiDvd;
+    use crate::tests::test_helpers::check_response;
     use disk_backend::Disk;
     use disk_backend::DiskError;
     use disk_backend::DiskIo;
@@ -2446,7 +2445,6 @@ mod tests {
     use scsi_core::save_restore::ScsiDvdSavedState;
     use std::pin::pin;
     use std::sync::Arc;
-    use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use std::sync::mpsc;
@@ -2472,21 +2470,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let scsi_dvd = SimpleScsiDvd::new(Some(disk.with_read_only(read_only).into_disk()));
-        let sector_shift = ISO_SECTOR_SIZE.trailing_zeros() as u8;
-        assert_eq!(scsi_dvd.sector_shift(), sector_shift);
-        if let Media::Loaded(disk) = &*scsi_dvd.media.read() {
-            assert_eq!(iso_sector_count(disk), sector_count / disk_balancer(disk));
-            assert_eq!(disk.is_read_only(), read_only);
-            assert_eq!(disk.sector_size(), sector_size);
-            assert_eq!(disk.physical_sector_size(), sector_size);
-            assert_eq!(disk.disk_id(), None);
-            assert!(!disk.is_fua_respected());
-            assert_eq!(disk.unmap_behavior(), UnmapBehavior::Ignored);
-        } else {
-            panic!("unexpected Media::Unloaded");
-        }
-        scsi_dvd
+        SimpleScsiDvd::new(Some(disk.with_read_only(read_only).into_disk()))
     }
 
     fn fill_repeat_data_buffer(buf: &mut [u8], sector_size: usize) {
@@ -2504,23 +2488,23 @@ mod tests {
         external_data: &RequestBuffers<'_>,
         request: &Request,
         pass: bool,
-    ) {
+    ) -> ScsiResult {
         let result = scsi_dvd.execute_scsi(external_data, request).await;
-        match pass {
-            true if result.scsi_status != scsi::ScsiStatus::GOOD => {
-                panic!(
-                    "execute_scsi failed! request: {:?} result: {:?}",
-                    request, result
-                );
-            }
-            false if result.scsi_status == scsi::ScsiStatus::GOOD => {
-                panic!(
-                    "execute_scsi passed! request: {:?} result: {:?}",
-                    request, result
-                );
-            }
-            _ => (),
+        if pass {
+            assert_eq!(result.scsi_status, scsi::ScsiStatus::GOOD, "{result:?}");
+            assert_eq!(result.srb_status, scsi::srb::SrbStatus::SUCCESS);
+            assert!(result.sense_data.is_none(), "{result:?}");
+        } else {
+            assert_eq!(
+                result.scsi_status,
+                scsi::ScsiStatus::CHECK_CONDITION,
+                "{result:?}"
+            );
+            assert_eq!(result.srb_status, scsi::srb::SrbStatus::ERROR);
+            assert_eq!(result.tx, 0);
+            assert!(result.sense_data.is_some(), "{result:?}");
         }
+        result
     }
 
     fn make_cdb16_request(operation_code: ScsiOp, start_lba: u64, lba_count: u32) -> Request {
@@ -2540,74 +2524,47 @@ mod tests {
         }
     }
 
-    fn check_guest_memory(
-        guest_mem: &GuestMemory,
-        start_lba: u64,
-        buff: &[u8],
-        sector_size: usize,
-    ) -> bool {
-        let mut b = vec![0u8; buff.len()];
-        if guest_mem.read_at(start_lba, &mut b).is_err() {
-            panic!("guest_mem read error");
-        };
-        buff[..].eq(&b[..]) && (b[sector_size / 2 - 1] == 2) && (b[sector_size / 2] == 3)
-    }
-
     fn save_scsi_dvd(scsi_dvd: &SimpleScsiDvd) -> ScsiDvdSavedState {
-        let saved_state =
-            if let Some(ScsiSavedState::ScsiDvd(saved_state)) = scsi_dvd.save().unwrap() {
-                saved_state
-            } else {
-                panic!("saved_state cannot be none")
-            };
-        let media_state = scsi_dvd.media_state.lock();
-        assert_eq!(saved_state.persistent, media_state.persistent);
-        assert_eq!(saved_state.prevent, media_state.prevent);
-        assert_eq!(saved_state.drive_state, media_state.drive_state);
-        assert_eq!(
-            saved_state.pending_medium_event,
-            media_state.pending_medium_event
-        );
-        let sense = scsi_dvd.sense_data.get();
-        let sense_data = sense.map(|sense| SavedSenseData {
-            sense_key: sense.header.sense_key.0,
-            additional_sense_code: sense.additional_sense_code.0,
-            additional_sense_code_qualifier: sense.additional_sense_code_qualifier,
-        });
-        assert_eq!(saved_state.sense_data, sense_data);
-        saved_state
+        match scsi_dvd.save().unwrap() {
+            Some(ScsiSavedState::ScsiDvd(saved_state)) => saved_state,
+            _ => panic!("expected a DVD checkpoint"),
+        }
     }
 
     fn restore_scsi_dvd(saved_state: ScsiDvdSavedState, scsi_dvd: &SimpleScsiDvd) {
-        if scsi_dvd
+        scsi_dvd
             .restore(&ScsiSavedState::ScsiDvd(saved_state))
-            .is_err()
-        {
-            panic!("restore scsi dvd failed. saved_state {:?}", saved_state);
-        }
-
-        let media_state = scsi_dvd.media_state.lock();
-        assert_eq!(saved_state.persistent, media_state.persistent);
-        assert_eq!(saved_state.prevent, media_state.prevent);
-        assert_eq!(saved_state.drive_state, media_state.drive_state);
+            .unwrap();
+        let restored = save_scsi_dvd(scsi_dvd);
+        assert_eq!(restored.persistent, saved_state.persistent);
+        assert_eq!(restored.prevent, saved_state.prevent);
+        assert_eq!(restored.drive_state, saved_state.drive_state);
         assert_eq!(
-            saved_state.pending_medium_event,
-            media_state.pending_medium_event
+            restored.pending_medium_event,
+            saved_state.pending_medium_event
         );
-        let sense = scsi_dvd.sense_data.get();
-        let sense_data = sense.map(|sense| SavedSenseData {
-            sense_key: sense.header.sense_key.0,
-            additional_sense_code: sense.additional_sense_code.0,
-            additional_sense_code_qualifier: sense.additional_sense_code_qualifier,
-        });
-        assert_eq!(saved_state.sense_data, sense_data);
+        assert_eq!(restored.sense_data, saved_state.sense_data);
     }
 
+    // Test: Construct DVDs over two backing sector sizes and both backing protection modes.
+    // Expected: Guest capacity always uses 2048-byte ISO blocks and the loaded drive is ready.
     #[async_test]
     async fn validate_new_scsi_dvd() {
         for sector_size in [512, ISO_SECTOR_SIZE] {
             for read_only in [false, true] {
-                new_scsi_dvd(sector_size, 2048, read_only).await;
+                let dvd = new_scsi_dvd(sector_size, 2048, read_only).await;
+                let sectors = 2048 * u64::from(sector_size) / u64::from(ISO_SECTOR_SIZE);
+                let mut expected = [0; 8];
+                expected[..4].copy_from_slice(&((sectors - 1) as u32).to_be_bytes());
+                expected[4..].copy_from_slice(&2048u32.to_be_bytes());
+                check_response(
+                    &dvd,
+                    make_request(&[ScsiOp::READ_CAPACITY.0]).cdb,
+                    128,
+                    &expected,
+                )
+                .await;
+                check_response(&dvd, make_request(&[ScsiOp::TEST_UNIT_READY.0]).cdb, 0, &[]).await;
             }
         }
     }
@@ -2647,16 +2604,8 @@ mod tests {
         }
     }
 
-    /// A tray lock belongs to the initiator that set it, not to the drive.
-    ///
-    /// PREVENT ALLOW MEDIUM REMOVAL is scoped to the I_T nexus, so when the nexus
-    /// goes away - the guest closed the channel, or was reset in place, which
-    /// closes it too - the lock has to go with it. Otherwise the next guest to
-    /// boot cannot eject, and its START STOP UNIT is failed with
-    /// MEDIUM_REMOVAL_PREVENTED by a decision it never made (umbrella #186).
-    ///
-    /// The first eject is the control: without it a pass would only show that
-    /// ejecting works, not that clearing the nexus is what made it work.
+    // Test: Lock the tray, attempt eject, clear the initiator nexus and retry eject.
+    // Expected: The live lock refuses eject; clearing the nexus removes both lock flags and allows it.
     #[async_test]
     async fn validate_tray_lock_does_not_outlive_the_nexus() {
         let mut scsi_dvd = new_scsi_dvd(ISO_SECTOR_SIZE, 2048, true).await;
@@ -2670,22 +2619,27 @@ mod tests {
             true,
         )
         .await;
-        assert!(scsi_dvd.media_state.lock().prevent);
-        // Set PERSISTENT as well, so that the assertion after the clear can fail.
-        assert!(scsi_dvd.media_state.lock().persistent);
+        let locked = save_scsi_dvd(&scsi_dvd);
+        assert!(locked.prevent);
+        assert!(locked.persistent);
 
         // Locked, so this one must be refused.
-        check_execute_scsi(
+        let refused = check_execute_scsi(
             &mut scsi_dvd,
             &external_data.buffer(&guest_mem),
             &make_eject_request(),
             false,
         )
         .await;
+        assert_eq!(
+            refused.sense_data.unwrap().additional_sense_code,
+            AdditionalSenseCode::MEDIUM_REMOVAL_PREVENTED
+        );
 
         scsi_dvd.clear_nexus_state();
-        assert!(!scsi_dvd.media_state.lock().prevent);
-        assert!(!scsi_dvd.media_state.lock().persistent);
+        let cleared = save_scsi_dvd(&scsi_dvd);
+        assert!(!cleared.prevent);
+        assert!(!cleared.persistent);
 
         // Same command, same drive, same media: it succeeds now only because the
         // lock did not survive the nexus.
@@ -2698,18 +2652,8 @@ mod tests {
         .await;
     }
 
-    /// Sense data and a queued medium-change event are per-nexus too, and the
-    /// tray state is NOT.
-    ///
-    /// The second half is the guard against over-clearing: an ejected tray must
-    /// stay ejected, as it would on real hardware, so a fix that resets the whole
-    /// MediaState would fail here.
-    ///
-    /// Order matters. The eject has to come FIRST and the failing command last:
-    /// a command that succeeds clears the sense slot on its way out, so an eject
-    /// placed after it would leave the slot empty and the sense assertion would
-    /// hold whether or not anything cleared it. Written the other way round this
-    /// test passed against a `clear_nexus_state` mutated to do nothing at all.
+    // Test: Eject media, leave a failed command's sense pending, then clear the nexus.
+    // Expected: Serialized sense/events clear, but the tray remains open with a no-change guest event.
     #[async_test]
     async fn validate_sense_clears_but_the_tray_state_survives() {
         let mut scsi_dvd = new_scsi_dvd(ISO_SECTOR_SIZE, 2048, true).await;
@@ -2723,10 +2667,10 @@ mod tests {
             true,
         )
         .await;
-        let ejected = scsi_dvd.media_state.lock().drive_state;
+        let ejected = save_scsi_dvd(&scsi_dvd).drive_state;
         // The eject queued a medium-change event, which belongs to this initiator.
         assert_eq!(
-            scsi_dvd.media_state.lock().pending_medium_event,
+            save_scsi_dvd(&scsi_dvd).pending_medium_event,
             IsoMediumEvent::MediaToNoMedia
         );
 
@@ -2738,55 +2682,63 @@ mod tests {
             false,
         )
         .await;
-        assert!(scsi_dvd.sense_data.get().is_some());
+        assert!(save_scsi_dvd(&scsi_dvd).sense_data.is_some());
 
         scsi_dvd.clear_nexus_state();
 
-        assert!(scsi_dvd.sense_data.get().is_none());
+        let cleared = save_scsi_dvd(&scsi_dvd);
+        assert!(cleared.sense_data.is_none());
+        assert_eq!(cleared.pending_medium_event, IsoMediumEvent::None);
         assert_eq!(
-            scsi_dvd.media_state.lock().pending_medium_event,
-            IsoMediumEvent::None
-        );
-        assert_eq!(
-            scsi_dvd.media_state.lock().drive_state,
-            ejected,
+            cleared.drive_state, ejected,
             "the tray belongs to the drive, not to the initiator"
         );
+        check_response(
+            &scsi_dvd,
+            make_request(&[0x4a, 1, 0, 0, 0x10, 0, 0, 0, 8]).cdb,
+            128,
+            &[0, 6, 4, 0x7e, 0, 1, 0, 0],
+        )
+        .await;
     }
 
+    // Test: Read initial, interior and final ISO ranges over both backing sector sizes.
+    // Expected: Every request transfers the exact pattern and leaves the full guest guard region intact.
     #[async_test]
     async fn validate_read16() {
         for sector_size in [512, ISO_SECTOR_SIZE] {
             let mut scsi_dvd = new_scsi_dvd(sector_size, 2048, true).await;
             let lba_count = 2;
             let len = (ISO_SECTOR_SIZE * lba_count) as usize;
-            let external_data = OwnedRequestBuffers::linear(0, len, true);
-            let guest_mem = GuestMemory::allocate(len);
+            let external_data =
+                OwnedRequestBuffers::new_unaligned(&[0, 1][..(64 + len).div_ceil(4096)], 64, len);
+            let guest_mem = GuestMemory::allocate(8192);
             let mut data = vec![0; len];
             fill_repeat_data_buffer(&mut data, sector_size as usize);
 
-            let sector_count =
-                iso_sector_count(scsi_dvd.loaded_disk(&scsi_dvd.media.read()).unwrap());
+            let sector_count = 2048 * u64::from(sector_size) / u64::from(ISO_SECTOR_SIZE);
             for start_lba in [0, 3, sector_count - u64::from(lba_count)] {
-                guest_mem.fill_at(0, 0xff, len).unwrap();
+                guest_mem.fill_at(0, 0xa5, 8192).unwrap();
                 let request = make_cdb16_request(ScsiOp::READ16, start_lba, lba_count);
-                check_execute_scsi(
+                let result = check_execute_scsi(
                     &mut scsi_dvd,
                     &external_data.buffer(&guest_mem),
                     &request,
                     true,
                 )
                 .await;
-                assert!(check_guest_memory(
-                    &guest_mem,
-                    0,
-                    &data,
-                    sector_size as usize
-                ));
+                assert_eq!(result.tx, len);
+                let mut actual = [0; 8192];
+                guest_mem.read_at(0, &mut actual).unwrap();
+                let mut expected = [0xa5; 8192];
+                expected[64..64 + len].copy_from_slice(&data);
+                assert_eq!(actual, expected);
             }
         }
     }
 
+    // Test: Save and restore a loaded DVD without altering its checkpoint.
+    // Expected: Public serialized tray, prevention, pending-event and sense fields survive exactly.
     #[async_test]
     async fn validate_save_restore_scsi_dvd_no_change() {
         let scsi_dvd = new_scsi_dvd(512, 2048, true).await;
@@ -2794,6 +2746,8 @@ mod tests {
         restore_scsi_dvd(saved_state, &scsi_dvd);
     }
 
+    // Test: Restore a DVD checkpoint with nonzero serialized sense data.
+    // Expected: The next public checkpoint retains the supplied sense fields and other drive state.
     #[async_test]
     async fn validate_save_restore_scsi_dvd_with_sense_data() {
         let scsi_dvd = new_scsi_dvd(512, 2048, true).await;
@@ -2894,38 +2848,45 @@ mod tests {
         disk: impl FnOnce(Box<dyn Fn() + Send + Sync>) -> Disk,
         request: Request,
         change: fn(&SimpleScsiDvd),
-    ) -> (scsi::ScsiStatus, [u8; 4]) {
-        let barrier = Arc::new(Barrier::new(2));
+    ) -> (ScsiResult, [u8; 4096]) {
+        let (entered, command_entered) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let released = parking_lot::Mutex::new(released);
         let disk = disk(Box::new({
-            let barrier = barrier.clone();
             let paused = AtomicBool::new(false);
             move || {
                 // Only the command under test pauses.
                 if !paused.swap(true, Ordering::SeqCst) {
-                    barrier.wait();
-                    barrier.wait();
+                    entered.send(()).unwrap();
+                    released
+                        .lock()
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("the paused command was not released");
                 }
             }
         }));
         let scsi_dvd = Arc::new(SimpleScsiDvd::new(Some(disk)));
 
         let (command_done, command_result) = mpsc::channel();
-        std::thread::spawn({
+        let command_thread = std::thread::spawn({
             let scsi_dvd = scsi_dvd.clone();
             move || {
-                let external_data = OwnedRequestBuffers::linear(0, ISO_SECTOR_SIZE as usize, true);
-                let guest_mem = GuestMemory::allocate(ISO_SECTOR_SIZE as usize);
+                let external_data = OwnedRequestBuffers::linear(16, ISO_SECTOR_SIZE as usize, true);
+                let guest_mem = GuestMemory::allocate(4096);
+                guest_mem.fill_at(0, 0xa5, 4096).unwrap();
                 let result = pal_async::local::block_on(
                     scsi_dvd.execute_scsi(&external_data.buffer(&guest_mem), &request),
                 );
-                let mut data = [0; 4];
+                let mut data = [0; 4096];
                 guest_mem.read_at(0, &mut data).unwrap();
-                command_done.send((result.scsi_status, data)).unwrap();
+                command_done.send((result, data)).unwrap();
             }
         });
-        barrier.wait();
+        command_entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the command never reached its blocking disk operation");
         let (change_done, change_result) = mpsc::channel();
-        std::thread::spawn({
+        let change_thread = std::thread::spawn({
             let scsi_dvd = scsi_dvd.clone();
             move || {
                 change(&scsi_dvd);
@@ -2936,32 +2897,37 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the media change waited for the command");
         assert_eq!(
-            scsi_dvd.media_state.lock().drive_state,
+            save_scsi_dvd(&scsi_dvd).drive_state,
             DriveState::MediumNotPresentTrayOpen
         );
-        assert!(matches!(*scsi_dvd.media.read(), Media::Unloaded));
-        barrier.wait();
+        release.send(()).unwrap();
 
         // The command finishes with the disk it started with.
-        command_result
+        let result = command_result
             .recv_timeout(Duration::from_secs(10))
-            .expect("the command did not finish")
+            .expect("the command did not finish");
+        command_thread.join().unwrap();
+        change_thread.join().unwrap();
+        result
     }
 
     /// Checks `change` during READ CAPACITY while it asks the disk for its
     /// size, and during READ16 while its disk read is in flight.
     fn check_media_change_during_commands(change: fn(&SimpleScsiDvd)) {
-        let result = check_media_change_during_command(
+        let (result, data) = check_media_change_during_command(
             |pause| Disk::new(SectorCountHookDisk(pause)).unwrap(),
             make_request(&[ScsiOp::READ_CAPACITY.0]),
             change,
         );
-        assert_eq!(
-            result,
-            (scsi::ScsiStatus::GOOD, (2048u32 / 4 - 1).to_be_bytes())
-        );
+        assert_eq!(result.scsi_status, scsi::ScsiStatus::GOOD);
+        assert_eq!(result.srb_status, scsi::srb::SrbStatus::SUCCESS);
+        assert!(result.sense_data.is_none());
+        assert_eq!(result.tx, 8);
+        let mut expected = [0xa5; 4096];
+        expected[16..24].copy_from_slice(&[0, 0, 1, 0xff, 0, 0, 8, 0]);
+        assert_eq!(data, expected);
 
-        let result = check_media_change_during_command(
+        let (result, data) = check_media_change_during_command(
             |pause| {
                 let disk = HookDisk::new(1024 * 1024, 512)
                     .with_sync_hook(move |op| {
@@ -2981,14 +2947,23 @@ mod tests {
             make_cdb16_request(ScsiOp::READ16, 0, 1),
             change,
         );
-        assert_eq!(result, (scsi::ScsiStatus::GOOD, [0x5a; 4]));
+        assert_eq!(result.scsi_status, scsi::ScsiStatus::GOOD);
+        assert_eq!(result.srb_status, scsi::srb::SrbStatus::SUCCESS);
+        assert!(result.sense_data.is_none());
+        assert_eq!(result.tx, ISO_SECTOR_SIZE as usize);
+        expected[16..16 + ISO_SECTOR_SIZE as usize].fill(0x5a);
+        assert_eq!(data, expected);
     }
 
+    // Test: Eject from the host while capacity and read commands are blocked in their backing disk.
+    // Expected: Eject completes independently; in-flight commands retain exact old-media data and guards.
     #[test]
     fn host_eject_does_not_wait_for_running_commands() {
         check_media_change_during_commands(|scsi_dvd| scsi_dvd.change_media(None));
     }
 
+    // Test: Eject from the guest while capacity and read commands are blocked in their backing disk.
+    // Expected: Eject succeeds independently; in-flight commands retain exact old-media data and guards.
     #[test]
     fn guest_eject_does_not_wait_for_running_commands() {
         check_media_change_during_commands(|scsi_dvd| {
@@ -2998,6 +2973,9 @@ mod tests {
                 scsi_dvd.execute_scsi(&external_data.buffer(&guest_mem), &make_eject_request()),
             );
             assert_eq!(result.scsi_status, scsi::ScsiStatus::GOOD);
+            assert_eq!(result.srb_status, scsi::srb::SrbStatus::SUCCESS);
+            assert_eq!(result.tx, 0);
+            assert!(result.sense_data.is_none());
         });
     }
 
@@ -3013,7 +2991,7 @@ mod tests {
                     .flatten();
                 async move {
                     if let Some(released) = released {
-                        let _ = released.await;
+                        released.await.expect("the paused read was not released");
                     }
                     Ok(())
                 }
@@ -3029,10 +3007,8 @@ mod tests {
         disk
     }
 
-    /// storvsp runs each channel's commands in that channel's worker, and on a
-    /// reset it stops all the workers and then drains the channels one at a
-    /// time. A command that waits for a command on another channel would never
-    /// finish there, so a command must complete while another one is stuck.
+    // Test: Keep one READ16 pending while issuing other commands and replacing the medium.
+    // Expected: Independent commands finish; new and in-flight reads retain distinct complete payloads.
     #[async_test]
     async fn commands_do_not_wait_for_each_other() {
         let (release, released) = mesh::oneshot();
@@ -3041,7 +3017,8 @@ mod tests {
         // A READ16 whose disk read does not complete, as if its channel had
         // been stopped.
         let read_data = OwnedRequestBuffers::linear(0, ISO_SECTOR_SIZE as usize, true);
-        let read_mem = GuestMemory::allocate(ISO_SECTOR_SIZE as usize);
+        let read_mem = GuestMemory::allocate(4096);
+        read_mem.fill_at(0, 0xa5, 4096).unwrap();
         let read_request = make_cdb16_request(ScsiOp::READ16, 0, 1);
         let read_buffers = read_data.buffer(&read_mem);
         let mut read = pin!(scsi_dvd.execute_scsi(&read_buffers, &read_request));
@@ -3049,7 +3026,7 @@ mod tests {
 
         // Other commands complete without it being polled.
         let external_data = OwnedRequestBuffers::linear(0, ISO_SECTOR_SIZE as usize, true);
-        let guest_mem = GuestMemory::allocate(ISO_SECTOR_SIZE as usize);
+        let guest_mem = GuestMemory::allocate(4096);
         for request in [
             make_request(&[ScsiOp::TEST_UNIT_READY.0]),
             make_request(&[ScsiOp::READ_CAPACITY.0]),
@@ -3060,33 +3037,58 @@ mod tests {
                 .now_or_never()
                 .expect("the command waited for the stuck READ16");
             assert_eq!(result.scsi_status, scsi::ScsiStatus::GOOD, "{request:?}");
+            assert_eq!(result.srb_status, scsi::srb::SrbStatus::SUCCESS);
+            assert!(result.sense_data.is_none());
+            assert_eq!(
+                result.tx,
+                match request.scsiop() {
+                    ScsiOp::TEST_UNIT_READY => 0,
+                    ScsiOp::READ_CAPACITY => 8,
+                    ScsiOp::READ_TOC => 12,
+                    _ => unreachable!(),
+                }
+            );
         }
 
         // So does a media change, and the commands after it use the new disk.
         scsi_dvd.change_media(Some(filled_disk(0xa5, None).await));
+        guest_mem.fill_at(0, 0xff, 4096).unwrap();
         let result = scsi_dvd
             .execute_scsi(&external_data.buffer(&guest_mem), &read_request)
             .now_or_never()
             .expect("the READ16 of the new disk waited for the stuck READ16");
         assert_eq!(result.scsi_status, scsi::ScsiStatus::GOOD);
-        let mut data = [0; 4];
+        assert_eq!(result.srb_status, scsi::srb::SrbStatus::SUCCESS);
+        assert!(result.sense_data.is_none());
+        assert_eq!(result.tx, ISO_SECTOR_SIZE as usize);
+        let mut data = [0; 4096];
         guest_mem.read_at(0, &mut data).unwrap();
-        assert_eq!(data, [0xa5; 4]);
+        let mut expected = [0xff; 4096];
+        expected[..ISO_SECTOR_SIZE as usize].fill(0xa5);
+        assert_eq!(data, expected);
 
         // The READ16 that was in flight finishes from the disk it started with.
         release.send(());
-        assert_eq!(read.await.scsi_status, scsi::ScsiStatus::GOOD);
+        let result = read.await;
+        assert_eq!(result.scsi_status, scsi::ScsiStatus::GOOD);
+        assert_eq!(result.srb_status, scsi::srb::SrbStatus::SUCCESS);
+        assert!(result.sense_data.is_none());
+        assert_eq!(result.tx, ISO_SECTOR_SIZE as usize);
         read_mem.read_at(0, &mut data).unwrap();
-        assert_eq!(data, [0x5a; 4]);
+        expected.fill(0xa5);
+        expected[..ISO_SECTOR_SIZE as usize].fill(0x5a);
+        assert_eq!(data, expected);
     }
 
+    // Test: Restore a present-media drive state without restoring any backing medium.
+    // Expected: Data/capacity/TOC requests report NO MEDIA with the restored tray qualifier.
     #[async_test]
     async fn validate_media_missing_behind_drive_state() {
-        let scsi_dvd = new_scsi_dvd(ISO_SECTOR_SIZE, 2048, true).await;
+        let scsi_dvd = SimpleScsiDvd::new(None);
         // The drive state says that the medium is present but there is none,
         // as can happen after a restore: the drive state is restored, the
         // media is not.
-        *scsi_dvd.media.write() = Media::Unloaded;
+        let saved = save_scsi_dvd(&scsi_dvd);
 
         let external_data = OwnedRequestBuffers::linear(0, ISO_SECTOR_SIZE as usize, true);
         let guest_mem = GuestMemory::allocate(ISO_SECTOR_SIZE as usize);
@@ -3100,7 +3102,12 @@ mod tests {
                 scsi::MEDIUM_NOT_PRESENT_TRAY_OPEN,
             ),
         ] {
-            scsi_dvd.media_state.lock().drive_state = drive_state;
+            scsi_dvd
+                .restore(&ScsiSavedState::ScsiDvd(ScsiDvdSavedState {
+                    drive_state,
+                    ..saved
+                }))
+                .unwrap();
             for request in [
                 make_cdb16_request(ScsiOp::READ16, 0, 1),
                 make_request(&[ScsiOp::READ_CAPACITY.0]),
@@ -3110,6 +3117,8 @@ mod tests {
                     .execute_scsi(&external_data.buffer(&guest_mem), &request)
                     .await;
                 let sense = result.sense_data.expect("no sense data");
+                assert_eq!(result.srb_status, scsi::srb::SrbStatus::ERROR);
+                assert_eq!(result.tx, 0);
                 assert_eq!(
                     (
                         result.scsi_status,

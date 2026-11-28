@@ -76,7 +76,10 @@ async fn dvd_small_status_replies_have_stable_fields_and_allocation_bounds() {
     check_response(&dvd, cdb, 0, &[]).await;
 }
 
-// Test: Known product bug: request full disc information when zero OPC entries are reported.
+// IGNORED: Disc information currently emits an OPC entry while declaring zero entries.
+//       Keep this regression pending a separate production fix.
+//
+// Test: Request full disc information when zero OPC entries are reported.
 // Expected: The declared 34-byte response is returned without an unadvertised OPC placeholder.
 #[async_test]
 #[ignore = "known product bug: disc information emits an OPC entry despite declaring zero entries"]

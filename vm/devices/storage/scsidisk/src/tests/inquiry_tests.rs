@@ -25,7 +25,9 @@ fn inquiry_request(flags: u8, page: u8, allocation: u16) -> Request {
 }
 
 fn configured_disk(parameters: DiskParameters) -> SimpleScsiDisk {
-    let (disk, _) = TestDisk::new(512, 4096, 1024, false, false);
+    let (disk, _) = TestDisk::new(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ false,
+    );
     SimpleScsiDisk::new(Disk::new(disk).unwrap(), parameters)
 }
 
@@ -195,7 +197,10 @@ async fn microsoft_and_odx_pages_preserve_the_published_wire_contracts() {
 // Expected: The literal disk identity and SPC-3 wire header are truncated correctly without overwrites.
 #[async_test]
 async fn standard_inquiry_wire_image_and_allocation_boundaries() {
-    let (disk, _) = new_scsi_disk(512, 4096, 1024, false, false, false);
+    let (disk, _) = new_scsi_disk(
+        512, 4096, 1024, /* read_only: */ false, /* storage: */ false,
+        /* pr: */ false,
+    );
     let mut expected = [0; 104];
     expected[..8].copy_from_slice(&[0, 0, 5, 2, 99, 0, 0, 2]);
     expected[8..16].copy_from_slice(b"Msft    ");

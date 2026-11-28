@@ -11,7 +11,7 @@ use scsi_core::{AsyncScsiDisk, Request, ScsiResult};
 use scsidisk_resources::DiskParameters;
 
 fn configured_disk(sectors: u64, read_only: bool, parameters: DiskParameters) -> SimpleScsiDisk {
-    let (backing, _) = TestDisk::new(512, 4096, sectors, read_only, false);
+    let (backing, _) = TestDisk::new(512, 4096, sectors, read_only, /* storage: */ false);
     SimpleScsiDisk::new(Disk::new(backing).unwrap(), parameters)
 }
 
@@ -458,7 +458,10 @@ async fn mode_select_rejects_invalid_headers_descriptors_and_saved_pages() {
     }
 }
 
-// Test: Known product bug: select the short caching-page format advertised by this device's MODE SENSE.
+// IGNORED: MODE SELECT currently rejects the short caching page advertised by MODE SENSE.
+//       Keep this regression pending a separate production fix.
+//
+// Test: Select the short caching-page format advertised by this device's MODE SENSE.
 // Expected: Both MODE SELECT forms accept unchanged policy with the advertised page length of ten.
 #[async_test]
 #[ignore = "known product bug: MODE SELECT compares payload page length to the full caching-page size"]

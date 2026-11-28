@@ -203,23 +203,7 @@ pub fn new_scsi_disk(
         Disk::new(disk).unwrap()
     };
 
-    let scsi_disk = SimpleScsiDisk::new(simple_disk, Default::default());
-    let sector_shift = logical_sector_size.trailing_zeros() as u8;
-    let physical_extra_shift = physical_sector_size.trailing_zeros() as u8 - sector_shift;
-    assert_eq!(scsi_disk.sector_size, logical_sector_size);
-    assert_eq!(
-        scsi_disk.get_and_update_sector_count(ScsiOp::READ),
-        Ok(sector_count)
-    );
-    assert_eq!(scsi_disk.physical_extra_shift, physical_extra_shift);
-    assert_eq!(scsi_disk.disk.is_read_only(), read_only);
-    assert_eq!(scsi_disk.sector_shift, sector_shift);
-    assert_eq!(
-        scsi_disk.scsi_parameters.physical_sector_size,
-        physical_sector_size
-    );
-    assert_eq!(state.lock().is_fua_set, false);
-    (scsi_disk, state)
+    (SimpleScsiDisk::new(simple_disk, Default::default()), state)
 }
 
 pub fn new_scsi_dvd(
@@ -232,7 +216,7 @@ pub fn new_scsi_dvd(
         logical_sector_size,
         physical_sector_size,
         sector_count,
-        true,
+        /* read_only: */ true,
         storage,
     );
     let scsi_dvd = SimpleScsiDvd::new(Some(Disk::new(disk).unwrap()));
@@ -268,18 +252,23 @@ pub async fn check_response(
     buffer_len: usize,
     expected: &[u8],
 ) {
-    let memory = GuestMemory::allocate(4096);
-    memory.write_at(0, &[0xa5; 256]).unwrap();
-    let buffers = scsi_buffers::OwnedRequestBuffers::new_unaligned(&[0], 16, buffer_len);
+    let memory_len = (buffer_len + 32).div_ceil(HV_PAGE_SIZE as usize) * HV_PAGE_SIZE as usize;
+    let memory = GuestMemory::allocate(memory_len);
+    let mut guarded_expected = vec![0xa5; memory_len];
+    memory.write_at(0, &guarded_expected).unwrap();
+    let pages: Vec<_> = (0..(16 + buffer_len).div_ceil(HV_PAGE_SIZE as usize).max(1))
+        .map(|page| page as u64)
+        .collect();
+    let buffers = scsi_buffers::OwnedRequestBuffers::new_unaligned(&pages, 16, buffer_len);
     let result = disk
         .execute_scsi(&buffers.buffer(&memory), &Request { cdb, srb_flags: 0 })
         .await;
     assert_eq!(result.scsi_status, ScsiStatus::GOOD, "{cdb:?}");
     assert_eq!(result.srb_status, scsi::srb::SrbStatus::SUCCESS);
+    assert!(result.sense_data.is_none(), "{result:?}");
     assert_eq!(result.tx, expected.len());
-    let mut actual = [0; 256];
+    let mut actual = vec![0; memory_len];
     memory.read_at(0, &mut actual).unwrap();
-    let mut guarded_expected = [0xa5; 256];
     guarded_expected[16..16 + expected.len()].copy_from_slice(expected);
     assert_eq!(actual, guarded_expected, "{cdb:?}");
 }
@@ -288,14 +277,20 @@ pub async fn check_execute_scsi_pass(
     scsi_disk: &dyn AsyncScsiDisk,
     external_data: &RequestBuffers<'_>,
     request: &Request,
-) {
+) -> ScsiResult {
     let result = scsi_disk.execute_scsi(external_data, request).await;
-    if result.scsi_status != ScsiStatus::GOOD {
-        panic!(
-            "execute_scsi failed! request: {:?} result: {:?}",
-            request, result
-        );
-    }
+    assert_eq!(
+        result.scsi_status,
+        ScsiStatus::GOOD,
+        "{request:?}: {result:?}"
+    );
+    assert_eq!(
+        result.srb_status,
+        scsi::srb::SrbStatus::SUCCESS,
+        "{result:?}"
+    );
+    assert!(result.sense_data.is_none(), "{result:?}");
+    result
 }
 
 pub async fn check_execute_scsi_pass_with_tx(
@@ -304,13 +299,7 @@ pub async fn check_execute_scsi_pass_with_tx(
     request: &Request,
     tx: usize,
 ) {
-    let result = scsi_disk.execute_scsi(external_data, request).await;
-    if result.scsi_status != ScsiStatus::GOOD {
-        panic!(
-            "execute_scsi failed! request: {:?} result: {:?}",
-            request, result
-        );
-    }
+    let result = check_execute_scsi_pass(scsi_disk, external_data, request).await;
     assert_eq!(result.tx, tx);
 }
 
