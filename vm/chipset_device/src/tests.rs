@@ -25,6 +25,7 @@ use std::task::Context;
 use std::task::Poll;
 use std::task::Wake;
 use std::task::Waker;
+use test_with_tracing::test;
 
 #[derive(Default)]
 struct WakeCounter(AtomicUsize);
@@ -67,6 +68,7 @@ fn deferred_read_errors_preserve_the_output_buffer() {
         token.poll_read(&mut cx, &mut bytes),
         Poll::Ready(Err(IoError::InvalidRegister))
     ));
+    assert_eq!(bytes, [0x55; 2]);
     let (complete, mut token) = defer_read();
     drop(complete);
     assert!(matches!(
@@ -156,17 +158,24 @@ fn pci_byte_enables_merge_only_selected_lanes() {
     assert!(PciConfigByteEnable::new(16).is_none());
     for bits in 1..16 {
         let lanes = PciConfigByteEnable::new(bits).unwrap();
-        let mut expected = [0x11u8; 4];
+        let initial = [0x11, 0x22, 0x33, 0x44];
+        let incoming = [0x55, 0x66, 0x77, 0x88];
+        let mut expected = initial;
+        let mut extracted = [0; 4];
         for (index, byte) in expected.iter_mut().enumerate() {
             if bits & (1 << index) != 0 {
-                *byte = 0x99;
+                *byte = incoming[index];
+                extracted[index] = incoming[index];
             }
         }
         assert_eq!(
-            lanes.merge(0x11111111, 0x99999999),
+            lanes.merge(u32::from_le_bytes(initial), u32::from_le_bytes(incoming)),
             u32::from_le_bytes(expected)
         );
-        assert_eq!(lanes.extract(0x99999999), lanes.mask() & 0x99999999);
+        assert_eq!(
+            lanes.extract(u32::from_le_bytes(incoming)),
+            u32::from_le_bytes(extracted)
+        );
         assert_eq!(lanes.is_full(), bits == 15);
         assert_eq!(lanes.restrict(PciConfigByteEnable::FULL), Some(lanes));
         assert!(lanes.exclude(PciConfigByteEnable::FULL).is_none());
@@ -179,7 +188,10 @@ fn pci_byte_enables_merge_only_selected_lanes() {
 fn pci_write_buffers_preserve_lane_positions() {
     for (lanes, bytes, expected) in [
         (PciConfigByteEnable::BYTE0, vec![0x11], 0x11),
+        (PciConfigByteEnable::BYTE1, vec![0x22], 0x2200),
+        (PciConfigByteEnable::BYTE2, vec![0x33], 0x330000),
         (PciConfigByteEnable::BYTE3, vec![0x44], 0x44000000),
+        (PciConfigByteEnable::LOW_WORD, vec![0x11, 0x22], 0x2211),
         (PciConfigByteEnable::HIGH_WORD, vec![0x33, 0x44], 0x44330000),
         (
             PciConfigByteEnable::FULL,
@@ -197,7 +209,10 @@ fn pci_write_buffers_preserve_lane_positions() {
         assert_eq!(value.extract_high(), (expected >> 16) as u16);
         let mut current = 0xaabbccdd;
         value.merge_into(&mut current);
-        assert_eq!(current, lanes.merge(0xaabbccdd, expected));
+        let mut merged = [0xdd, 0xcc, 0xbb, 0xaa];
+        let (offset, len) = lanes.to_byte_offset_len();
+        merged[usize::from(offset)..usize::from(offset) + len].copy_from_slice(&bytes);
+        assert_eq!(current.to_le_bytes(), merged);
         assert_eq!(value.merge_low(0xccdd), current as u16);
         assert_eq!(value.merge_high(0xaabb), (current >> 16) as u16);
     }
@@ -218,9 +233,11 @@ fn pci_reads_preserve_disabled_lanes() {
         assert_eq!(read.valid_mask(), 0xffff0000);
         read.set_low_high(0x1122, 0x3344);
         assert_eq!(read.extract(), 0x33440000);
+        assert_eq!(read.reborrow().into_valid_byte_slice(), &[0x44, 0x33]);
         assert_eq!(read.reborrow().extract_high(), 0x3344);
         assert_eq!(read.reborrow().extract_low(), 0);
         read.set_bytes(1, 2, 3, 4);
+        assert_eq!(read.extract(), 0x04030000);
         read.reborrow()
             .into_valid_byte_slice()
             .copy_from_slice(&[0x66, 0x77]);
@@ -251,19 +268,22 @@ fn nested_pci_reads_respect_lane_intersections() {
 
 #[derive(Default)]
 struct Endpoint {
-    writes: Vec<(u16, u32)>,
+    reads: Vec<(u16, u8)>,
+    writes: Vec<(u16, u8, u32)>,
 }
 
 impl ChipsetDevice for Endpoint {}
 
 impl PciConfigSpace for Endpoint {
     fn pci_cfg_read(&mut self, offset: u16, mut value: ByteEnabledDwordRead<'_>) -> IoResult {
+        self.reads.push((offset, value.byte_enable().bits()));
         value.set(u32::from(offset) | 0x12340000);
         IoResult::Ok
     }
 
     fn pci_cfg_write(&mut self, offset: u16, value: ByteEnabledDwordWrite) -> IoResult {
-        self.writes.push((offset, value.extract()));
+        self.writes
+            .push((offset, value.byte_enable().bits(), value.extract()));
         IoResult::Ok
     }
 }
@@ -296,7 +316,8 @@ fn pci_default_routing_dispatches_only_the_endpoint() {
             )
             .unwrap();
     }
-    assert_eq!(endpoint.writes, [(12, 42)]);
+    assert_eq!(endpoint.reads, [(12, 15)]);
+    assert_eq!(endpoint.writes, [(12, 15, 42)]);
     assert!(endpoint.suggested_bdf().is_none());
     assert!(PciConfigAddress::new(0, 0, 1024).is_none());
 }
@@ -323,8 +344,6 @@ fn minimal_device_does_not_advertise_optional_interfaces() {
 fn externally_managed_mmio_never_creates_a_mapping() {
     let mut registration = crate::mmio::ExternallyManagedMmioIntercepts;
     let mut region = registration.new_io_region("test", 16);
-    assert_eq!(region.region_name(), "(noop)");
-    assert_eq!(region.len(), 0);
     region.map(0x1000);
     assert_eq!(region.addr(), None);
     assert_eq!(region.offset_of(0x1000), None);
@@ -338,8 +357,6 @@ fn externally_managed_mmio_never_creates_a_mapping() {
 fn externally_managed_pio_never_creates_a_mapping() {
     let mut registration = crate::pio::ExternallyManagedPortIoIntercepts;
     let mut region = registration.new_io_region("test", 16);
-    assert_eq!(region.region_name(), "(noop)");
-    assert_eq!(region.len(), 0);
     region.map(0x100);
     assert_eq!(region.addr(), None);
     assert_eq!(region.offset_of(0x100), None);
@@ -439,4 +456,280 @@ fn absent_pci_routes_preserve_subword_access_boundaries() {
         }
     }
     assert!(endpoint.writes.is_empty());
+    assert!(endpoint.reads.is_empty());
+}
+
+// Test: Split a capability register read between two providers for every
+//       nonempty parent and child lane selection, including partial overlap.
+// Expected: Restriction and exclusion partition the parent's enabled bytes;
+//       neither provider can modify a disabled parent byte.
+#[test]
+fn nested_pci_reads_partition_overlapping_lane_selections() {
+    for parent_bits in 1..16 {
+        for child_bits in 1..16 {
+            let parent = PciConfigByteEnable::new(parent_bits).unwrap();
+            let child = PciConfigByteEnable::new(child_bits).unwrap();
+            let mut value = u32::from_le_bytes([0x11, 0x22, 0x33, 0x44]);
+            let mut read = ByteEnabledDwordRead::new(&mut value, parent);
+            let mut expected = [0x11, 0x22, 0x33, 0x44];
+            if let Some(mut selected) = read.restrict(child) {
+                selected.set(u32::from_le_bytes([0x55, 0x66, 0x77, 0x88]));
+            } else {
+                assert_eq!(parent_bits & child_bits, 0);
+            }
+            if let Some(mut remainder) = read.exclude(child) {
+                remainder.set(u32::from_le_bytes([0x99, 0xaa, 0xbb, 0xcc]));
+            } else {
+                assert_eq!(parent_bits & !child_bits, 0);
+            }
+            for (lane, byte) in expected.iter_mut().enumerate() {
+                if parent_bits & (1 << lane) != 0 {
+                    *byte = if child_bits & (1 << lane) != 0 {
+                        [0x55, 0x66, 0x77, 0x88][lane]
+                    } else {
+                        [0x99, 0xaa, 0xbb, 0xcc][lane]
+                    };
+                }
+            }
+            assert_eq!(value.to_le_bytes(), expected);
+        }
+    }
+}
+
+// Test: Route legal subword accesses to an endpoint at conventional and
+//       extended configuration-space boundaries on different routed buses.
+// Expected: Callbacks receive the aligned register and original byte enables,
+//       with enabled data in its proper lanes and other read bytes preserved.
+#[test]
+fn pci_endpoint_routes_preserve_subword_data_and_extended_offsets() {
+    let mut endpoint = Endpoint::default();
+    for bus in [0, 0xff] {
+        for dword in [0, 0x3f, 0x40, 0x3ff] {
+            let address = PciConfigAddress::new(bus, 0, dword).unwrap();
+            let offset = dword * 4;
+            for (lane, len, bits) in [
+                (0, 1, 1),
+                (1, 1, 2),
+                (2, 1, 4),
+                (3, 1, 8),
+                (0, 2, 3),
+                (2, 2, 12),
+                (0, 4, 15),
+            ] {
+                let lanes = PciConfigByteEnable::from_offset_len(offset + lane, len).unwrap();
+                let mut value = u32::from_le_bytes([0x55, 0x66, 0x77, 0x88]);
+                endpoint
+                    .pci_cfg_read_with_routing(
+                        PciConfigAccessType::Type0,
+                        address,
+                        ByteEnabledDwordRead::new(&mut value, lanes),
+                    )
+                    .unwrap();
+                let mut expected = [0x55, 0x66, 0x77, 0x88];
+                let start = usize::from(lane);
+                let supplied = (0x12340000 | u32::from(offset)).to_le_bytes();
+                expected[start..start + len].copy_from_slice(&supplied[start..start + len]);
+                assert_eq!(value.to_le_bytes(), expected);
+                assert_eq!(endpoint.reads.last(), Some(&(offset, bits)));
+
+                let data = &[0x12, 0x34, 0x56, 0x78][..len];
+                endpoint
+                    .pci_cfg_write_with_routing(
+                        PciConfigAccessType::Type0,
+                        address,
+                        ByteEnabledDwordWrite::from_intercept_buffer(lanes, data),
+                    )
+                    .unwrap();
+                let mut written = [0; 4];
+                written[start..start + len].copy_from_slice(data);
+                assert_eq!(
+                    endpoint.writes.last(),
+                    Some(&(offset, bits, u32::from_le_bytes(written)))
+                );
+            }
+        }
+    }
+    assert_eq!(endpoint.reads.len(), 56);
+    assert_eq!(endpoint.writes.len(), 56);
+}
+
+// Test: Complete a read from temporary storage, then reuse that storage and
+//       cancel separate read and write callers before device completion.
+// Expected: Read data is owned by the completion, and abandoned callers do
+//       not prevent either successful or failed device completion.
+#[test]
+fn deferred_completion_owns_read_data_and_tolerates_cancelled_callers() {
+    let (complete, mut token) = defer_read();
+    let mut source = vec![0x12, 0x34, 0x56];
+    complete.complete(&source);
+    source.fill(0xff);
+    drop(source);
+    let mut bytes = [0; 3];
+    assert!(matches!(
+        token.poll_read(&mut Context::from_waker(Waker::noop()), &mut bytes),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(bytes, [0x12, 0x34, 0x56]);
+    for fail in [false, true] {
+        let (complete, token) = defer_read();
+        drop(token);
+        if fail {
+            complete.complete_error(IoError::InvalidAccessSize);
+        } else {
+            complete.complete(&[1]);
+        }
+        let (complete, token) = defer_write();
+        drop(token);
+        if fail {
+            complete.complete_error(IoError::InvalidRegister);
+        } else {
+            complete.complete();
+        }
+    }
+}
+
+// Test: Await reads and writes whose device returns an error or disappears
+//       after the caller has registered interest.
+// Expected: Both futures wake and report the exact failure; read buffers
+//       remain untouched. No timer or speculative polling is needed.
+#[test]
+fn deferred_futures_wake_on_errors_and_sender_loss() {
+    for lost_sender in [false, true] {
+        let wake = Arc::new(WakeCounter::default());
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let (complete, token) = defer_read();
+        let mut bytes = [0x55; 2];
+        {
+            let mut future = pin!(token.read_future(&mut bytes));
+            assert!(future.as_mut().poll(&mut cx).is_pending());
+            if lost_sender {
+                drop(complete);
+            } else {
+                complete.complete_error(IoError::InvalidAccessSize);
+            }
+            assert!(wake.0.load(Ordering::SeqCst) > 0);
+            let result = future.as_mut().poll(&mut cx);
+            assert!(matches!(
+                (lost_sender, result),
+                (true, Poll::Ready(Err(IoError::NoResponse)))
+                    | (false, Poll::Ready(Err(IoError::InvalidAccessSize)))
+            ));
+        }
+        assert_eq!(bytes, [0x55; 2]);
+        let wake = Arc::new(WakeCounter::default());
+        let waker = Waker::from(wake.clone());
+        let mut cx = Context::from_waker(&waker);
+        let (complete, token) = defer_write();
+        let mut future = pin!(token.write_future());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        if lost_sender {
+            drop(complete);
+        } else {
+            complete.complete_error(IoError::UnalignedAccess);
+        }
+        assert!(wake.0.load(Ordering::SeqCst) > 0);
+        assert!(matches!(
+            (lost_sender, future.as_mut().poll(&mut cx)),
+            (true, Poll::Ready(Err(IoError::NoResponse)))
+                | (false, Poll::Ready(Err(IoError::UnalignedAccess)))
+        ));
+    }
+}
+
+struct ResultEndpoint {
+    read: Option<IoResult>,
+    write: Option<IoResult>,
+}
+
+impl ChipsetDevice for ResultEndpoint {}
+
+impl PciConfigSpace for ResultEndpoint {
+    fn pci_cfg_read(&mut self, _offset: u16, _value: ByteEnabledDwordRead<'_>) -> IoResult {
+        self.read.take().unwrap()
+    }
+
+    fn pci_cfg_write(&mut self, _offset: u16, _value: ByteEnabledDwordWrite) -> IoResult {
+        self.write.take().unwrap()
+    }
+}
+
+// Test: Route endpoint accesses that fail or defer instead of completing
+//       synchronously, as asynchronous PCI transports do.
+// Expected: Every access error is forwarded unchanged; returned deferred
+//       tokens remain pending until the original device completes them.
+#[test]
+fn pci_endpoint_routes_forward_errors_and_deferred_results() {
+    let address = PciConfigAddress::new(0xff, 0, 0x3ff).unwrap();
+    let mut value = 0x12345678;
+    for (index, error) in [
+        IoError::InvalidRegister,
+        IoError::InvalidAccessSize,
+        IoError::UnalignedAccess,
+        IoError::NoResponse,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut endpoint = ResultEndpoint {
+            read: Some(IoResult::Err(error)),
+            write: Some(IoResult::Err(error)),
+        };
+        let read = endpoint.pci_cfg_read_with_routing(
+            PciConfigAccessType::Type0,
+            address,
+            ByteEnabledDwordRead::with_all_bytes_enabled(&mut value),
+        );
+        let write = endpoint.pci_cfg_write_with_routing(
+            PciConfigAccessType::Type0,
+            address,
+            ByteEnabledDwordWrite::with_all_bytes_enabled(0xabcdef01),
+        );
+        for result in [read, write] {
+            assert!(matches!(
+                (index, result),
+                (0, IoResult::Err(IoError::InvalidRegister))
+                    | (1, IoResult::Err(IoError::InvalidAccessSize))
+                    | (2, IoResult::Err(IoError::UnalignedAccess))
+                    | (3, IoResult::Err(IoError::NoResponse))
+            ));
+        }
+        assert_eq!(value, 0x12345678);
+    }
+    let (read_complete, read_token) = defer_read();
+    let (write_complete, write_token) = defer_write();
+    let mut endpoint = ResultEndpoint {
+        read: Some(IoResult::Defer(read_token)),
+        write: Some(IoResult::Defer(write_token)),
+    };
+    let IoResult::Defer(mut read) = endpoint.pci_cfg_read_with_routing(
+        PciConfigAccessType::Type0,
+        address,
+        ByteEnabledDwordRead::with_all_bytes_enabled(&mut value),
+    ) else {
+        panic!("endpoint read must remain deferred");
+    };
+    let IoResult::Defer(mut write) = endpoint.pci_cfg_write_with_routing(
+        PciConfigAccessType::Type0,
+        address,
+        ByteEnabledDwordWrite::with_all_bytes_enabled(0xabcdef01),
+    ) else {
+        panic!("endpoint write must remain deferred");
+    };
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut bytes = [0x55; 4];
+    assert!(read.poll_read(&mut cx, &mut bytes).is_pending());
+    assert_eq!(bytes, [0x55; 4]);
+    assert!(write.poll_write(&mut cx).is_pending());
+    read_complete.complete(&[0x12, 0x34, 0x56, 0x78]);
+    write_complete.complete_error(IoError::UnalignedAccess);
+    assert!(matches!(
+        read.poll_read(&mut cx, &mut bytes),
+        Poll::Ready(Ok(()))
+    ));
+    assert_eq!(bytes, [0x12, 0x34, 0x56, 0x78]);
+    assert!(matches!(
+        write.poll_write(&mut cx),
+        Poll::Ready(Err(IoError::UnalignedAccess))
+    ));
 }

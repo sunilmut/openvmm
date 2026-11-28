@@ -633,6 +633,7 @@ dependencies = [
  "inspect",
  "mesh",
  "tdisp",
+ "test_with_tracing",
  "vmcore",
  "zerocopy",
 ]

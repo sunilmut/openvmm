@@ -462,7 +462,11 @@ pub trait PciConfigSpace: ChipsetDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
 
+    // Test: Decode byte, word and DWORD accesses and reject invalid requests.
+    // Expected: Legal accesses select their lanes; invalid size and alignment
+    //       remain distinguishable device errors.
     #[test]
     fn byte_enable_from_offset_len_rejects_invalid_accesses() {
         assert_eq!(
@@ -510,8 +514,29 @@ mod tests {
             PciConfigByteEnable::from_offset_len(0, 3),
             Err(IoError::InvalidAccessSize)
         ));
+        for base in [0, 0xfc, 0x100, 0xffc] {
+            for lane in 0..4 {
+                let offset = base + lane;
+                for len in [0, 3, 5, usize::MAX] {
+                    assert!(matches!(
+                        PciConfigByteEnable::from_offset_len(offset, len),
+                        Err(IoError::InvalidAccessSize)
+                    ));
+                }
+                for len in [2, 4] {
+                    if (len == 2 && lane % 2 != 0) || (len == 4 && lane != 0) {
+                        assert!(matches!(
+                            PciConfigByteEnable::from_offset_len(offset, len),
+                            Err(IoError::UnalignedAccess)
+                        ));
+                    }
+                }
+            }
+        }
     }
 
+    // Test: Extract and merge distinct register bytes with subword enables.
+    // Expected: Only selected bytes are read or changed, including upper lanes.
     #[test]
     fn byte_enable_masks_and_merges_lanes() {
         let byte_enable = PciConfigByteEnable::from_offset_len(1, 1).unwrap();
@@ -533,6 +558,8 @@ mod tests {
         assert_eq!(byte_enable.merge(0xaaaa_aaaa, 0x1234_5678), 0x1234_5678);
     }
 
+    // Test: Convert upper-word PCI intercept buffers in both directions.
+    // Expected: Byte order is preserved and lower register bytes are untouched.
     #[test]
     fn byte_enabled_intercept_buffers_copy_selected_lanes() {
         let write = ByteEnabledDwordWrite::from_intercept_buffer(
@@ -549,6 +576,9 @@ mod tests {
         assert_eq!(buffer, [0x66, 0x55]);
     }
 
+    // Test: Decode the bus, device, function and register of a PCI request.
+    // Expected: Packed device/function and DWORD register fields decode to
+    //       the corresponding bus address and aligned byte offset.
     #[test]
     fn config_request_decodes_bdf() {
         let address = PciConfigAddress::new(0x12, 0x1d, 0x40).unwrap();
