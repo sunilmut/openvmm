@@ -797,7 +797,10 @@ impl LoadStoreAtomic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
 
+    // Test: Decode primary instruction groups and reserved selector patterns.
+    // Expected: Allocated selectors map to their ISA group; invalid ones fail.
     #[test]
     fn verify_groups() {
         let check_groups = [
@@ -849,6 +852,9 @@ mod tests {
         }
     }
 
+    // Test: Decode load/store groups across addressing and operand selectors.
+    // Expected: Each encoding maps to its independent expected group, and
+    //       unallocated SIMD combinations are rejected.
     #[test]
     fn verify_load_store_groups() {
         let check_groups = [

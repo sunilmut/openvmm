@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use test_with_tracing::test;
 
 #[derive(Debug)]
 pub enum TestCpuError {
@@ -1042,6 +1043,8 @@ const fn ldapr(size: u8, rn: u8, rt: u8) -> u32 {
 //     0x38000c00 | (imm9 as u32) << 12 | (rn as u32) << 5 | (rt as u32)
 // }
 
+// Test: Load integer and SIMD literals with positive and negative PC offsets.
+// Expected: Values have the requested width/extension and PC advances once.
 #[async_test]
 async fn verify_load_register_literal() {
     let variations = [
@@ -1092,6 +1095,8 @@ async fn verify_load_register_literal() {
     }
 }
 
+// Test: Load unsigned scalar widths with pre/post indexing and SP/XZR operands.
+// Expected: Loaded values are zero extended and the selected base is updated.
 #[async_test]
 async fn verify_load_gp_register_immediate_pre_and_post_index_simple() {
     let variations = [
@@ -1170,6 +1175,8 @@ async fn verify_load_gp_register_immediate_pre_and_post_index_simple() {
     }
 }
 
+// Test: Load unsigned scalar widths using scaled immediate offsets.
+// Expected: The correct value is loaded without modifying the base register.
 #[async_test]
 async fn verify_load_gp_register_immediate_unsigned_simple() {
     let variations = [
@@ -1205,6 +1212,8 @@ async fn verify_load_gp_register_immediate_unsigned_simple() {
     }
 }
 
+// Test: Load scalar widths using positive and negative unscaled immediates.
+// Expected: The selected bytes are zero extended and the base is unchanged.
 #[async_test]
 async fn verify_load_gp_register_unscaled_immediate() {
     let variations = [
@@ -1246,6 +1255,9 @@ async fn verify_load_gp_register_unscaled_immediate() {
     }
 }
 
+// Test: Load signed/unsigned scalar operands using extended register offsets.
+// Expected: Address scaling and extension produce the specified value while
+//       preserving base and offset registers, including SP and XZR aliases.
 #[async_test]
 async fn verify_load_gp_register_register_offset() {
     run_register_offset_variations(|reg_offset, rn, rt| {
@@ -1501,6 +1513,8 @@ where
     }
 }
 
+// Test: Load signed subword operands with pre/post indexing into W/X registers.
+// Expected: Sign extension respects destination width and base writeback.
 #[async_test]
 async fn verify_load_gp_register_immediate_pre_and_post_index_sign_extend() {
     let variations = [
@@ -1588,6 +1602,8 @@ async fn verify_load_gp_register_immediate_pre_and_post_index_sign_extend() {
     }
 }
 
+// Test: Load signed subword operands with scaled unsigned immediate offsets.
+// Expected: W/X extension is correct for both signs and the base is unchanged.
 #[async_test]
 async fn verify_load_gp_register_immediate_unsigned_sign_extend() {
     let variations = [
@@ -1650,6 +1666,8 @@ async fn verify_load_gp_register_immediate_unsigned_sign_extend() {
     }
 }
 
+// Test: Load signed subword operands using positive/negative unscaled offsets.
+// Expected: W/X extension is correct for both signs and the base is unchanged.
 #[async_test]
 async fn verify_load_gp_register_unscaled_immediate_sign_extend() {
     let variations = [
@@ -1712,6 +1730,9 @@ async fn verify_load_gp_register_unscaled_immediate_sign_extend() {
     }
 }
 
+// Test: Perform atomic adds at each width with ordering and SP/XZR variants.
+// Expected: The destination receives the old value and the sized sum preserves
+//       adjacent bytes and the base.
 #[async_test]
 async fn verify_atomic_add() {
     let variations = [(0, 1, 2), (31, 1, 2), (0, 31, 2), (0, 1, 31)];
@@ -1778,6 +1799,8 @@ async fn verify_atomic_add() {
     }
 }
 
+// Test: Perform atomic bit clears across widths, ordering and SP/XZR variants.
+// Expected: Only selected bits change; old-value return and base are preserved.
 #[async_test]
 async fn verify_atomic_clear() {
     let variations = [(0, 1, 2), (31, 1, 2), (0, 31, 2), (0, 1, 31)];
@@ -1844,6 +1867,8 @@ async fn verify_atomic_clear() {
     }
 }
 
+// Test: Perform atomic XOR across widths, ordering and SP/XZR variants.
+// Expected: Only selected bits toggle; old-value return and base are preserved.
 #[async_test]
 async fn verify_atomic_xor() {
     let variations = [(0, 1, 2), (31, 1, 2), (0, 31, 2), (0, 1, 31)];
@@ -1910,6 +1935,8 @@ async fn verify_atomic_xor() {
     }
 }
 
+// Test: Perform atomic OR across widths, ordering and SP/XZR variants.
+// Expected: Only selected bits are set; old-value return and base are preserved.
 #[async_test]
 async fn verify_atomic_or() {
     let variations = [(0, 1, 2), (31, 1, 2), (0, 31, 2), (0, 1, 31)];
@@ -1976,6 +2003,9 @@ async fn verify_atomic_or() {
     }
 }
 
+// Test: Perform signed atomic maxima across widths, ordering and SP/XZR cases.
+// Expected: Signed comparison selects the maximum without changing neighbors
+//       or the base, and the destination receives the original value.
 #[async_test]
 async fn verify_atomic_signed_max() {
     let variations = [(0, 1, 2), (31, 1, 2), (0, 31, 2), (0, 1, 31)];
@@ -2052,6 +2082,9 @@ async fn verify_atomic_signed_max() {
     }
 }
 
+// Test: Perform signed atomic minima across widths, ordering and SP/XZR cases.
+// Expected: Signed comparison selects the minimum without changing neighbors
+//       or the base, and the destination receives the original value.
 #[async_test]
 async fn verify_atomic_signed_min() {
     let variations = [(0, 1, 2), (31, 1, 2), (0, 31, 2), (0, 1, 31)];
@@ -2128,6 +2161,9 @@ async fn verify_atomic_signed_min() {
     }
 }
 
+// Test: Perform unsigned atomic maxima across widths, ordering and SP/XZR cases.
+// Expected: Unsigned comparison selects the maximum while preserving neighbors,
+//       the base, and the original value returned to the destination.
 #[async_test]
 async fn verify_atomic_unsigned_max() {
     let variations = [(0, 1, 2), (31, 1, 2), (0, 31, 2), (0, 1, 31)];
@@ -2199,6 +2235,9 @@ async fn verify_atomic_unsigned_max() {
     }
 }
 
+// Test: Perform unsigned atomic minima across widths, ordering and SP/XZR cases.
+// Expected: Unsigned comparison selects the minimum while preserving neighbors,
+//       the base, and the original value returned to the destination.
 #[async_test]
 async fn verify_atomic_unsigned_min() {
     let variations = [(0, 1, 2), (31, 1, 2), (0, 31, 2), (0, 1, 31)];
@@ -2270,6 +2309,9 @@ async fn verify_atomic_unsigned_min() {
     }
 }
 
+// Test: Perform atomic swaps across widths, ordering and SP/XZR variants.
+// Expected: The sized source replaces memory, returning the old value without
+//       changing neighbors or the base.
 #[async_test]
 async fn verify_atomic_swap() {
     let variations = [(0, 1, 2), (31, 1, 2), (0, 31, 2), (0, 1, 31)];
@@ -2336,6 +2378,8 @@ async fn verify_atomic_swap() {
     }
 }
 
+// Test: Load acquire operands at all scalar widths using general/SP/XZR bases.
+// Expected: The destination receives the sized value; memory/base are unchanged.
 #[async_test]
 async fn verify_atomic_load_acquire() {
     let variations = [(1, 2), (31, 1), (0, 31)];
@@ -2393,6 +2437,8 @@ async fn verify_atomic_load_acquire() {
     }
 }
 
+// Test: Load SIMD scalar/vector widths using positive/negative pre/post offsets.
+// Expected: Upper vector bits clear for narrow loads and base writeback is exact.
 #[async_test]
 async fn verify_load_fp_register_immediate_pre_and_post_index_simple() {
     let variations = [
@@ -2453,6 +2499,8 @@ async fn verify_load_fp_register_immediate_pre_and_post_index_simple() {
     }
 }
 
+// Test: Load SIMD scalar/vector widths using scaled unsigned immediate offsets.
+// Expected: The complete vector has the sized value and the base is unchanged.
 #[async_test]
 async fn verify_load_fp_register_immediate_unsigned_simple() {
     let variations = [
@@ -2496,6 +2544,8 @@ async fn verify_load_fp_register_immediate_unsigned_simple() {
     }
 }
 
+// Test: Load SIMD scalar/vector widths using positive/negative unscaled offsets.
+// Expected: The complete vector has the sized value and the base is unchanged.
 #[async_test]
 async fn verify_load_fp_register_unscaled_immediate() {
     let variations = [
@@ -2539,6 +2589,8 @@ async fn verify_load_fp_register_unscaled_immediate() {
     }
 }
 
+// Test: Load SIMD widths with signed/unsigned extended, scaled register offsets.
+// Expected: Loaded vectors have the requested width with base/offset preserved.
 #[async_test]
 async fn verify_load_fp_register_register_offset() {
     let intercept_state = InterceptState::default();
@@ -2659,6 +2711,8 @@ async fn verify_load_fp_register_register_offset() {
     }
 }
 
+// Test: Load W/X pairs using offset, pre/post indexing and SP/XZR operands.
+// Expected: Both independent values load with exact optional base writeback.
 #[async_test]
 async fn verify_load_gp_register_pair() {
     enum AdjustIndex {
@@ -2842,6 +2896,9 @@ async fn verify_load_gp_register_pair() {
     }
 }
 
+// Test: Load signed word pairs for all operand-sign and indexing combinations.
+// Expected: Each operand independently sign extends to X width, with exact
+//       optional base/SP writeback and discarded XZR results.
 #[async_test]
 async fn verify_load_gp_register_pair_sign_extend() {
     enum AdjustIndex {

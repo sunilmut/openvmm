@@ -4,6 +4,7 @@
 use super::*;
 use aarch64defs::IssDataAbort;
 use aarch64emu::Error;
+use test_with_tracing::test;
 
 fn syndrome(abort: IssDataAbort, il: bool) -> InterceptState {
     InterceptState {
@@ -94,7 +95,8 @@ async fn syndrome_stores_preserve_neighbors_and_zero_register_semantics() {
     }
 }
 
-// IGNORED: Syndrome loads to XZR skip the memory access, hiding access failures
+// IGNORED: Existing entry42 regression, reproduced with the test enabled.
+//       Syndrome loads to XZR skip the memory access, hiding access failures
 //       and any device read side effects.
 //
 // Test: Load XZR through a valid syndrome when the memory access fails.
@@ -260,13 +262,18 @@ async fn borrowed_cpu_atomic_retries_retire_once() {
     cpu.compare_retries = 2;
     state.update_x(0, 7);
     state.update_instruction(ldadd(3, false, false, 0, 1, 2));
-    *cpu.mem_val.lock().await = 11;
+    *cpu.mem_val.lock().await = 0x0123_4567_89ab_cdef_0000_0000_0000_000b;
     Emulator::new(&mut cpu, &InterceptState::default())
         .run()
         .await
         .unwrap();
     assert_eq!(state.x(2), 11);
-    assert_eq!(*cpu.mem_val.lock().await, 18);
+    assert_eq!(
+        *cpu.mem_val.lock().await,
+        0x0123_4567_89ab_cdef_0000_0000_0000_0012
+    );
+    assert_eq!(state.x(0), 7);
+    assert_eq!(state.x(1), 0x8000);
     assert_eq!(state.pc(), 0x1004);
 }
 
@@ -282,7 +289,11 @@ async fn literal_simd_and_prefetch_have_architectural_effects() {
         .run()
         .await
         .unwrap();
-    assert_eq!(state.q(0), *cpu.mem_val.lock().await);
+    assert_eq!(state.q(0), 0x1234_5678_9abc_def0_fedc_ba98_7654_3210);
+    assert_eq!(
+        *cpu.mem_val.lock().await,
+        0x1234_5678_9abc_def0_fedc_ba98_7654_3210
+    );
     cpu.valid_gva = 0;
     state.update_instruction(0xd800_0000); // PRFM literal.
     Emulator::new(&mut cpu, &InterceptState::default())
@@ -398,7 +409,9 @@ async fn unallocated_instruction_fields_are_rejected_without_side_effects() {
     }
 }
 
-// IGNORED: Paired stores write both operands at the first address, overwriting
+// IGNORED: Existing entry42 regression, also recorded by entry24 and reproduced
+//       with this test enabled. Supported paired stores write both operands at
+//       the first address, overwriting
 //       the first value and leaving the second destination unchanged.
 //
 // Test: Store two adjacent general-purpose registers with STP X0, X2, [X1].
@@ -437,4 +450,149 @@ async fn decoded_zero_register_load_preserves_memory_faults() {
         Error::MemoryAccess(0x8000, _, TestCpuError::BadAddress)
     ));
     assert_eq!(state.pc(), 0x1000);
+}
+
+// Test: Load/store at the last valid byte range and one byte beyond it.
+// Expected: Exact-width transfers preserve peers/flags; faults preserve memory,
+//       destination, SP and PC, including pre/post-index writeback.
+#[async_test]
+async fn scalar_access_boundaries_preserve_architectural_peers() {
+    let original = 0x1020_3040_5060_7080_90a0_b0c0_d0e0_f001u128;
+    for (load, store, offset, expected_load, expected_store) in [
+        (
+            0x3940_03e0u32,
+            0x3900_03e0,
+            15,
+            0x10,
+            0x8820_3040_5060_7080_90a0_b0c0_d0e0_f001,
+        ),
+        (
+            0x7940_03e0,
+            0x7900_03e0,
+            14,
+            0x1020,
+            0x7788_3040_5060_7080_90a0_b0c0_d0e0_f001,
+        ),
+        (
+            0xb940_03e0,
+            0xb900_03e0,
+            12,
+            0x1020_3040,
+            0x5566_7788_5060_7080_90a0_b0c0_d0e0_f001,
+        ),
+        (
+            0xf940_03e0,
+            0xf900_03e0,
+            8,
+            0x1020_3040_5060_7080,
+            0x1122_3344_5566_7788_90a0_b0c0_d0e0_f001,
+        ),
+    ] {
+        for (opcode, write) in [(load, false), (store, true)] {
+            for crosses_end in [false, true] {
+                let (mut state, mut cpu) = cpu();
+                let address = 0x8000 + offset + u64::from(crosses_end);
+                state.update_sp(address);
+                state.update_x(0, 0x1122_3344_5566_7788);
+                state.update_x(2, 0xa1a2_a3a4_a5a6_a7a8);
+                state.update_q(0, 0xb1b2_b3b4_b5b6_b7b8_c1c2_c3c4_c5c6_c7c8);
+                state.cpsr.store(0xa000_0000, Ordering::Relaxed);
+                state.update_instruction(opcode);
+                *cpu.mem_val.lock().await = original;
+                let result = Emulator::new(&mut cpu, &InterceptState::default())
+                    .run()
+                    .await;
+                if crosses_end {
+                    assert!(matches!(
+                        *result.unwrap_err(),
+                        Error::MemoryAccess(a, _, TestCpuError::BadAddress)
+                            if a == address
+                    ));
+                    assert_eq!(state.x(0), 0x1122_3344_5566_7788);
+                    assert_eq!(*cpu.mem_val.lock().await, original);
+                    assert_eq!(state.pc(), 0x1000);
+                } else {
+                    result.unwrap();
+                    assert_eq!(
+                        state.x(0),
+                        if write {
+                            0x1122_3344_5566_7788
+                        } else {
+                            expected_load
+                        }
+                    );
+                    assert_eq!(
+                        *cpu.mem_val.lock().await,
+                        if write { expected_store } else { original }
+                    );
+                    assert_eq!(state.pc(), 0x1004);
+                }
+                assert_eq!(state.sp(), address);
+                assert_eq!(state.x(1), 0x8000);
+                assert_eq!(state.x(2), 0xa1a2_a3a4_a5a6_a7a8);
+                assert_eq!(state.q(0), 0xb1b2_b3b4_b5b6_b7b8_c1c2_c3c4_c5c6_c7c8);
+                assert_eq!(u64::from(state.cpsr()), 0xa000_0000);
+            }
+        }
+    }
+    for opcode in [0xf840_8fe0, 0xf840_87e0, 0xf800_8fe0, 0xf800_87e0] {
+        let (mut state, mut cpu) = cpu();
+        state.update_sp(0x800c); // Eight bytes do not fit, with or without +8.
+        state.update_x(0, 0x1122_3344_5566_7788);
+        state.update_instruction(opcode);
+        *cpu.mem_val.lock().await = original;
+        assert!(matches!(
+            *Emulator::new(&mut cpu, &InterceptState::default())
+                .run()
+                .await
+                .unwrap_err(),
+            Error::MemoryAccess(_, _, TestCpuError::BadAddress)
+        ));
+        assert_eq!(state.sp(), 0x800c);
+        assert_eq!(state.x(0), 0x1122_3344_5566_7788);
+        assert_eq!(state.pc(), 0x1000);
+        assert_eq!(*cpu.mem_val.lock().await, original);
+    }
+}
+
+// Test: Load frame/link register pairs when the second read succeeds or faults.
+// Expected: Both distinct payloads load before post-index retirement; a second
+//       read failure preserves both destinations, SP, flags, memory and peers.
+#[async_test]
+async fn pair_load_second_access_fault_preserves_both_destinations() {
+    for second_fault in [false, true] {
+        let (mut state, mut cpu) = cpu();
+        state.update_sp(if second_fault { 0x8008 } else { 0x8000 });
+        state.update_x(29, 0x1111_2222_3333_4444);
+        state.update_x(30, 0x5555_6666_7777_8888);
+        state.update_x(28, 0x9999_aaaa_bbbb_cccc);
+        state.cpsr.store(0x6000_0000, Ordering::Relaxed);
+        state.update_instruction(0xa8c1_7bfd); // LDP X29, X30, [SP], #16.
+        *cpu.mem_val.lock().await = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210;
+        let result = Emulator::new(&mut cpu, &InterceptState::default())
+            .run()
+            .await;
+        if second_fault {
+            assert!(matches!(
+                *result.unwrap_err(),
+                Error::MemoryAccess(0x8010, _, TestCpuError::BadAddress)
+            ));
+            assert_eq!(state.x(29), 0x1111_2222_3333_4444);
+            assert_eq!(state.x(30), 0x5555_6666_7777_8888);
+            assert_eq!(state.sp(), 0x8008);
+            assert_eq!(state.pc(), 0x1000);
+        } else {
+            result.unwrap();
+            assert_eq!(state.x(29), 0xfedc_ba98_7654_3210);
+            assert_eq!(state.x(30), 0x0123_4567_89ab_cdef);
+            assert_eq!(state.sp(), 0x8010);
+            assert_eq!(state.pc(), 0x1004);
+        }
+        assert_eq!(state.x(28), 0x9999_aaaa_bbbb_cccc);
+        assert_eq!(u64::from(state.cpsr()), 0x6000_0000);
+        assert_eq!(
+            *cpu.mem_val.lock().await,
+            0x0123_4567_89ab_cdef_fedc_ba98_7654_3210
+        );
+    }
 }
