@@ -39,7 +39,7 @@ fn register(device: &mut IdeDevice, port: IdeIoPort) -> u8 {
 }
 
 // Enable the bus-master I/O window without starting a transfer.
-fn enable_dma(device: &mut IdeDevice) {
+pub(super) fn enable_dma(device: &mut IdeDevice) {
     for (offset, value) in [
         (HeaderType00::BAR4.0, 0xc000),
         (HeaderType00::STATUS_COMMAND.0, 5),
@@ -50,12 +50,31 @@ fn enable_dma(device: &mut IdeDevice) {
     }
 }
 
-// Test: Save a partially consumed two-sector read, reset, and resume it.
-// Expected: The remaining bytes and following sector match uninterrupted media.
+fn fresh_controller(file: &File, memory: GuestMemory, drive_type: DriveType) -> IdeDevice {
+    let disk = Disk::new(FileDisk::open(file.try_clone().unwrap(), false).unwrap()).unwrap();
+    let media = match drive_type {
+        DriveType::Hard => DriveMedia::hard_disk(disk),
+        DriveType::Optical => DriveMedia::optical_disk(Arc::new(AtapiScsiDisk::new(Arc::new(
+            SimpleScsiDvd::new(Some(disk)),
+        )))),
+    };
+    IdeDevice::new(
+        memory,
+        &mut ExternallyManagedPortIoIntercepts,
+        [Some(media), None],
+        [None, None],
+        LineInterrupt::detached(),
+        LineInterrupt::detached(),
+    )
+    .unwrap()
+}
+
+// Test: Restore a partially consumed two-sector read into a fresh controller.
+// Expected: Its remaining bytes and following sector match uninterrupted media.
 #[async_test]
 async fn hard_disk_read_resumes_at_the_saved_byte_and_sector() {
     let path = IdePath::default();
-    let (mut device, _, contents, geometry) = ide_test_setup(None, DriveType::Hard);
+    let (mut device, file, contents, geometry) = ide_test_setup(None, DriveType::Hard);
     write_command_params(&mut device, &path, 0, 2, Addressing::Lba28Bit, &geometry);
     execute_command(&mut device, &path, IdeCommand::READ_SECTORS.0);
     assert!(check_command_ready(&mut device, &path).await.drq());
@@ -64,7 +83,7 @@ async fn hard_disk_read_resumes_at_the_saved_byte_and_sector() {
         .io_read(IdeIoPort::PRI_DATA.0, &mut actual[..200])
         .unwrap();
     let saved = device.save().unwrap();
-    device.reset().await;
+    device = fresh_controller(&file, GuestMemory::allocate(16384), DriveType::Hard);
     device.restore(saved).unwrap();
     device
         .io_read(IdeIoPort::PRI_DATA.0, &mut actual[200..512])
@@ -138,24 +157,34 @@ fn extended_task_file_high_bytes_do_not_replace_low_bytes() {
     }
 }
 
-// Test: Read through extended sector and block commands from a nonzero LBA.
-// Expected: Both commands return exactly the requested sector and finish cleanly.
+// Test: Read extended sector/block commands at nonzero LBAs, including byte carry.
+// Expected: Each returns the requested sector and advances the task-file address.
 #[async_test]
 async fn extended_pio_reads_return_the_requested_sector() {
     for command in [
         IdeCommand::READ_MULTI_SECTORS_EXT,
         IdeCommand::READ_MULTI_BLOCKS_EXT,
     ] {
-        let path = IdePath::default();
-        let (mut device, _, contents, _) = ide_test_setup(None, DriveType::Hard);
-        address_lba48(&mut device, 3, 1);
-        execute_command(&mut device, &path, command.0);
-        assert!(check_command_ready(&mut device, &path).await.drq());
-        let mut actual = [0; 512];
-        device.io_read(IdeIoPort::PRI_DATA.0, &mut actual).unwrap();
-        assert!(!check_status_loop(&mut device, &path).await.err());
-        assert_eq!(actual, contents.as_bytes()[1536..2048]);
-        assert_eq!(register(&mut device, IdeIoPort::PRI_SECTOR_NUM), 4);
+        for lba in [3, 255] {
+            let path = IdePath::default();
+            let (mut device, _, contents, _) = ide_test_setup(None, DriveType::Hard);
+            address_lba48(&mut device, lba, 1);
+            execute_command(&mut device, &path, command.0);
+            assert!(check_command_ready(&mut device, &path).await.drq());
+            let mut actual = [0; 512];
+            device.io_read(IdeIoPort::PRI_DATA.0, &mut actual).unwrap();
+            assert!(!check_status_loop(&mut device, &path).await.err());
+            let offset = lba as usize * 512;
+            assert_eq!(actual, contents.as_bytes()[offset..offset + 512]);
+            assert_eq!(
+                register(&mut device, IdeIoPort::PRI_SECTOR_NUM),
+                (lba + 1) as u8
+            );
+            assert_eq!(
+                register(&mut device, IdeIoPort::PRI_CYLINDER_LSB),
+                ((lba + 1) >> 8) as u8
+            );
+        }
     }
 }
 
@@ -225,12 +254,12 @@ async fn invalid_media_range_does_not_poison_later_commands() {
     assert_eq!(actual, contents.as_bytes()[..512]);
 }
 
-// Test: Restore an interrupted IDENTIFY response from an optical drive.
+// Test: Restore an interrupted optical IDENTIFY response into a fresh controller.
 // Expected: Its remaining identification bytes match the uninterrupted response.
 #[async_test]
 async fn optical_identification_snapshot_preserves_unread_bytes() {
     let path = IdePath::default();
-    let (mut device, _, _, _) = ide_test_setup(None, DriveType::Optical);
+    let (mut device, file, _, _) = ide_test_setup(None, DriveType::Optical);
     execute_command(&mut device, &path, IdeCommand::IDENTIFY_PACKET_DEVICE.0);
     assert!(get_status(&mut device, &path).drq());
     let mut prefix = [0; 200];
@@ -241,7 +270,7 @@ async fn optical_identification_snapshot_preserves_unread_bytes() {
     device
         .io_read(IdeIoPort::PRI_DATA.0, &mut expected)
         .unwrap();
-    device.reset().await;
+    device = fresh_controller(&file, GuestMemory::allocate(16384), DriveType::Optical);
     device.restore(saved).unwrap();
     let mut actual = [0; 312];
     device.io_read(IdeIoPort::PRI_DATA.0, &mut actual).unwrap();
@@ -252,11 +281,11 @@ async fn optical_identification_snapshot_preserves_unread_bytes() {
 }
 
 // Test: Save an optical INQUIRY response after reading only its first ten bytes.
-// Expected: Restore preserves the response tail and the final packet completion.
+// Expected: A fresh controller preserves its tail and final packet completion.
 #[async_test]
 async fn optical_packet_snapshot_preserves_data_and_completion() {
     let path = IdePath::default();
-    let (mut device, _, _, _) = ide_test_setup(None, DriveType::Optical);
+    let (mut device, file, _, _) = ide_test_setup(None, DriveType::Optical);
     let mut cdb = [0; 12];
     cdb[0] = 0x12;
     cdb[4] = 36;
@@ -269,7 +298,7 @@ async fn optical_packet_snapshot_preserves_data_and_completion() {
     device
         .io_read(IdeIoPort::PRI_DATA.0, &mut expected)
         .unwrap();
-    device.reset().await;
+    device = fresh_controller(&file, GuestMemory::allocate(16384), DriveType::Optical);
     device.restore(saved).unwrap();
     let mut actual = [0; 26];
     device.io_read(IdeIoPort::PRI_DATA.0, &mut actual).unwrap();
@@ -624,4 +653,59 @@ fn alternate_status_preserves_irq_and_regular_status_preserves_the_dma_latch() {
     device.io_read(0xc002, &mut dma_status).unwrap();
     assert_eq!(dma_status[0] & 4, 0);
     assert!(!target.is_high(0));
+}
+
+// Test: Read across CHS track/head and cylinder boundaries using IDENTIFY geometry.
+// Expected: Guest bytes match media and the next task-file address carries into
+//       the next head or cylinder without skipping or duplicating a sector.
+#[async_test]
+async fn chs_reads_cross_track_and_cylinder_boundaries() {
+    let path = IdePath::default();
+    let (mut device, _, contents, _) = ide_test_setup(None, DriveType::Hard);
+    execute_command(&mut device, &path, IdeCommand::IDENTIFY_DEVICE.0);
+    let mut identity = [0; 512];
+    device
+        .io_read(IdeIoPort::PRI_DATA.0, &mut identity)
+        .unwrap();
+    let word = |index: usize| u16::from_le_bytes([identity[index * 2], identity[index * 2 + 1]]);
+    let heads = word(3);
+    let sectors = word(6);
+    assert!(heads > 1 && heads <= 16 && sectors > 1 && sectors <= 255);
+
+    for head in [0, heads - 1] {
+        for (port, value) in [
+            (IdeIoPort::PRI_SECTOR_COUNT, 2),
+            (IdeIoPort::PRI_SECTOR_NUM, sectors as u8),
+            (IdeIoPort::PRI_CYLINDER_LSB, 0),
+            (IdeIoPort::PRI_CYLINDER_MSB, 0),
+            (IdeIoPort::PRI_DEVICE_HEAD, head as u8),
+        ] {
+            device.io_write(port.0, &[value]).unwrap();
+        }
+        execute_command(&mut device, &path, IdeCommand::READ_SECTORS.0);
+        let mut actual = [0; 1024];
+        for sector in actual.chunks_mut(512) {
+            let status = check_command_ready(&mut device, &path).await;
+            assert!(status.drq() && !status.err());
+            device.io_read(IdeIoPort::PRI_DATA.0, sector).unwrap();
+        }
+        let status = check_status_loop(&mut device, &path).await;
+        assert!(!status.err());
+        let offset = (usize::from(head + 1) * usize::from(sectors) - 1) * 512;
+        assert_eq!(actual, contents.as_bytes()[offset..offset + 1024]);
+        assert_eq!(register(&mut device, IdeIoPort::PRI_SECTOR_NUM), 2);
+        assert_eq!(
+            register(&mut device, IdeIoPort::PRI_DEVICE_HEAD) & 0x0f,
+            if head + 1 == heads {
+                0
+            } else {
+                (head + 1) as u8
+            }
+        );
+        assert_eq!(
+            register(&mut device, IdeIoPort::PRI_CYLINDER_LSB),
+            u8::from(head + 1 == heads)
+        );
+        assert_eq!(register(&mut device, IdeIoPort::PRI_CYLINDER_MSB), 0);
+    }
 }

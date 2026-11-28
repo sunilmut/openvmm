@@ -1825,6 +1825,9 @@ mod tests {
     use zerocopy::FromZeros;
     use zerocopy::IntoBytes;
 
+    // Test: Restore pending and idle drive interrupts into fresh controllers.
+    // Expected: IRQ immediately matches the checkpoint without relatching the
+    //       separately acknowledged bus-master interrupt.
     #[async_test]
     async fn restore_updates_interrupt_without_processing_drive_work() {
         use vmcore::line_interrupt::test_helpers::TestLineInterruptTarget;
@@ -1851,6 +1854,7 @@ mod tests {
                 let file = NamedTempFile::new().unwrap();
                 file.as_file().set_len(1024 * 1024).unwrap();
                 let mut source = controller(&file, drive, LineInterrupt::detached());
+                drive_behavior::enable_dma(&mut source);
                 if pending {
                     source
                         .io_write(
@@ -1880,12 +1884,9 @@ mod tests {
                 destination.channels[0].interrupt.set_level(!pending);
                 destination.restore(saved.parse().unwrap()).unwrap();
                 assert_eq!(target.is_high(0), pending);
-                assert!(
-                    !destination.channels[0]
-                        .bus_master_state
-                        .status_reg
-                        .interrupt()
-                );
+                let mut dma_status = [0];
+                destination.io_read(0xc002, &mut dma_status).unwrap();
+                assert_eq!(dma_status[0] & 4, 0);
             }
         }
     }
@@ -2157,14 +2158,6 @@ mod tests {
             .unwrap();
     }
 
-    fn get_dma_state(ide_controller: &mut IdeDevice, dev_path: &IdePath) -> bool {
-        // Returns true if DMA state exists, false if None
-        ide_controller.channels[dev_path.channel as usize]
-            .bus_master_state
-            .dma_state
-            .is_some()
-    }
-
     fn prep_ide_channel(ide_controller: &mut IdeDevice, drive_type: DriveType, dev_path: &IdePath) {
         match drive_type {
             DriveType::Hard => {
@@ -2195,8 +2188,8 @@ mod tests {
         .await
     }
 
-    // IDE Command Tests
-    // Command: WRITE SECTOR(S)
+    // Test: Write four sectors through the ATA data port.
+    // Expected: Every sector reaches the backing file and DRQ clears.
     #[async_test]
     async fn write_sectors_test() {
         const START_SECTOR: u32 = 0;
@@ -2249,6 +2242,8 @@ mod tests {
         }
     }
 
+    // Test: Assert SRST while a PIO write is waiting for guest data.
+    // Expected: The guest sees BSY while that command is pending.
     #[async_test]
     async fn software_reset_test() {
         const START_SECTOR: u32 = 0;
@@ -2282,7 +2277,8 @@ mod tests {
         assert!(status.bsy());
     }
 
-    // Command: READ SECTOR(S)
+    // Test: Read four sectors through word-sized ATA data-port accesses.
+    // Expected: Each byte matches the media across all sector handshakes.
     #[async_test]
     async fn read_sectors_test() {
         const START_SECTOR: u32 = 0;
@@ -2402,19 +2398,22 @@ mod tests {
         assert_eq!(buffer, file_contents.as_bytes()[..buffer.len()]);
     }
 
-    // Command: READ SECTOR(S) - enlightened
+    // Test: Read optical media through the enlightened BIOS packet interface.
+    // Expected: Deferred completion delivers the requested guest bytes.
     #[async_test]
     async fn enlightened_cd_cmd_test() {
         enlightened_cmd_test(DriveType::Optical).await
     }
 
+    // Test: Read hard-disk media through the enlightened BIOS packet interface.
+    // Expected: Deferred completion delivers the requested guest bytes.
     #[async_test]
     async fn enlightened_hdd_cmd_test() {
         enlightened_cmd_test(DriveType::Hard).await
     }
 
-    // Command: READ SECTOR(S) - enlightened
-    // However, provide incomplete PRD table
+    // Test: End the enlightened read descriptor table halfway through a command.
+    // Expected: The described prefix matches media despite an unused next PRD.
     #[async_test]
     async fn enlightened_cmd_test_incomplete_prd() {
         const SECTOR_COUNT: u16 = 8;
@@ -2495,6 +2494,8 @@ mod tests {
         assert_eq!(buffer, file_contents.as_bytes()[..buffer.len()]);
     }
 
+    // Test: Point an enlightened DMA read across the end of guest RAM.
+    // Expected: Completion stops DMA without copying into the valid prefix.
     #[async_test]
     async fn enlightened_cmd_test_dma_boundary_overflow() {
         // Tests a DMA descriptor that starts at a valid address but overflows into invalid memory
@@ -2505,6 +2506,7 @@ mod tests {
         const BYTE_COUNT: u16 = SECTOR_COUNT * protocol::HARD_DRIVE_SECTOR_BYTES as u16;
 
         let test_guest_mem = GuestMemory::allocate(16384);
+        test_guest_mem.write_at(0x3000, &[0x93; 4096]).unwrap();
 
         let table_gpa = 0x1000;
         let data_gpa = 0x3000; // Valid start, but will overflow
@@ -2559,20 +2561,16 @@ mod tests {
             _ => panic!("{:?}", r),
         }
 
-        let dma_state = get_dma_state(&mut ide_device, &dev_path);
-        assert!(
-            !dma_state,
-            "Expected DMA state cleared - transfer from 0x{:x} with {} bytes overflows valid range 0x0-0x3FFF",
-            data_gpa, BYTE_COUNT
-        );
+        assert_enlightened_dma_stopped(&mut ide_device, &dev_path);
+        let mut actual = [0; 4096];
+        test_guest_mem.read_at(0x3000, &mut actual).unwrap();
+        assert_eq!(actual, [0x93; 4096]);
     }
 
+    // Test: Read a sector ending exactly at the end of guest RAM.
+    // Expected: The entire sector reaches RAM; the command and DMA finish.
     #[async_test]
     async fn enlightened_cmd_test_dma_exact_boundary() {
-        // Tests a DMA descriptor that ends exactly at the boundary of valid memory
-        // Guest memory: 0x0000-0x3FFF (16KB)
-        // Descriptor: starts at 0x3E00, requests 512 bytes -> ends at 0x4000 (just past boundary)
-
         const BYTE_COUNT: u16 = 512;
 
         let test_guest_mem = GuestMemory::allocate(16384);
@@ -2584,7 +2582,7 @@ mod tests {
                 table_gpa,
                 &BusMasterDmaDesc {
                     mem_physical_base: data_gpa,
-                    byte_count: BYTE_COUNT, // Ends exactly at boundary + 1
+                    byte_count: BYTE_COUNT, // Exclusive end is 0x4000.
                     unused: 0,
                     end_of_table: 0x80,
                 },
@@ -2610,7 +2608,10 @@ mod tests {
         test_guest_mem.write_plain(0, &eint13_command).unwrap();
 
         let dev_path = IdePath::default();
-        let (mut ide_device, _disk, _file_contents, _geometry) =
+        test_guest_mem
+            .write_at(data_gpa.into(), &[0x93; 512])
+            .unwrap();
+        let (mut ide_device, _disk, file_contents, _geometry) =
             ide_test_setup(Some(test_guest_mem.clone()), DriveType::Hard);
 
         device_select(&mut ide_device, &dev_path).await;
@@ -2630,22 +2631,20 @@ mod tests {
             _ => panic!("{:?}", r),
         }
 
-        let dma_state = get_dma_state(&mut ide_device, &dev_path);
-        assert!(
-            !dma_state,
-            "Expected DMA state cleared - transfer ending at 0x{:x} exceeds valid range",
-            data_gpa + BYTE_COUNT as u32
-        );
+        assert_enlightened_dma_stopped(&mut ide_device, &dev_path);
+        let mut actual = [0; 512];
+        test_guest_mem
+            .read_at(data_gpa.into(), &mut actual)
+            .unwrap();
+        assert_eq!(actual, file_contents.as_bytes()[..512]);
     }
 
+    // Test: Supply a maximum-length PRD that extends beyond mapped guest RAM.
+    // Expected: DMA stops and the mapped destination remains untouched.
     #[async_test]
-    async fn enlightened_cmd_test_dma_integer_overflow() {
-        // Tests a DMA descriptor with byte_count that could cause integer overflow
-        // Guest memory: 0x0000-0x3FFF (16KB)
-        // Descriptor: mem_physical_base = 0x2000, byte_count = 0xFFFF (64KB)
-        // The checked_add should catch this overflow
-
+    async fn enlightened_cmd_test_dma_unmapped_maximum_length() {
         let test_guest_mem = GuestMemory::allocate(16384);
+        test_guest_mem.write_at(0x2000, &[0x93; 8192]).unwrap();
 
         let table_gpa = 0x1000;
         let data_gpa = 0x2000;
@@ -2654,7 +2653,7 @@ mod tests {
                 table_gpa,
                 &BusMasterDmaDesc {
                     mem_physical_base: data_gpa,
-                    byte_count: 0xFFFF, // Maximum 16-bit value - would overflow
+                    byte_count: 0xFFFF,
                     unused: 0,
                     end_of_table: 0x80,
                 },
@@ -2671,7 +2670,7 @@ mod tests {
             result_status: 0,
             lba_low: 0,
             lba_high: 0,
-            block_count: 128, // Arbitrary
+            block_count: 128,
             byte_count,
             data_buffer,
             skip_bytes_head: 0,
@@ -2700,19 +2699,18 @@ mod tests {
             _ => panic!("{:?}", r),
         }
 
-        let dma_state = get_dma_state(&mut ide_device, &dev_path);
-        assert!(
-            !dma_state,
-            "Expected DMA state cleared - large byte_count 0xFFFF should be rejected"
-        );
+        assert_enlightened_dma_stopped(&mut ide_device, &dev_path);
+        let mut actual = [0; 8192];
+        test_guest_mem.read_at(0x2000, &mut actual).unwrap();
+        assert_eq!(actual, [0x93; 8192]);
     }
 
+    // Test: Supply a PRD above mapped RAM whose extent crosses the 32-bit limit.
+    // Expected: DMA stops without wrapping and overwriting low guest RAM.
     #[async_test]
     async fn enlightened_cmd_test_dma_u32_max_overflow() {
-        // Tests a DMA descriptor where mem_physical_base + transfer_bytes_left overflows u32
-        // This tests the checked_add protection against u32 overflow
-
         let test_guest_mem = GuestMemory::allocate(16384);
+        test_guest_mem.write_at(0x2000, &[0x93; 8192]).unwrap();
 
         let table_gpa = 0x1000;
         let data_gpa = 0xFFFF_F000_u32; // Near u32::MAX
@@ -2721,7 +2719,7 @@ mod tests {
                 table_gpa,
                 &BusMasterDmaDesc {
                     mem_physical_base: data_gpa,
-                    byte_count: 0x2000, // Would overflow past u32::MAX
+                    byte_count: 0x2000, // Extent crosses the 32-bit address limit.
                     unused: 0,
                     end_of_table: 0x80,
                 },
@@ -2767,79 +2765,97 @@ mod tests {
             _ => panic!("{:?}", r),
         }
 
-        let dma_state = get_dma_state(&mut ide_device, &dev_path);
-        assert!(
-            !dma_state,
-            "Expected DMA state cleared - checked_add should catch u32 overflow from 0x{:x} + 0x2000",
-            data_gpa
-        );
+        assert_enlightened_dma_stopped(&mut ide_device, &dev_path);
+        let mut actual = [0; 8192];
+        test_guest_mem.read_at(0x2000, &mut actual).unwrap();
+        assert_eq!(actual, [0x93; 8192]);
     }
 
+    // Test: Use a zero PRD byte count with sufficient and insufficient guest RAM.
+    // Expected: Zero means 64 KiB; valid reads deliver media and invalid extents
+    //       stop without changing the mapped destination.
     #[async_test]
     async fn enlightened_cmd_test_dma_zero_byte_count() {
-        // Tests a DMA descriptor with byte_count = 0, which should be treated as 64KB
-        // This could overflow if the base address is high enough
+        for memory_size in [16384, 0x14000] {
+            let test_guest_mem = GuestMemory::allocate(memory_size);
 
-        let test_guest_mem = GuestMemory::allocate(16384);
-
-        let table_gpa = 0x1000;
-        let data_gpa = 0x1000;
-        test_guest_mem
-            .write_plain(
-                table_gpa,
-                &BusMasterDmaDesc {
-                    mem_physical_base: data_gpa,
-                    byte_count: 0, // Treated as 64KB (0x10000)
-                    unused: 0,
-                    end_of_table: 0x80,
-                },
-            )
-            .unwrap();
-
-        let data_buffer = table_gpa as u32;
-        let byte_count = 0;
-
-        let eint13_command = protocol::EnlightenedInt13Command {
-            command: IdeCommand::READ_DMA_ALT,
-            device_head: DeviceHeadReg::new().with_lba(true),
-            flags: 0,
-            result_status: 0,
-            lba_low: 0,
-            lba_high: 0,
-            block_count: 128, // 64KB
-            byte_count,
-            data_buffer,
-            skip_bytes_head: 0,
-            skip_bytes_tail: 0,
-        };
-        test_guest_mem.write_plain(0, &eint13_command).unwrap();
-
-        let dev_path = IdePath::default();
-        let (mut ide_device, _disk, _file_contents, _geometry) =
-            ide_test_setup(Some(test_guest_mem.clone()), DriveType::Hard);
-
-        device_select(&mut ide_device, &dev_path).await;
-        prep_ide_channel(&mut ide_device, DriveType::Hard, &dev_path);
-
-        let r = ide_device.io_write(IdeIoPort::PRI_ENLIGHTENED.0, 0_u32.as_bytes());
-
-        match r {
-            IoResult::Defer(mut deferred) => {
-                poll_fn(|cx| {
-                    ide_device.poll_device(cx);
-                    deferred.poll_write(cx)
-                })
-                .await
+            let table_gpa = 0x1000;
+            let data_gpa = 0x2000;
+            let observed_bytes = if memory_size == 16384 { 8192 } else { 65536 };
+            test_guest_mem
+                .write_at(0x2000, &vec![0x93; observed_bytes])
                 .unwrap();
-            }
-            _ => panic!("{:?}", r),
-        }
+            test_guest_mem
+                .write_plain(
+                    table_gpa,
+                    &BusMasterDmaDesc {
+                        mem_physical_base: data_gpa,
+                        byte_count: 0, // Treated as 64KB (0x10000)
+                        unused: 0,
+                        end_of_table: 0x80,
+                    },
+                )
+                .unwrap();
 
-        let dma_state = get_dma_state(&mut ide_device, &dev_path);
-        assert!(
-            !dma_state,
-            "Expected DMA state cleared - byte_count=0 implies 64KB which exceeds guest memory"
-        );
+            let data_buffer = table_gpa as u32;
+            let byte_count = 0;
+
+            let eint13_command = protocol::EnlightenedInt13Command {
+                command: IdeCommand::READ_DMA_ALT,
+                device_head: DeviceHeadReg::new().with_lba(true),
+                flags: 0,
+                result_status: 0,
+                lba_low: 0,
+                lba_high: 0,
+                block_count: 128, // 64KB
+                byte_count,
+                data_buffer,
+                skip_bytes_head: 0,
+                skip_bytes_tail: 0,
+            };
+            test_guest_mem.write_plain(0, &eint13_command).unwrap();
+
+            let dev_path = IdePath::default();
+            let (mut ide_device, _disk, file_contents, _geometry) =
+                ide_test_setup(Some(test_guest_mem.clone()), DriveType::Hard);
+
+            device_select(&mut ide_device, &dev_path).await;
+            prep_ide_channel(&mut ide_device, DriveType::Hard, &dev_path);
+
+            let r = ide_device.io_write(IdeIoPort::PRI_ENLIGHTENED.0, 0_u32.as_bytes());
+
+            match r {
+                IoResult::Defer(mut deferred) => {
+                    poll_fn(|cx| {
+                        ide_device.poll_device(cx);
+                        deferred.poll_write(cx)
+                    })
+                    .await
+                    .unwrap();
+                }
+                _ => panic!("{:?}", r),
+            }
+
+            assert_enlightened_dma_stopped(&mut ide_device, &dev_path);
+            let mut actual = vec![0; observed_bytes];
+            test_guest_mem
+                .read_at(data_gpa.into(), &mut actual)
+                .unwrap();
+            if memory_size == 16384 {
+                assert_eq!(actual, vec![0x93; observed_bytes]);
+            } else {
+                assert_eq!(actual, file_contents.as_bytes()[..65536]);
+            }
+        }
+    }
+
+    fn assert_enlightened_dma_stopped(device: &mut IdeDevice, path: &IdePath) {
+        drive_behavior::enable_dma(device);
+        let mut status = [0];
+        device.io_read(0xc002, &mut status).unwrap();
+        assert_eq!(status[0] & 1, 0);
+        let status = get_status(device, path);
+        assert!(!status.bsy() && !status.drq());
     }
 
     /// Build the 12-byte ATAPI CDB for PREVENT ALLOW MEDIUM REMOVAL.
@@ -2906,6 +2922,8 @@ mod tests {
     ///
     /// The first eject is the control: without it a pass would only show that
     /// ejecting works, not that the reset is what made it work.
+    // Test: Lock an optical tray, reject eject, then reset the controller.
+    // Expected: The identical eject succeeds only after reset ends the nexus.
     #[async_test]
     async fn atapi_reset_ends_the_nexus() {
         let dev_path = IdePath::default();
@@ -2942,6 +2960,8 @@ mod tests {
     ///
     /// Writing the CDB spawns the I/O synchronously and nothing polls it until
     /// `poll_device` runs, which is what lets the test hold one across the reset.
+    // Test: Reset with an unsupported optical command submitted but unpolled.
+    // Expected: Polling after reset cannot publish the cancelled error result.
     #[async_test]
     async fn atapi_reset_drops_the_command_left_in_flight() {
         let dev_path = IdePath::default();
@@ -2985,6 +3005,8 @@ mod tests {
     /// It takes its own path (`handle_soft_reset`) and never reaches the drive
     /// reset above, so covering only that one would leave the command a guest
     /// actually issues after an error still carrying the previous lock.
+    // Test: Lock an optical tray and issue ATA DEVICE RESET after refused eject.
+    // Expected: The same eject succeeds after that reset ends the nexus.
     #[async_test]
     async fn atapi_device_reset_command_ends_the_nexus() {
         let dev_path = IdePath::default();
@@ -3014,6 +3036,8 @@ mod tests {
 
     /// A software reset (SRST through the device control register) is the path a
     /// guest driver takes, so it is pinned separately from the two above.
+    // Test: Lock an optical tray and assert SRST after refused eject.
+    // Expected: Software reset releases the prior initiator's tray lock.
     #[async_test]
     async fn atapi_software_reset_ends_the_nexus() {
         let dev_path = IdePath::default();
@@ -3035,6 +3059,8 @@ mod tests {
         assert!(!status.err(), "the tray lock outlived the software reset");
     }
 
+    // Test: Fetch the optical IDENTIFY response through the ATA data port.
+    // Expected: Its wire identification, capabilities and timing words match.
     #[async_test]
     async fn identify_test_cd() {
         let dev_path = IdePath::default();
@@ -3087,6 +3113,8 @@ mod tests {
         assert_eq!(features.as_bytes(), ex_features.as_bytes());
     }
 
+    // Test: Fetch the hard-disk IDENTIFY response through the ATA data port.
+    // Expected: Geometry, capacity and advertised capability words match media.
     #[async_test]
     async fn identify_test_hdd() {
         let dev_path = IdePath::default();
@@ -3193,6 +3221,8 @@ mod tests {
     /// hang. Before the fix, this would start async disk IO that produces
     /// a PIO buffer on completion. The DMA engine can't drain a PIO buffer,
     /// so the deferred write completion check (!(bsy || drq)) never passes.
+    // Test: Submit a PIO command to the DMA-only enlightened BIOS interface.
+    // Expected: It returns synchronously rather than an undrainable deferred I/O.
     #[async_test]
     async fn enlightened_hdd_non_dma_cmd_completes() {
         let test_guest_mem = GuestMemory::allocate(16384);
@@ -3268,6 +3298,8 @@ mod tests {
     /// "command is already pending on this drive, ignoring enlightened
     /// command"); after the fix the command is serviced (`Defer`) and the
     /// slave disk's data is read.
+    // Test: Target an enlightened slave read while the optical master awaits CDB.
+    // Expected: The slave's media reaches guest RAM despite the master's DRQ.
     #[async_test]
     async fn enlightened_wrong_drive_head_toctou() {
         const SECTOR_COUNT: u16 = 4;
