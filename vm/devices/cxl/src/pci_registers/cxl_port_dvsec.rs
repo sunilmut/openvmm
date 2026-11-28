@@ -368,6 +368,7 @@ mod tests {
     use pci_core::spec::caps::dvsec::DvsecExtendedCapabilityHeader;
     use pci_core::test_helpers::read_extended_cap_u32;
     use pci_core::test_helpers::write_extended_cap_u32;
+    use test_with_tracing::test;
     use vmcore::save_restore::SaveRestore;
 
     use super::CxlPortDvsecControl;
@@ -375,6 +376,8 @@ mod tests {
     use super::CxlPortDvsecRegisterOffset;
     use super::CxlPortDvsecStatus;
 
+    // Test: Read port DVSEC identification headers.
+    // Expected: Vendor, length, revision and port-extension ID match the protocol.
     #[test]
     fn header_registers_match_required_constants() {
         let cap = CxlPortDvsecExtendedCapability::new();
@@ -392,12 +395,16 @@ mod tests {
         );
     }
 
+    // Test: Identify the port capability for save/restore routing.
+    // Expected: Its label remains cxl_port_dvsec.
     #[test]
     fn label_is_cxl_port_dvsec() {
         let cap = CxlPortDvsecExtendedCapability::new();
         assert_eq!(cap.label(), "cxl_port_dvsec");
     }
 
+    // Test: Request optional UIO and viral control without corresponding support.
+    // Expected: Both unsupported control bits remain zero.
     #[test]
     fn unsupported_optional_control_bits_are_forced_zero() {
         let mut cap = CxlPortDvsecExtendedCapability::new();
@@ -420,6 +427,8 @@ mod tests {
         assert!(!control.viral_enable());
     }
 
+    // Test: Clear viral status on a port configured with viral support.
+    // Expected: The write-one-to-clear request clears guest-visible viral status.
     #[test]
     fn status_viral_rw1c_is_gated_by_support() {
         let mut cap = CxlPortDvsecExtendedCapability::new().with_viral_support(true);
@@ -444,6 +453,8 @@ mod tests {
         assert!(!status.viral_status());
     }
 
+    // Test: Write viral status with only the low header byte lanes enabled.
+    // Expected: The disabled status lanes preserve viral status.
     #[test]
     fn status_rw1c_ignores_disabled_byte_lanes() {
         let mut cap = CxlPortDvsecExtendedCapability::new().with_viral_support(true);
@@ -463,6 +474,8 @@ mod tests {
         assert!(status.viral_status());
     }
 
+    // Test: Save a configured port and restore into a fresh default port.
+    // Expected: All guest-visible DWORDs match independent masked wire values.
     #[test]
     fn save_restore_round_trips_state() {
         let mut cap = CxlPortDvsecExtendedCapability::new()
@@ -509,6 +522,19 @@ mod tests {
         let saved = cap.save().expect("save should succeed");
         let mut restored = CxlPortDvsecExtendedCapability::new();
         restored.restore(saved).expect("restore should succeed");
+        for (offset, expected) in [
+            (0x08, 0x4001_0003),
+            (0x0c, 0xa55a_001f),
+            (0x10, 0x1230_5670),
+            (0x14, 0x9ab0_def0),
+            (0x18, 0x1020_3040),
+            (0x1c, 0x5060_7080),
+            (0x20, 0x3fff_e001),
+            (0x24, 0x1111_2222),
+        ] {
+            assert_eq!(read_extended_cap_u32(&cap, offset), expected);
+            assert_eq!(read_extended_cap_u32(&restored, offset), expected);
+        }
 
         assert_eq!(
             read_extended_cap_u32(
@@ -581,5 +607,11 @@ mod tests {
             ),
             read_extended_cap_u32(&cap, CxlPortDvsecRegisterOffset::DVSEC_CXL_RCRB_BASE_HIGH.0)
         );
+        write_extended_cap_u32(&mut restored, 0x08, 0x4000_0000);
+        assert_eq!(read_extended_cap_u32(&restored, 0x08), 0x0001_0003);
+        write_extended_cap_u32(&mut restored, 0x0c, 0xa55a_4010);
+        assert_eq!(read_extended_cap_u32(&restored, 0x0c), 0xa55a_4010);
+        assert_eq!(read_extended_cap_u32(&cap, 0x08), 0x4001_0003);
+        assert_eq!(read_extended_cap_u32(&cap, 0x0c), 0xa55a_001f);
     }
 }

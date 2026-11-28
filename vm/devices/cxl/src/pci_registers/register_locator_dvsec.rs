@@ -258,6 +258,7 @@ mod tests {
     use pci_core::capabilities::extended::PciExtendedCapability;
     use pci_core::spec::caps::dvsec::DvsecExtendedCapabilityHeader;
     use pci_core::test_helpers::read_extended_cap_u32;
+    use test_with_tracing::test;
     use vmcore::save_restore::SaveRestore;
 
     use super::CxlRegisterLocatorDvsecExtendedCapability;
@@ -267,6 +268,8 @@ mod tests {
     use super::RegisterLocatorConfigError;
     use cxl_spec::CXL_COMPONENT_REGISTERS_SIZE_BYTES;
 
+    // Test: Discover a locator with three configured register blocks.
+    // Expected: The vendor header includes all blocks and identifies locator DVSEC.
     #[test]
     fn header_registers_match_required_constants() {
         let cap = CxlRegisterLocatorDvsecExtendedCapability::new()
@@ -300,12 +303,16 @@ mod tests {
         );
     }
 
+    // Test: Identify the locator capability for save/restore routing.
+    // Expected: Its label remains register_locator_dvsec.
     #[test]
     fn label_is_register_locator_dvsec() {
         let cap = CxlRegisterLocatorDvsecExtendedCapability::new();
         assert_eq!(cap.label(), "register_locator_dvsec");
     }
 
+    // Test: Configure a register block at a non-64-KiB-aligned offset.
+    // Expected: Configuration returns RegisterBlockOffsetUnaligned.
     #[test]
     fn unaligned_register_block_offset_is_rejected() {
         let result = CxlRegisterLocatorDvsecExtendedCapability::new().with_register_block(
@@ -319,6 +326,8 @@ mod tests {
         ));
     }
 
+    // Test: Discover two register blocks with distinct BAR/block identifiers.
+    // Expected: Each locator DWORD encodes its own BAR, identifier and offset.
     #[test]
     fn register_block_entries_are_encoded() {
         let cap = CxlRegisterLocatorDvsecExtendedCapability::new()
@@ -359,25 +368,38 @@ mod tests {
         );
     }
 
+    // Test: Restore two locator entries into a fresh empty locator capability.
+    // Expected: Header length and every low/high offset DWORD restore independently.
     #[test]
     fn save_restore_round_trips_state() {
         let mut cap = CxlRegisterLocatorDvsecExtendedCapability::new()
             .with_register_block(
                 CxlRegisterLocatorRegisterBir::BAR_10H,
                 CxlRegisterLocatorRegisterBlockIdentifier::COMPONENT_REGISTERS,
-                CXL_COMPONENT_REGISTERS_SIZE_BYTES,
+                0x1234_0001_0000,
             )
             .expect("block should configure")
             .with_register_block(
                 CxlRegisterLocatorRegisterBir::BAR_1CH,
                 CxlRegisterLocatorRegisterBlockIdentifier::CHMU_REGISTERS,
-                CXL_COMPONENT_REGISTERS_SIZE_BYTES * 4,
+                0x5678_0004_0000,
             )
             .expect("block should configure");
 
         let saved = cap.save().expect("save should succeed");
         let mut restored = CxlRegisterLocatorDvsecExtendedCapability::new();
         restored.restore(saved).expect("restore should succeed");
+        for (offset, expected) in [
+            (0x04, 0x01c0_1e98),
+            (0x08, 8),
+            (0x0c, 0x0001_0100),
+            (0x10, 0x1234),
+            (0x14, 0x0004_0503),
+            (0x18, 0x5678),
+        ] {
+            assert_eq!(read_extended_cap_u32(&cap, offset), expected);
+            assert_eq!(read_extended_cap_u32(&restored, offset), expected);
+        }
 
         assert_eq!(
             read_extended_cap_u32(&restored, DvsecExtendedCapabilityHeader::DVSEC_HEADER1.0),
@@ -412,6 +434,8 @@ mod tests {
         );
     }
 
+    // Test: Reset a configured register locator.
+    // Expected: The discovery header and configured register-block entry survive.
     #[test]
     fn reset_preserves_configured_register_blocks() {
         let mut cap = CxlRegisterLocatorDvsecExtendedCapability::new()

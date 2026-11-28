@@ -8,6 +8,7 @@ use chipset_device::mmio::{ControlMmioIntercept, MmioIntercept, RegisterMmioInte
 use chipset_device::pci::{ByteEnabledDwordRead, ByteEnabledDwordWrite, PciConfigSpace};
 use cxl_spec::component_registers::hdm_decoder::*;
 use futures::executor::block_on;
+use test_with_tracing::test;
 use vmcore::device_state::ChangeDeviceState;
 use vmcore::save_restore::{SaveError, SaveRestore};
 
@@ -148,7 +149,7 @@ fn program_decoder(device: &mut CxlTestDevice, cap: u16, size: u64) {
 }
 
 // Test: Construct endpoints with zero, unaligned, and excessive memory sizes.
-// Expected: Invalid requests fail before registering any MMIO region.
+// Expected: Invalid requests return size-specific errors before registering MMIO.
 #[test]
 fn endpoint_rejects_invalid_memory_sizes() {
     struct RejectRegistration;
@@ -157,9 +158,22 @@ fn endpoint_rejects_invalid_memory_sizes() {
             panic!("invalid construction must not register memory")
         }
     }
-    for size in [0, 1, SIZE - 1, 5 * 1024 * 1024 * 1024] {
-        assert!(CxlTestDevice::new(&mut RejectRegistration, size).is_err());
+    for size in [0, 1, SIZE - 1] {
+        let error = CxlTestDevice::new(&mut RejectRegistration, size)
+            .err()
+            .expect("invalid size must fail");
+        assert_eq!(
+            error.to_string(),
+            format!("invalid HDM size {size:#x}; expected non-zero and 256MiB aligned")
+        );
     }
+    let error = CxlTestDevice::new(&mut RejectRegistration, 5 * 1024 * 1024 * 1024)
+        .err()
+        .expect("excessive size must fail");
+    assert_eq!(
+        error.to_string(),
+        "HDM size 0x140000000 exceeds test-device limit 0x100000000; reduce --cxl-test mem:<len>"
+    );
 }
 
 // Test: Configure endpoint memory through PCI and MMIO, then stop and reset it.
@@ -199,15 +213,28 @@ fn endpoint_memory_obeys_decoder_enable_bounds_and_reset() {
     ));
     assert_eq!(bytes, [1, 2, 3, 4]);
     for address in [HDM - 1, HDM + SIZE - 2, u64::MAX] {
+        let mut rejected = [0xa5; 4];
         assert!(matches!(
-            device.mmio_read(address, &mut bytes),
+            device.mmio_read(address, &mut rejected),
             IoResult::Err(IoError::InvalidRegister)
         ));
+        assert_eq!(rejected, [0xa5; 4]);
         assert!(matches!(
-            device.mmio_write(address, &bytes),
+            device.mmio_write(address, &[0xff; 4]),
             IoResult::Err(IoError::InvalidRegister)
         ));
     }
+    let mut neighbors = [0xa5; 8];
+    assert!(matches!(
+        device.mmio_read(HDM + 4, &mut neighbors),
+        IoResult::Ok
+    ));
+    assert_eq!(neighbors, [0, 0, 0, 1, 2, 3, 4, 0]);
+    assert!(matches!(
+        device.mmio_read(HDM + SIZE - 4, &mut bytes),
+        IoResult::Ok
+    ));
+    assert_eq!(bytes, [0; 4]);
     write_register(&mut device, cap + CXL_HDM_DECODER_GLOBAL_CONTROL_OFFSET, 0);
     assert!(matches!(
         device.mmio_read(HDM, &mut bytes),

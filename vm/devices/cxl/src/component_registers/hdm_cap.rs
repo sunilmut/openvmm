@@ -552,6 +552,7 @@ mod save_restore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
     use vmcore::save_restore::SaveRestore;
 
     fn fixed_config() -> CxlHdmDecoderFixedConfig {
@@ -563,6 +564,8 @@ mod tests {
         }
     }
 
+    // Test: Advertise one fixed decoder in the component capability directory.
+    // Expected: Type, version, length and decoder-count encoding describe one range.
     #[test]
     fn metadata_and_capability_dword() {
         let mut cap = CxlHdmDecoderCapability::new().expect("new should succeed");
@@ -584,6 +587,8 @@ mod tests {
         assert_eq!(cap_dword & 0xF, 0x0);
     }
 
+    // Test: Read a fixed decoder's control register.
+    // Expected: Commit, committed and lock-on-commit are all set.
     #[test]
     fn fixed_decoder_control_exposes_read_only_committed_state() {
         let mut cap = CxlHdmDecoderCapability::new().expect("new should succeed");
@@ -598,6 +603,8 @@ mod tests {
         assert_ne!(control & (1u32 << 10), 0);
     }
 
+    // Test: Attempt to change a fixed decoder's base and control registers.
+    // Expected: Both writes are rejected and the original base remains intact.
     #[test]
     fn fixed_decoder_rejects_programming_writes() {
         let mut cap = CxlHdmDecoderCapability::new().expect("new should succeed");
@@ -613,24 +620,54 @@ mod tests {
         assert_eq!(base_high, 0x0);
     }
 
+    // Test: Restore a fixed decoder into a fresh programmable slot.
+    // Expected: All address, size, control and DPA words restore; enable stays off.
     #[test]
     fn save_restore_roundtrip_preserves_decoder_state() {
         let mut cap = CxlHdmDecoderCapability::new().expect("new should succeed");
-        cap.with_hdm(fixed_config()).expect("fixed config valid");
+        cap.with_hdm(CxlHdmDecoderFixedConfig {
+            hdm_base: 0x2_1000_0000,
+            hdm_size: 0x3_1000_0000,
+            ..fixed_config()
+        })
+        .expect("fixed config valid");
 
         let saved = cap.save().expect("save should succeed");
 
         let mut restored = CxlHdmDecoderCapability::new().expect("new should succeed");
         restored
-            .with_hdm(fixed_config())
-            .expect("fixed config valid");
+            .with_decoder_slot(
+                CxlHdmDecoderInterleaveGranularity::Bytes256,
+                CxlHdmDecoderInterleaveWays::Way1,
+            )
+            .expect("slot creation should succeed");
         restored.restore(saved).expect("restore should succeed");
+        for (offset, expected) in [
+            (CxlHdmDecoderRegisterOffset::BASE_LOW, 0x1000_0000),
+            (CxlHdmDecoderRegisterOffset::BASE_HIGH, 2),
+            (CxlHdmDecoderRegisterOffset::SIZE_LOW, 0x1000_0000),
+            (CxlHdmDecoderRegisterOffset::SIZE_HIGH, 3),
+            (CxlHdmDecoderRegisterOffset::CONTROL, 0x700),
+            (CxlHdmDecoderRegisterOffset::DPA_SKIP_LOW, 0),
+            (CxlHdmDecoderRegisterOffset::DPA_SKIP_HIGH, 0),
+        ] {
+            assert_eq!(
+                cap.read_u32(CXL_HDM_DECODER_BASE_OFFSET + offset),
+                Some(expected)
+            );
+            assert_eq!(
+                restored.read_u32(CXL_HDM_DECODER_BASE_OFFSET + offset),
+                Some(expected)
+            );
+        }
         assert_eq!(
             restored.read_u32(CXL_HDM_DECODER_GLOBAL_CONTROL_OFFSET),
             Some(0)
         );
     }
 
+    // Test: Save an enabled decoder and restore it into a disabled destination.
+    // Expected: Global enable and the resulting address translation are restored.
     #[test]
     fn save_restore_should_preserve_global_control_runtime_state() {
         let mut cap = CxlHdmDecoderCapability::new().expect("new should succeed");
@@ -652,13 +689,18 @@ mod tests {
             .expect("fixed config valid");
         restored.restore(saved).expect("restore should succeed");
 
-        // This currently fails: restore forces global control back to defaults.
         assert_eq!(
             restored.read_u32(CXL_HDM_DECODER_GLOBAL_CONTROL_OFFSET),
             Some(enabled)
         );
+        assert_eq!(
+            restored.find_enabled_decoder_for_access(0x1000_0100, 4),
+            Some((0, 0x100))
+        );
     }
 
+    // Test: Look up a committed fixed range before and after global enable.
+    // Expected: Only the enabled lookup resolves to decoder zero and its offset.
     #[test]
     fn enabled_decoder_lookup_requires_global_enable() {
         let mut cap = CxlHdmDecoderCapability::new().expect("new should succeed");
@@ -672,6 +714,8 @@ mod tests {
         );
     }
 
+    // Test: Add a second fixed range while the decoder capability is enabled.
+    // Expected: Length grows and the second address resolves to decoder one.
     #[test]
     fn with_hdm_can_add_multiple_fixed_ranges() {
         let mut cap = CxlHdmDecoderCapability::new().expect("new should succeed");
@@ -698,6 +742,8 @@ mod tests {
         );
     }
 
+    // Test: Commit a programmable decoder and attempt to program it again.
+    // Expected: Commit becomes sticky and subsequent base/control writes fail.
     #[test]
     fn programmable_decoder_commit_sets_committed_and_locks_when_configured() {
         let mut cap = CxlHdmDecoderCapability::new().expect("new should succeed");
@@ -728,6 +774,8 @@ mod tests {
         assert!(!cap.write_u32(control_offset, 0));
     }
 
+    // Test: Write all base, size and DPA words before and after committing a slot.
+    // Expected: Unlocked writes succeed; locked writes fail without changing words.
     #[test]
     fn programmable_decoder_lock_blocks_base_size_and_dpa_programming() {
         let mut cap = CxlHdmDecoderCapability::new().expect("new should succeed");
@@ -767,5 +815,55 @@ mod tests {
         assert!(!cap.write_u32(size_high_offset, 0x44));
         assert!(!cap.write_u32(dpa_skip_low_offset, 0x55));
         assert!(!cap.write_u32(dpa_skip_high_offset, 0x66));
+        for (offset, expected) in [
+            (base_low_offset, 1),
+            (base_high_offset, 2),
+            (size_low_offset, 3),
+            (size_high_offset, 4),
+            (dpa_skip_low_offset, 5),
+            (dpa_skip_high_offset, 6),
+        ] {
+            assert_eq!(cap.read_u32(offset), Some(expected));
+        }
+    }
+
+    // Test: Resolve high-address fixed ranges at their boundaries and after reset.
+    // Expected: Full-width indices/offsets resolve; holes and overflow reject;
+    //       reset disables lookup without changing either committed range.
+    #[test]
+    fn decoder_lookup_preserves_high_addresses_and_peer_ranges_on_reset() {
+        let mut cap = CxlHdmDecoderCapability::new().unwrap();
+        for base in [0x2_1000_0000, 0x7_3000_0000] {
+            cap.with_hdm(CxlHdmDecoderFixedConfig {
+                hdm_base: base,
+                ..fixed_config()
+            })
+            .unwrap();
+        }
+        assert!(cap.write_u32(CXL_HDM_DECODER_GLOBAL_CONTROL_OFFSET, 2));
+        for (address, len, expected) in [
+            (0x2_1000_0000, 4, Some((0, 0))),
+            (0x2_1fff_fffc, 4, Some((0, 0x0fff_fffc))),
+            (0x7_3000_0100, 8, Some((1, 0x100))),
+            (0x7_3fff_fff8, 8, Some((1, 0x0fff_fff8))),
+            (0x2_0fff_fffc, 8, None),
+            (0x2_1fff_fffc, 8, None),
+            (0x7_4000_0000, 4, None),
+            (u64::MAX - 3, 8, None),
+        ] {
+            assert_eq!(cap.find_enabled_decoder_for_access(address, len), expected);
+        }
+        cap.reset();
+        assert_eq!(cap.find_enabled_decoder_for_access(0x2_1000_0000, 4), None);
+        assert_eq!(cap.find_enabled_decoder_for_access(0x7_3000_0000, 4), None);
+        assert!(cap.write_u32(CXL_HDM_DECODER_GLOBAL_CONTROL_OFFSET, 2));
+        assert_eq!(
+            cap.find_enabled_decoder_for_access(0x2_1000_0000, 4),
+            Some((0, 0))
+        );
+        assert_eq!(
+            cap.find_enabled_decoder_for_access(0x7_3000_0000, 4),
+            Some((1, 0))
+        );
     }
 }

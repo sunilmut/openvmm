@@ -362,6 +362,7 @@ mod tests {
     use pci_core::spec::caps::dvsec::DvsecExtendedCapabilityHeader;
     use pci_core::test_helpers::read_extended_cap_u32;
     use pci_core::test_helpers::write_extended_cap_u32;
+    use test_with_tracing::test;
     use vmcore::save_restore::SaveRestore;
 
     use super::CxlFlexBusPortDvsecCapability;
@@ -371,6 +372,8 @@ mod tests {
     use super::CxlFlexBusPortDvsecRegisterOffset;
     use super::CxlFlexBusPortDvsecStatus;
 
+    // Test: Read Flex Bus Port DVSEC identification headers.
+    // Expected: Vendor, revision, length and Flex Bus Port ID match the protocol.
     #[test]
     fn header_registers_match_required_constants() {
         let cap = CxlFlexBusPortDvsecExtendedCapability::new();
@@ -388,12 +391,16 @@ mod tests {
         );
     }
 
+    // Test: Identify the Flex Bus Port capability for save/restore routing.
+    // Expected: Its label remains flex_bus_port_dvsec.
     #[test]
     fn label_is_flex_bus_port_dvsec() {
         let cap = CxlFlexBusPortDvsecExtendedCapability::new();
         assert_eq!(cap.label(), "flex_bus_port_dvsec");
     }
 
+    // Test: Request optional control modes with only memory capability enabled.
+    // Expected: Memory and required IO enable; unsupported modes remain disabled.
     #[test]
     fn control_write_is_capability_gated() {
         let mut cap = CxlFlexBusPortDvsecExtendedCapability::new().with_mem_capable(true);
@@ -427,6 +434,8 @@ mod tests {
         assert!(control.io_enable());
     }
 
+    // Test: Reset a port after runtime memory enable.
+    // Expected: Memory capability survives while its enable clears and IO stays on.
     #[test]
     fn reset_preserves_configured_mem_capability() {
         let mut cap = CxlFlexBusPortDvsecExtendedCapability::new().with_mem_capable(true);
@@ -458,6 +467,8 @@ mod tests {
         assert!(control.io_enable());
     }
 
+    // Test: Clear two status errors while a third status error is set.
+    // Expected: Only the requested write-one-to-clear fields change.
     #[test]
     fn status_rw1cs_clears_target_bits() {
         let mut cap = CxlFlexBusPortDvsecExtendedCapability::new();
@@ -485,6 +496,8 @@ mod tests {
         assert!(!next.cxl_unexpected_protocol_id_dropped());
     }
 
+    // Test: Write error status with only the low control byte lanes enabled.
+    // Expected: The error in the disabled status lanes remains set.
     #[test]
     fn status_rw1cs_ignores_disabled_byte_lanes() {
         let mut cap = CxlFlexBusPortDvsecExtendedCapability::new();
@@ -505,6 +518,8 @@ mod tests {
         assert!(next.even_half_failed());
     }
 
+    // Test: Request NOP hint enable with and without its advertised capability.
+    // Expected: The control bit enables only for a capable port.
     #[test]
     fn control2_is_gated_by_capability2() {
         let mut cap = CxlFlexBusPortDvsecExtendedCapability::new();
@@ -536,6 +551,9 @@ mod tests {
         assert!(control2.nop_hint_enable());
     }
 
+    // Test: Restore a configured Flex Bus Port into a fresh default capability.
+    // Expected: Complete register payloads match independent encodings; reset
+    //       preserves capabilities while clearing runtime controls and status.
     #[test]
     fn save_restore_round_trips_state() {
         let mut cap = CxlFlexBusPortDvsecExtendedCapability::new()
@@ -574,6 +592,17 @@ mod tests {
         let saved = cap.save().expect("save should succeed");
         let mut restored = CxlFlexBusPortDvsecExtendedCapability::new();
         restored.restore(saved).expect("restore should succeed");
+        for (offset, expected) in [
+            (0x08, 0x6067_0007),
+            (0x0c, 0x0800_6067),
+            (0x10, 0x00ab_cdef),
+            (0x14, 3),
+            (0x18, 1),
+            (0x1c, 6),
+        ] {
+            assert_eq!(read_extended_cap_u32(&cap, offset), expected);
+            assert_eq!(read_extended_cap_u32(&restored, offset), expected);
+        }
 
         assert_eq!(
             read_extended_cap_u32(
@@ -636,5 +665,17 @@ mod tests {
         assert!(capability.cache_capable());
         assert!(capability.cxl_68b_flit_and_vh_capable());
         assert!(capability.cxl_multi_logical_device_capable());
+        restored.reset();
+        for (offset, expected) in [
+            (0x08, 0x6067_0007),
+            (0x0c, 2),
+            (0x10, 0),
+            (0x14, 3),
+            (0x18, 0),
+            (0x1c, 0),
+        ] {
+            assert_eq!(read_extended_cap_u32(&restored, offset), expected);
+        }
+        assert_eq!(read_extended_cap_u32(&cap, 0x0c), 0x0800_6067);
     }
 }

@@ -699,6 +699,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+    use test_with_tracing::test;
     use vmcore::save_restore::SaveRestore;
 
     use super::CxlCacheWriteBackAndInvalidateHandler;
@@ -720,27 +721,26 @@ mod tests {
     use super::CxlMemoryRange;
     use super::CxlResetHandler;
 
-    static CXL_RESET_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static CXL_CWBI_HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
-
     #[derive(Inspect)]
-    struct TestCxlResetHandler;
+    struct TestCxlResetHandler(Arc<AtomicUsize>);
 
     impl CxlResetHandler for TestCxlResetHandler {
         fn initiate_cxl_reset(&self) {
-            CXL_RESET_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     #[derive(Inspect)]
-    struct TestCxlCacheWriteBackAndInvalidateHandler;
+    struct TestCxlCacheWriteBackAndInvalidateHandler(Arc<AtomicUsize>);
 
     impl CxlCacheWriteBackAndInvalidateHandler for TestCxlCacheWriteBackAndInvalidateHandler {
         fn initiate_cache_write_back_and_invalidate(&self) {
-            CXL_CWBI_HANDLER_CALLS.fetch_add(1, Ordering::SeqCst);
+            self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
 
+    // Test: Read the device DVSEC vendor, revision, length and identifier.
+    // Expected: Header DWORDs match the required wire encodings.
     #[test]
     fn header_registers_match_required_constants() {
         let cap = CxlDeviceDevsecExtendedCapability::new(None, None);
@@ -755,12 +755,16 @@ mod tests {
         );
     }
 
+    // Test: Identify the device DVSEC capability for save/restore routing.
+    // Expected: The label remains cxl_device_dvsec.
     #[test]
     fn label_is_cxl_dvsec() {
         let cap = CxlDeviceDevsecExtendedCapability::new(None, None);
         assert_eq!(cap.label(), "cxl_device_dvsec");
     }
 
+    // Test: Discover a device before enabling cache or memory capabilities.
+    // Expected: Only required CXL.io support is advertised, with no HDM ranges.
     #[test]
     fn default_only_enables_cxl_io() {
         let cap = CxlDeviceDevsecExtendedCapability::new(None, None);
@@ -773,6 +777,8 @@ mod tests {
         assert_eq!(capability.hdm_count(), 0);
     }
 
+    // Test: Configure cache support with a specified cache size and unit.
+    // Expected: Discovery advertises cache capability and the requested size.
     #[test]
     fn with_cxl_cache_sets_cache_capable() {
         let cap = CxlDeviceDevsecExtendedCapability::new(None, None)
@@ -791,6 +797,8 @@ mod tests {
         assert_eq!(capability2.cache_size(), 0x20);
     }
 
+    // Test: Configure a valid memory range with CDAT metadata.
+    // Expected: The range is active and discovery preserves every metadata field.
     #[test]
     fn with_cxl_memory_enables_mem_for_valid_range() {
         let cap = CxlDeviceDevsecExtendedCapability::new(None, None)
@@ -835,6 +843,8 @@ mod tests {
         assert_eq!(size_low.memory_size_low(), 0x4);
     }
 
+    // Test: Enable memory, then reset the device DVSEC.
+    // Expected: Configured capability/range survive while runtime enable clears.
     #[test]
     fn reset_preserves_configured_mem_capability_and_ranges() {
         let mut cap = CxlDeviceDevsecExtendedCapability::new(None, None)
@@ -877,6 +887,8 @@ mod tests {
         );
     }
 
+    // Test: Supply an unaligned optional base while configuring valid memory.
+    // Expected: Memory is advertised but invalid optional base programming is ignored.
     #[test]
     fn with_cxl_memory_ignores_invalid_range_programming() {
         let cap = CxlDeviceDevsecExtendedCapability::new(None, None)
@@ -903,6 +915,8 @@ mod tests {
         );
     }
 
+    // Test: Configure memory support without supplying an optional address range.
+    // Expected: One HDM range and memory capability are still advertised.
     #[test]
     fn with_cxl_memory_enables_mem_without_range() {
         let cap = CxlDeviceDevsecExtendedCapability::new(None, None)
@@ -923,6 +937,8 @@ mod tests {
         assert_eq!(capability.hdm_count(), 0x1);
     }
 
+    // Test: Configure two address ranges in succession.
+    // Expected: The second slot is populated and the first remains advertised.
     #[test]
     fn with_cxl_memory_second_call_programs_range2() {
         let cap = CxlDeviceDevsecExtendedCapability::new(None, None)
@@ -962,6 +978,8 @@ mod tests {
         );
     }
 
+    // Test: Configure both range slots with different memory metadata.
+    // Expected: Discovery reports memory support and exactly two HDM ranges.
     #[test]
     fn with_cxl_memory_on_both_ranges_sets_hdm_count_two() {
         let cap = CxlDeviceDevsecExtendedCapability::new(None, None)
@@ -991,6 +1009,8 @@ mod tests {
         assert_eq!(capability.hdm_count(), 0x2);
     }
 
+    // Test: Attempt to configure a third HDM range.
+    // Expected: Configuration returns TooManyHdmRanges.
     #[test]
     fn with_cxl_memory_third_call_fails() {
         let cap = CxlDeviceDevsecExtendedCapability::new(None, None)
@@ -1028,6 +1048,8 @@ mod tests {
         ));
     }
 
+    // Test: Program a range base, lock configuration, then overwrite the base.
+    // Expected: The locked base preserves its previously programmed value.
     #[test]
     fn config_lock_blocks_rw_fields() {
         let mut cap = CxlDeviceDevsecExtendedCapability::new(None, None);
@@ -1059,6 +1081,8 @@ mod tests {
         );
     }
 
+    // Test: Write a runtime Control2 field after locking configuration.
+    // Expected: Disable-caching remains writable despite the configuration lock.
     #[test]
     fn config_lock_does_not_block_control2_rw_fields() {
         let mut cap = CxlDeviceDevsecExtendedCapability::new(None, None);
@@ -1081,6 +1105,8 @@ mod tests {
         assert!(control2.disable_caching());
     }
 
+    // Test: Request cache, memory and viral enable without their capabilities.
+    // Expected: Unsupported enable bits stay clear.
     #[test]
     fn control_enables_require_corresponding_capabilities() {
         let mut cap = CxlDeviceDevsecExtendedCapability::new(None, None);
@@ -1108,6 +1134,8 @@ mod tests {
         assert!(!control.viral_enable());
     }
 
+    // Test: Attempt to clear required CXL.io enable through the control register.
+    // Expected: CXL.io remains enabled both initially and after the write.
     #[test]
     fn io_enable_is_always_set() {
         let mut cap = CxlDeviceDevsecExtendedCapability::new(None, None);
@@ -1131,27 +1159,35 @@ mod tests {
         assert!(control_after_write.io_enable());
     }
 
+    // Test: Issue a reset request to a reset-capable device with a handler.
+    // Expected: Exactly one callback is delivered to this device's handler.
     #[test]
     fn control2_reset_request_calls_handler() {
-        CXL_RESET_HANDLER_CALLS.store(0, Ordering::SeqCst);
+        let calls = Arc::new(AtomicUsize::new(0));
 
-        let mut cap =
-            CxlDeviceDevsecExtendedCapability::new(Some(Arc::new(TestCxlResetHandler)), None);
+        let mut cap = CxlDeviceDevsecExtendedCapability::new(
+            Some(Arc::new(TestCxlResetHandler(calls.clone()))),
+            None,
+        );
         write_extended_cap_u32(
             &mut cap,
             CxlDeviceDvsecRegisterOffset::DVSEC_CONTROL2_STATUS2.0,
             1 << 2,
         );
 
-        assert_eq!(CXL_RESET_HANDLER_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    // Test: Issue a reset request with reset capability disabled in the fixture.
+    // Expected: The registered handler receives no callback.
     #[test]
     fn control2_reset_request_does_not_call_handler_when_not_capable() {
-        CXL_RESET_HANDLER_CALLS.store(0, Ordering::SeqCst);
+        let calls = Arc::new(AtomicUsize::new(0));
 
-        let mut cap =
-            CxlDeviceDevsecExtendedCapability::new(Some(Arc::new(TestCxlResetHandler)), None);
+        let mut cap = CxlDeviceDevsecExtendedCapability::new(
+            Some(Arc::new(TestCxlResetHandler(calls.clone()))),
+            None,
+        );
         cap.capability = cap.capability.with_cxl_reset_capable(false);
         write_extended_cap_u32(
             &mut cap,
@@ -1159,16 +1195,20 @@ mod tests {
             1 << 2,
         );
 
-        assert_eq!(CXL_RESET_HANDLER_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    // Test: Request cache writeback/invalidation with configured cache support.
+    // Expected: Exactly one callback reaches this device's cache handler.
     #[test]
     fn control2_cwbi_request_calls_handler_when_capable() {
-        CXL_CWBI_HANDLER_CALLS.store(0, Ordering::SeqCst);
+        let calls = Arc::new(AtomicUsize::new(0));
 
         let mut cap = CxlDeviceDevsecExtendedCapability::new(
             None,
-            Some(Arc::new(TestCxlCacheWriteBackAndInvalidateHandler)),
+            Some(Arc::new(TestCxlCacheWriteBackAndInvalidateHandler(
+                calls.clone(),
+            ))),
         )
         .with_cxl_cache(CxlDeviceDvsecCacheSizeUnit::Kib64, 0x1);
 
@@ -1178,16 +1218,20 @@ mod tests {
             1 << 1,
         );
 
-        assert_eq!(CXL_CWBI_HANDLER_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    // Test: Request cache writeback/invalidation without cache capability.
+    // Expected: The registered cache handler receives no callback.
     #[test]
     fn control2_cwbi_request_does_not_call_handler_when_not_capable() {
-        CXL_CWBI_HANDLER_CALLS.store(0, Ordering::SeqCst);
+        let calls = Arc::new(AtomicUsize::new(0));
 
         let mut cap = CxlDeviceDevsecExtendedCapability::new(
             None,
-            Some(Arc::new(TestCxlCacheWriteBackAndInvalidateHandler)),
+            Some(Arc::new(TestCxlCacheWriteBackAndInvalidateHandler(
+                calls.clone(),
+            ))),
         );
         write_extended_cap_u32(
             &mut cap,
@@ -1195,9 +1239,11 @@ mod tests {
             1 << 1,
         );
 
-        assert_eq!(CXL_CWBI_HANDLER_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    // Test: Clear HDM preservation error before and after enabling configurability.
+    // Expected: Public status readback clears only when the capability permits it.
     #[test]
     fn status2_volatile_hdm_preservation_error_clear_requires_capability3_configurable() {
         let mut cap = CxlDeviceDevsecExtendedCapability::new(None, None);
@@ -1209,7 +1255,10 @@ mod tests {
             CxlDeviceDvsecRegisterOffset::DVSEC_CONTROL2_STATUS2.0,
             1 << (16 + 3),
         );
-        assert!(cap.status2.volatile_hdm_preservation_error());
+        assert_eq!(
+            read_extended_cap_u32(&cap, CxlDeviceDvsecRegisterOffset::DVSEC_CONTROL2_STATUS2.0),
+            0x0008_0000
+        );
 
         // Once the capability is set, the same RW1C write clears the status bit.
         cap.capability3 = cap
@@ -1220,9 +1269,14 @@ mod tests {
             CxlDeviceDvsecRegisterOffset::DVSEC_CONTROL2_STATUS2.0,
             1 << (16 + 3),
         );
-        assert!(!cap.status2.volatile_hdm_preservation_error());
+        assert_eq!(
+            read_extended_cap_u32(&cap, CxlDeviceDvsecRegisterOffset::DVSEC_CONTROL2_STATUS2.0),
+            0
+        );
     }
 
+    // Test: Clear HDM preservation error while reset error/complete are set.
+    // Expected: Public readback preserves both non-target reset status bits.
     #[test]
     fn status2_clear_bit_only_targets_rw1c_field() {
         let mut cap = CxlDeviceDevsecExtendedCapability::new(None, None);
@@ -1240,11 +1294,14 @@ mod tests {
             1 << (16 + 3),
         );
 
-        assert!(!cap.status2.volatile_hdm_preservation_error());
-        assert!(cap.status2.cxl_reset_error());
-        assert!(cap.status2.cxl_reset_complete());
+        assert_eq!(
+            read_extended_cap_u32(&cap, CxlDeviceDvsecRegisterOffset::DVSEC_CONTROL2_STATUS2.0),
+            0x0006_0000
+        );
     }
 
+    // Test: Issue status clears with disabled and then enabled status byte lanes.
+    // Expected: Disabled lanes preserve status; enabled clears affect their targets.
     #[test]
     fn rw1c_status_bits_ignore_disabled_byte_lanes() {
         let mut cap = CxlDeviceDevsecExtendedCapability::new(None, None);
@@ -1259,8 +1316,14 @@ mod tests {
             ByteEnabledDwordWrite::new(0xffff_0000, PciConfigByteEnable::new(0b0011).unwrap()),
         );
 
-        assert!(cap.status.viral_status());
-        assert!(cap.status2.volatile_hdm_preservation_error());
+        assert_eq!(
+            read_extended_cap_u32(&cap, CxlDeviceDvsecRegisterOffset::DVSEC_CONTROL_STATUS.0),
+            0x4000_0002
+        );
+        assert_eq!(
+            read_extended_cap_u32(&cap, CxlDeviceDvsecRegisterOffset::DVSEC_CONTROL2_STATUS2.0),
+            0x0008_0000
+        );
 
         cap.write(
             CxlDeviceDvsecRegisterOffset::DVSEC_CONTROL_STATUS.0,
@@ -1271,10 +1334,18 @@ mod tests {
             ByteEnabledDwordWrite::new(0xffff_0000, PciConfigByteEnable::new(0b1100).unwrap()),
         );
 
-        assert!(!cap.status.viral_status());
-        assert!(!cap.status2.volatile_hdm_preservation_error());
+        assert_eq!(
+            read_extended_cap_u32(&cap, CxlDeviceDvsecRegisterOffset::DVSEC_CONTROL_STATUS.0),
+            2
+        );
+        assert_eq!(
+            read_extended_cap_u32(&cap, CxlDeviceDvsecRegisterOffset::DVSEC_CONTROL2_STATUS2.0),
+            0
+        );
     }
 
+    // Test: Save configured device state and restore into a fresh capability.
+    // Expected: Runtime controls, lock, capability metadata and range state match.
     #[test]
     fn save_restore_round_trips_state() {
         let mut cap = CxlDeviceDevsecExtendedCapability::new(None, None)
@@ -1370,5 +1441,112 @@ mod tests {
             read_extended_cap_u32(&restored, CxlDeviceDvsecRegisterOffset::DVSEC_CAPABILITY3.0),
             read_extended_cap_u32(&cap, CxlDeviceDvsecRegisterOffset::DVSEC_CAPABILITY3.0)
         );
+    }
+
+    // Test: Send reset/cache requests using status-only and control byte lanes.
+    // Expected: Only enabled control requests invoke their own handler; requests
+    //       self-clear, can repeat, and never invoke the peer device's handlers.
+    #[test]
+    fn control2_requests_obey_byte_lanes_and_device_ownership() {
+        let reset = Arc::new(AtomicUsize::new(0));
+        let cache = Arc::new(AtomicUsize::new(0));
+        let peer = Arc::new(AtomicUsize::new(0));
+        let mut cap = CxlDeviceDevsecExtendedCapability::new(
+            Some(Arc::new(TestCxlResetHandler(reset.clone()))),
+            Some(Arc::new(TestCxlCacheWriteBackAndInvalidateHandler(
+                cache.clone(),
+            ))),
+        )
+        .with_cxl_cache(CxlDeviceDvsecCacheSizeUnit::Kib64, 1);
+        let peer_cap = CxlDeviceDevsecExtendedCapability::new(
+            Some(Arc::new(TestCxlResetHandler(peer.clone()))),
+            Some(Arc::new(TestCxlCacheWriteBackAndInvalidateHandler(
+                peer.clone(),
+            ))),
+        )
+        .with_cxl_cache(CxlDeviceDvsecCacheSizeUnit::Kib64, 1);
+        let offset = CxlDeviceDvsecRegisterOffset::DVSEC_CONTROL2_STATUS2.0;
+        for (lanes, request, resets, caches) in [
+            (0b1100, 6, 0, 0),
+            (0b0001, 4, 1, 0),
+            (0b0001, 2, 1, 1),
+            (0b0001, 6, 2, 2),
+            (0b0001, 6, 3, 3),
+        ] {
+            cap.write(
+                offset,
+                ByteEnabledDwordWrite::new(request, PciConfigByteEnable::new(lanes).unwrap()),
+            );
+            assert_eq!(reset.load(Ordering::SeqCst), resets);
+            assert_eq!(cache.load(Ordering::SeqCst), caches);
+            assert_eq!(peer.load(Ordering::SeqCst), 0);
+            assert_eq!(read_extended_cap_u32(&cap, offset), 0);
+            assert_eq!(read_extended_cap_u32(&peer_cap, offset), 0);
+        }
+    }
+
+    // Test: Restore two distinct high-address ranges after runtime base changes.
+    // Expected: Every range DWORD restores independently; reset uses saved initial
+    //       bases rather than the runtime bases and clears the configuration lock.
+    #[test]
+    fn restore_preserves_both_ranges_and_their_reset_baselines() {
+        let mut cap = CxlDeviceDevsecExtendedCapability::new(None, None);
+        for (base, size) in [(0x1_4000_0000, 0x4000_0000), (0x7_8000_0000, 0x2_8000_0000)] {
+            cap = cap
+                .with_cxl_memory(
+                    size,
+                    Some(CxlMemoryRange { base, size }),
+                    CxlDeviceDvsecMediaType::VolatileMemory,
+                    CxlDeviceDvsecMemoryClass::Memory,
+                    CxlDeviceDvsecDesiredInterleave::NoInterleave,
+                    CxlDeviceDvsecMemoryActiveTimeout::Seconds1,
+                )
+                .unwrap();
+        }
+        for (offset, value) in [
+            (0x20, 0x1234_5678),
+            (0x24, 0x9000_0000),
+            (0x30, 0x8765_4321),
+            (0x34, 0xa000_0000),
+        ] {
+            write_extended_cap_u32(&mut cap, offset, value);
+        }
+        write_extended_cap_u32(&mut cap, 0x14, 1);
+        let saved = cap.save().unwrap();
+        let mut restored = CxlDeviceDevsecExtendedCapability::new(None, None);
+        restored.restore(saved).unwrap();
+        for (offset, expected) in [
+            (0x18, 0),
+            (0x1c, 0x4000_0003),
+            (0x20, 0x1234_5678),
+            (0x24, 0x9000_0000),
+            (0x28, 2),
+            (0x2c, 0x8000_0003),
+            (0x30, 0x8765_4321),
+            (0x34, 0xa000_0000),
+            (0x14, 1),
+        ] {
+            assert_eq!(read_extended_cap_u32(&cap, offset), expected);
+            assert_eq!(read_extended_cap_u32(&restored, offset), expected);
+        }
+        restored.reset();
+        for (offset, expected) in [
+            (0x18, 0),
+            (0x1c, 0x4000_0003),
+            (0x20, 1),
+            (0x24, 0x4000_0000),
+            (0x28, 2),
+            (0x2c, 0x8000_0003),
+            (0x30, 7),
+            (0x34, 0x8000_0000),
+            (0x14, 0),
+            (0x0c, 2),
+            (0x10, 0),
+        ] {
+            assert_eq!(read_extended_cap_u32(&restored, offset), expected);
+        }
+        assert_eq!(read_extended_cap_u32(&cap, 0x20), 0x1234_5678);
+        assert_eq!(read_extended_cap_u32(&cap, 0x30), 0x8765_4321);
+        assert_eq!(read_extended_cap_u32(&cap, 0x14), 1);
     }
 }

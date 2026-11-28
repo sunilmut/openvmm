@@ -503,11 +503,14 @@ mod save_restore {
 mod tests {
     use crate::component_registers::test_helper::TestCxlComponentRegisterBlock;
     use chipset_device::io::IoResult;
+    use test_with_tracing::test;
     use vmcore::save_restore::SaveRestore;
 
     use super::CxlComponentRegisterType;
     use super::CxlComponentRegisters;
 
+    // Test: Query the component register aperture before adding any blocks.
+    // Expected: The complete 64-KiB window is advertised.
     #[test]
     fn component_register_space_metadata() {
         // The aperture is always the fixed 64-KiB CXL component-register window.
@@ -515,6 +518,8 @@ mod tests {
         assert_eq!(regs.len(), 64 * 1024);
     }
 
+    // Test: Write a payload DWORD through the aperture, then reset all blocks.
+    // Expected: Readback contains the payload before reset and zero afterward.
     #[test]
     fn component_register_space_read_write_and_reset() {
         // Data reads/writes target payload space after the directory dwords.
@@ -541,6 +546,8 @@ mod tests {
         assert_eq!(read, 0);
     }
 
+    // Test: Read the cache/mem directory before registering a capability.
+    // Expected: The required header advertises an empty capability array.
     #[test]
     fn cachemem_directory_header_exists_even_with_zero_entries() {
         // Index 0 must always expose the CXL Capability Header.
@@ -551,6 +558,8 @@ mod tests {
         assert_eq!(header, 0x0011_0001);
     }
 
+    // Test: Access read-only directory words, unmapped space and aperture overflow.
+    // Expected: Writes to the directory and accesses outside payload space fail.
     #[test]
     fn component_register_space_rejects_invalid_offsets() {
         // Directory dwords are writable=false, and unmapped/out-of-bounds reads fail.
@@ -587,6 +596,8 @@ mod tests {
         ));
     }
 
+    // Test: Access a payload with partial-width or unnaturally aligned transfers.
+    // Expected: All unsupported widths and alignments are rejected.
     #[test]
     fn component_register_space_rejects_partial_and_unaligned_accesses() {
         // Spec requires full-width accesses only (4-byte for 32-bit, 8-byte for 64-bit).
@@ -615,6 +626,8 @@ mod tests {
         assert!(matches!(regs.write(0x100c, &eight), IoResult::Err(_)));
     }
 
+    // Test: Add a second block whose directory entry would overlap the first.
+    // Expected: Registration fails without moving or modifying existing payload.
     #[test]
     fn component_register_space_rejects_second_block_when_directory_growth_would_overlap() {
         // TODO: Teach allocator to repack/relocate payloads so additional capabilities
@@ -626,6 +639,10 @@ mod tests {
                 16,
             )))
         );
+        assert!(matches!(
+            regs.write(0x1008, &0x1234_5678u32.to_le_bytes()),
+            IoResult::Ok
+        ));
         assert!(
             !regs.add_register(Box::new(TestCxlComponentRegisterBlock::new(
                 CxlComponentRegisterType::CXL_CACHE_MEM_REGISTER,
@@ -637,9 +654,11 @@ mod tests {
         let mut value_bytes = [0u8; 4];
         assert!(matches!(regs.read(0x1008, &mut value_bytes), IoResult::Ok));
         let value = u32::from_le_bytes(value_bytes);
-        assert_eq!(value, 0);
+        assert_eq!(value, 0x1234_5678);
     }
 
+    // Test: Register zero-length and non-DWORD-sized payloads.
+    // Expected: Neither invalid block consumes aperture space.
     #[test]
     fn component_register_space_rejects_bad_block_params() {
         // Zero-sized and unaligned-size payloads are rejected.
@@ -658,6 +677,8 @@ mod tests {
         );
     }
 
+    // Test: Fill all primary pages with maximum-sized payloads, then add another.
+    // Expected: Each fitting block succeeds and the excess registration fails.
     #[test]
     fn component_register_space_rejects_when_section_capacity_is_exhausted() {
         // Fill every 4-KiB primary cachemem page with one max-sized payload block.
@@ -684,6 +705,8 @@ mod tests {
         );
     }
 
+    // Test: Register both cache/mem block types and an unsupported ARB/MUX block.
+    // Expected: Cache/mem blocks are accepted; ARB/MUX placement is rejected.
     #[test]
     fn component_register_space_supports_both_cachemem_register_types_in_primary_section() {
         // Extended register type is supported and placed in the primary section.
@@ -713,6 +736,8 @@ mod tests {
         );
     }
 
+    // Test: Discover a registered block through the synthetic capability directory.
+    // Expected: Header count, capability identifier, version and pointer match.
     #[test]
     fn cachemem_directory_exposes_header_and_capability_pointer_entries() {
         // Directory layout must expose header first, then capability pointer entries.
@@ -739,6 +764,8 @@ mod tests {
         assert_eq!((entry >> 20) & 0xFFF, 0x2);
     }
 
+    // Test: Register an extended cache/mem block and access its initial payload.
+    // Expected: The supported primary placement exposes a zero-filled payload.
     #[test]
     fn component_register_space_accepts_extended_cachemem_register_type() {
         // Extended register type is accepted, but still mapped into primary section.
@@ -757,6 +784,8 @@ mod tests {
         assert_eq!(value, 0);
     }
 
+    // Test: Save payload data and restore it into a separate compatible aperture.
+    // Expected: All payload bytes restore, including untouched neighboring words.
     #[test]
     fn component_register_space_save_restore_preserves_payload_state() {
         let mut regs = CxlComponentRegisters::new();
@@ -782,6 +811,7 @@ mod tests {
                 16,
             )))
         );
+        assert!(matches!(restored.write(0x1008, &[0xa5; 8]), IoResult::Ok));
 
         restored.restore(saved).expect("restore should succeed");
 
@@ -792,8 +822,21 @@ mod tests {
         ));
         let value = u32::from_le_bytes(value_bytes);
         assert_eq!(value, original);
+        let mut payload = [0xa5; 16];
+        for (index, chunk) in payload.chunks_exact_mut(8).enumerate() {
+            assert!(matches!(
+                restored.read(0x1008 + index as u16 * 8, chunk),
+                IoResult::Ok
+            ));
+        }
+        assert_eq!(
+            payload,
+            [0xef, 0xbe, 0xad, 0xde, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
     }
 
+    // Test: Restore a saved component block into an aperture without that block.
+    // Expected: Restore reports InvalidSavedState rather than accepting lost data.
     #[test]
     fn component_register_space_restore_rejects_layout_mismatch() {
         let mut regs = CxlComponentRegisters::new();
