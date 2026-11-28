@@ -208,7 +208,10 @@ pub mod tests {
     use super::*;
     use crate::test_helpers::TestVpciInterruptController;
     use pal_async::async_test;
+    use test_with_tracing::test;
 
+    // Test: Register and signal one interrupt using the test controller.
+    // Expected: The fixed address/data route once to vector 0x21 on CPU zero.
     #[async_test]
     async fn verify_simple_interrupt() {
         let test_intc = TestVpciInterruptController::new();
@@ -237,6 +240,8 @@ pub mod tests {
         assert!(test_intc.get_next_interrupt().is_none());
     }
 
+    // Test: Signal both data offsets of a two-vector interrupt mapping.
+    // Expected: FIFO delivery preserves vectors 0x21 and 0x22 on CPU zero.
     #[async_test]
     async fn verify_multi_interrupt() {
         let test_intc = TestVpciInterruptController::new();
@@ -269,6 +274,8 @@ pub mod tests {
         assert!(test_intc.get_next_interrupt().is_none());
     }
 
+    // Test: Register two independent interrupt routes and signal each.
+    // Expected: Distinct addresses deliver their own vector and CPU, with no extras.
     #[async_test]
     async fn verify_two_interrupts() {
         let test_intc = TestVpciInterruptController::new();
@@ -318,6 +325,8 @@ pub mod tests {
         assert!(test_intc.get_next_interrupt().is_none());
     }
 
+    // Test: Retarget an existing route from CPU zero to CPUs two and three.
+    // Expected: Its next signal retains vector 0x21 and reaches the first new CPU.
     #[async_test]
     async fn verify_retarget() {
         let test_intc = TestVpciInterruptController::new();

@@ -2006,6 +2006,7 @@ mod tests {
             assert_eq!(device.pnp_id.sub_vendor_id, self.config.type0_sub_vendor_id);
             assert_eq!(device.pnp_id.sub_system_id, self.config.type0_sub_system_id);
             assert_eq!(device.slot, SlotNumber::new());
+            assert_eq!(device.serial_num, 0x1234);
             assert_eq!(device.flags, protocol::DeviceDescription2Flags::new());
             assert_eq!(device.numa_node, 0);
             assert_eq!(device.rsvd, 0);
@@ -2141,6 +2142,13 @@ mod tests {
                         protocol::Status::SUCCESS,
                         "tdisp command completion returned non-success status"
                     );
+                    assert_eq!(reply_header.slot, SlotNumber::new());
+                    let data_length = usize::try_from(reply_header.data_length).unwrap();
+                    assert!(data_length <= proto_bytes.len());
+                    assert!(
+                        proto_bytes.len() - data_length < 8,
+                        "unexpected trailing payload"
+                    );
 
                     tracing::debug!(
                         reply_header_size = reply_header.as_bytes().len(),
@@ -2149,7 +2157,7 @@ mod tests {
                     tracing::debug!(payload_size = proto_bytes.len(), "completion payload size");
 
                     // Read only data_length bytes from the payload.
-                    let proto_bytes_shaved = &proto_bytes[..reply_header.data_length as usize];
+                    let proto_bytes_shaved = &proto_bytes[..data_length];
 
                     tdisp::serialize_proto::deserialize_response(proto_bytes_shaved)
                         .expect("failed to deserialize GuestToHostResponse")
@@ -2224,6 +2232,8 @@ mod tests {
         }
     }
 
+    // Test: Negotiate and power on a device with no BARs or capabilities.
+    // Expected: The guest receives complete hardware identity and matching completions.
     #[async_test]
     async fn verify_simple_device(driver: DefaultDriver) {
         let msi_controller = TestVpciInterruptController::new();
@@ -2251,6 +2261,8 @@ mod tests {
         guest_driver.start_device(base_address).await;
     }
 
+    // Test: Request ejection twice before the guest acknowledges the first request.
+    // Expected: The guest receives slot-zero EJECT; the duplicate fails and ACK completes.
     #[async_test]
     async fn eject_waits_for_guest_completion(driver: DefaultDriver) {
         let msi_controller = TestVpciInterruptController::new();
@@ -2300,6 +2312,8 @@ mod tests {
         eject_task.await.unwrap();
     }
 
+    // Test: Start a device after requesting an unsupported protocol version.
+    // Expected: The guest falls back to VB and completes enumeration successfully.
     #[async_test]
     async fn verify_version_negotiation(driver: DefaultDriver) {
         let msi_controller = TestVpciInterruptController::new();
@@ -2359,6 +2373,8 @@ mod tests {
     /// the guest requested `RB`, and echoes `VB` for every other
     /// supported version. Unsupported versions still return
     /// `REVISION_MISMATCH` with `VB`.
+    // Test: Request every supported version and an unknown version on fresh channels.
+    // Expected: Only RB echoes RB; legacy successes and rejection advertise VB.
     #[async_test]
     async fn verify_version_negotiation_rb_gated(driver: DefaultDriver) {
         let msi_controller = TestVpciInterruptController::new();
@@ -2440,6 +2456,8 @@ mod tests {
         }
     }
 
+    // Test: Negotiate and enumerate a device exposing an MSI-X capability.
+    // Expected: Capability probing leaves hardware identity and startup replies intact.
     #[async_test]
     async fn verify_simple_capability(driver: DefaultDriver) {
         let msi_conn = MsiConnection::new();
@@ -2472,6 +2490,8 @@ mod tests {
         guest_driver.start_device(base_address).await;
     }
 
+    // Test: Probe a 64-bit BAR, program its high half and enable MMIO.
+    // Expected: Masks and encoding bits remain exact; enabled BAR addresses resist writes.
     #[async_test]
     async fn verify_mmio(driver: DefaultDriver) {
         let msi_controller = TestVpciInterruptController::new();
@@ -2771,6 +2791,8 @@ mod tests {
         }
     }
 
+    // Test: Program two BARs and perform chipset reads and writes at distinct offsets.
+    // Expected: Each address reaches its intended BAR and returns or accepts its own value.
     #[async_test]
     async fn verify_simple_device_registers(driver: DefaultDriver) {
         let msi_controller = TestVpciInterruptController::new();
@@ -2856,6 +2878,9 @@ mod tests {
     /// This test covers:
     /// - Some basic VMBUS VPCI packet serialization for VpciTdispCommand
     /// - VPCI VMBUS server interface receiving and responding to TDISP commands
+    // Test: Request TDISP interface information over a negotiated RB VMBus channel.
+    // Expected: The complete reply identifies the mock protocol, features and device,
+    //       with unchanged Unlocked states and a bounded slot-zero response payload.
     #[async_test]
     async fn verify_tdisp_get_device_interface_info(driver: DefaultDriver) {
         let msi_controller = TestVpciInterruptController::new();
@@ -2907,6 +2932,8 @@ mod tests {
     /// TDISP commands only exist from `RB` onward, so a guest that negotiated
     /// an older version is answered `NOT_SUPPORTED` even though the device
     /// behind the bus implements TDISP.
+    // Test: Send a valid TDISP command to a capable device under VB.
+    // Expected: The protocol gate returns NOT_SUPPORTED before handling the command.
     #[async_test]
     async fn verify_tdisp_command_downlevel_protocol(driver: DefaultDriver) {
         let msi_controller = TestVpciInterruptController::new();
@@ -2939,6 +2966,9 @@ mod tests {
     /// - `NotTdispCapable` → `SUCCESS` with all entries `SHARED`.
     /// - `Error` → `UNSUCCESSFUL`.
     /// - Downlevel negotiation (no `RB`) → `NOT_SUPPORTED`.
+    // Test: Query all isolation report states and a capable device under VB.
+    // Expected: All six BAR classifications, DMA classification and status match
+    //       the report contract; VB returns NOT_SUPPORTED with invalid resources.
     #[async_test]
     async fn verify_query_isolated_resources(driver: DefaultDriver) {
         use tdisp::TdispIsolationReport;
@@ -3047,6 +3077,8 @@ mod tests {
         assert_eq!(reply.dma_isolation, protocol::ResourceIsolation::INVALID);
     }
 
+    // Test: Create an interrupt over VMBus and signal its returned address and data.
+    // Expected: One interrupt reaches vector 0x13 on CPU one, with no extra delivery.
     #[async_test]
     async fn verify_simple_device_interrupt(driver: DefaultDriver) {
         let msi_controller = TestVpciInterruptController::new();
@@ -3069,7 +3101,7 @@ mod tests {
                 DeviceBars::new(),
             ),
         }));
-        let mut guest_driver = connected_device(&driver, pci.clone(), msi_controller);
+        let mut guest_driver = connected_device(&driver, pci.clone(), msi_controller.clone());
         let base_address = 0x1000000;
         guest_driver.start_device(base_address).await;
         let target_processors = vec![1];
@@ -3078,6 +3110,10 @@ mod tests {
             .await;
         assert_ne!(addr, 0);
         assert_eq!(data, 0);
+        msi_controller.deliver_interrupt(addr, data);
+        let interrupt = msi_controller.get_next_interrupt().unwrap();
+        assert_eq!((interrupt.vector, interrupt.destination), (0x13, 1));
+        assert!(msi_controller.get_next_interrupt().is_none());
     }
 
     mod behavior;

@@ -230,10 +230,24 @@ async fn assignment_translates_interrupt_formats_and_releases_mappings(driver: D
         let bytes = exchange(&mut guest, &request).await;
         let (reply, rest) = protocol::DeviceTranslateReply::read_from_prefix(&bytes).unwrap();
         assert_eq!(reply.status, protocol::Status::SUCCESS);
+        assert_eq!(reply.slot, SlotNumber::new());
+        assert_eq!(reply.reserved, 0);
+        assert_eq!(
+            reply.mmio_resources.as_bytes(),
+            msg.mmio_resources.as_bytes()
+        );
         assert_eq!(reply.msi_resource_count, 1);
-        let msi = protocol::MsiResourceRemapped::read_from_prefix(rest)
-            .unwrap()
-            .0;
+        let (msi, padding) = protocol::MsiResourceRemapped::read_from_prefix(rest).unwrap();
+        assert_eq!(msi.reserved, 0);
+        assert_eq!(msi.message_count, 1);
+        assert_eq!(msi.address, 0xfee0_0000);
+        assert_eq!(msi.data_payload, 0);
+        if message_type == protocol::MessageType::ASSIGNED_RESOURCES {
+            assert!(padding.is_empty());
+        } else {
+            // V2 and V3 requests both receive the padded V2 remapped union.
+            assert_eq!(padding, &[0; 56]);
+        }
         controller.deliver_interrupt(msi.address, msi.data_payload);
         let interrupt = controller.get_next_interrupt().unwrap();
         assert_eq!((interrupt.vector, interrupt.destination), (vector, cpu));
@@ -759,4 +773,67 @@ async fn rejected_reassignment_preserves_live_resources(driver: DefaultDriver) {
             .iter()
             .all(|resource| resource.adjusted_len == 0)
     );
+}
+
+// Test: Reject wrong-data and wrong-slot deletions while two interrupt routes are live.
+// Expected: Rejected requests preserve both routes; deleting one leaves its peer working,
+//       and release removes the remaining route without delivering stale interrupts.
+#[async_test]
+async fn interrupt_deletion_preserves_peer_routes(driver: DefaultDriver) {
+    let (mut guest, _, controller) = endpoint(&driver, 0x1000);
+    guest.start_device(0x140000000).await;
+    let first = guest.register_interrupt(0x51, &[7]).await;
+    let second = guest.register_interrupt(0x63, &[9]).await;
+    assert_ne!(first.0, second.0);
+
+    let mut delete = protocol::DeleteInterrupt {
+        message_type: protocol::MessageType::DELETE_INTERRUPT2,
+        slot: SlotNumber::new(),
+        interrupt: protocol::MsiResourceRemapped {
+            reserved: 0,
+            message_count: 1,
+            address: first.0,
+            data_payload: first.1 + 1,
+        },
+    };
+    assert_eq!(
+        status(&mut guest, delete.as_bytes()).await,
+        protocol::Status::BAD_DATA
+    );
+    delete.interrupt.data_payload = first.1;
+    delete.slot = SlotNumber::from(1);
+    assert_eq!(
+        status(&mut guest, delete.as_bytes()).await,
+        protocol::Status::BAD_DATA
+    );
+    controller.deliver_interrupt(first.0, first.1);
+    controller.deliver_interrupt(second.0, second.1);
+    for expected in [(0x51, 7), (0x63, 9)] {
+        let delivered = controller.get_next_interrupt().unwrap();
+        assert_eq!((delivered.vector, delivered.destination), expected);
+    }
+    assert!(controller.get_next_interrupt().is_none());
+
+    delete.slot = SlotNumber::new();
+    assert_eq!(
+        status(&mut guest, delete.as_bytes()).await,
+        protocol::Status::SUCCESS
+    );
+    controller.deliver_interrupt(first.0, first.1);
+    controller.deliver_interrupt(second.0, second.1);
+    let delivered = controller.get_next_interrupt().unwrap();
+    assert_eq!((delivered.vector, delivered.destination), (0x63, 9));
+    assert!(controller.get_next_interrupt().is_none());
+
+    assert_eq!(
+        status(
+            &mut guest,
+            pdo(protocol::MessageType::RELEASE_RESOURCES).as_bytes()
+        )
+        .await,
+        protocol::Status::SUCCESS
+    );
+    controller.deliver_interrupt(first.0, first.1);
+    controller.deliver_interrupt(second.0, second.1);
+    assert!(controller.get_next_interrupt().is_none());
 }

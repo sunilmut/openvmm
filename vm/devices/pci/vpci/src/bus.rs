@@ -646,6 +646,8 @@ mod tests {
         }
     }
 
+    // Test: Access config space after permanently removing the PCI device.
+    // Expected: Both reads and writes return NoResponse.
     #[test]
     fn config_access_to_removed_device_returns_no_response() {
         let rig = VpciTestRig::new();
@@ -666,6 +668,8 @@ mod tests {
         ));
     }
 
+    // Test: Remove the bus while config reads and writes are pending.
+    // Expected: Both deferred tokens finish with NoResponse rather than hanging.
     #[test]
     fn pending_config_accesses_finish_when_bus_payload_is_removed() {
         let rig = VpciTestRig::new();
@@ -773,6 +777,8 @@ mod tests {
     /// Verifies that `VpciBusDevice` correctly suspends a VP on a deferred
     /// `pci_cfg_write` and completes it once `poll_device` drives the inner
     /// token to completion.
+    // Test: Forward deferred config writes and reject a multi-DWORD write.
+    // Expected: Polling completes the token; invalid widths never reach the device.
     #[async_test]
     async fn verify_deferred_pci_cfg_write_via_bus(driver: DefaultDriver) {
         const BASE_ADDR: u64 = 0x1000_0000;
@@ -874,6 +880,8 @@ mod tests {
         );
     }
 
+    // Test: Forward a deferred config read and a subsequent byte write.
+    // Expected: The read returns the complete device value and the write succeeds.
     #[async_test]
     async fn verify_deferred_pci_cfg_read_via_bus(_driver: DefaultDriver) {
         const BASE_ADDR: u64 = 0x1000_0000;
@@ -927,6 +935,8 @@ mod tests {
         assert!(matches!(write_result, IoResult::Ok));
     }
 
+    // Test: Fail deferred config reads and writes, then retry each operation.
+    // Expected: Errors preserve the read buffer and later requests complete normally.
     #[async_test]
     async fn verify_deferred_pci_cfg_errors_via_bus(_driver: DefaultDriver) {
         const READ_OFFSET: u64 = 4;
@@ -936,7 +946,7 @@ mod tests {
 
         rig.device.lock().fail_deferred_reads(IoError::NoResponse);
         let writes_before = rig.device.lock().writes.len();
-        let mut read_data = [0; 4];
+        let mut read_data = [0xa5; 4];
         let read_result = rig
             .bus
             .lock()
@@ -950,7 +960,20 @@ mod tests {
             read_token.read_future(&mut read_data).await,
             Err(IoError::NoResponse)
         ));
+        assert_eq!(read_data, [0xa5; 4]);
         assert_eq!(rig.device.lock().writes.len(), writes_before);
+
+        rig.device.lock().start_deferring_reads(0x8172_6354);
+        let IoResult::Defer(read_token) = rig
+            .bus
+            .lock()
+            .mmio_read(VpciTestRig::config_addr(READ_OFFSET), &mut read_data)
+        else {
+            panic!("retry read should defer");
+        };
+        rig.poll_bus_and_device();
+        read_token.read_future(&mut read_data).await.unwrap();
+        assert_eq!(read_data, 0x8172_6354u32.to_ne_bytes());
 
         rig.device.lock().fail_deferred_writes(IoError::NoResponse);
         let write_result = rig.bus.lock().mmio_write(
@@ -967,11 +990,25 @@ mod tests {
             Err(IoError::NoResponse)
         ));
         assert_eq!(rig.device.lock().writes.pop(), Some((8, 0xaabb_ccdd)));
+
+        let IoResult::Defer(write_token) = rig.bus.lock().mmio_write(
+            VpciTestRig::config_addr(WRITE_OFFSET),
+            &0x1357_9bdfu32.to_ne_bytes(),
+        ) else {
+            panic!("retry write should defer");
+        };
+        rig.poll_bus_and_device();
+        write_token.write_future().await.unwrap();
+        assert_eq!(rig.device.lock().writes.pop(), Some((8, 0x1357_9bdf)));
     }
 
+    // Test: Select an absent slot, access config space, then reselect slot zero.
+    // Expected: Absent reads return all ones; writes have no effect on the live device.
+    //       Reselecting zero restores the original device value and write routing.
     #[test]
     fn verify_nonzero_slot_config_accesses_do_not_touch_device() {
         let rig = VpciTestRig::new();
+        rig.device.lock().read_value = 0x8172_6354;
         let writes_before = rig.device.lock().writes.len();
 
         rig.bus
@@ -993,5 +1030,23 @@ mod tests {
         assert!(rig.device.lock().pending_read.is_none());
         assert!(rig.device.lock().pending_write.is_none());
         assert_eq!(rig.device.lock().writes.len(), writes_before);
+
+        rig.bus
+            .lock()
+            .mmio_write(VpciTestRig::slot_addr(), &0u32.to_ne_bytes())
+            .unwrap();
+        rig.bus
+            .lock()
+            .mmio_read(VpciTestRig::config_addr(0), &mut read_data)
+            .unwrap();
+        assert_eq!(read_data, 0x8172_6354u32.to_ne_bytes());
+        rig.bus
+            .lock()
+            .mmio_write(VpciTestRig::config_addr(8), &0x1357_9bdfu32.to_ne_bytes())
+            .unwrap();
+        assert_eq!(
+            &rig.device.lock().writes[writes_before..],
+            &[(8, 0x1357_9bdf)]
+        );
     }
 }
